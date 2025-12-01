@@ -9,7 +9,7 @@ import basix.ufl
 
 import ufl
 
-from runintgen import compile_runtime_integrals, runtime_dx
+from runintgen import compile_runtime_integrals
 
 
 def main():
@@ -27,8 +27,13 @@ def main():
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
 
-    # Create a runtime measure for subdomain 1
-    dx_rt = runtime_dx(subdomain_id=1, domain=mesh, tag="cut_cell")
+    # Create a runtime measure using metadata={"quadrature_rule": "runtime"}
+    dx_rt = ufl.Measure(
+        "dx",
+        domain=mesh,
+        subdomain_id=1,
+        metadata={"quadrature_rule": "runtime"},
+    )
 
     # Also use a standard measure for comparison
     dx = ufl.Measure("dx", domain=mesh)

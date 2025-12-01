@@ -4,7 +4,6 @@ import pytest
 import ufl
 from basix.ufl import element as basix_element
 
-from runintgen import runtime_dx
 from runintgen.analysis import build_runtime_info
 from runintgen.fe_tables import (
     ComponentRequest,
@@ -33,6 +32,12 @@ def options():
     return get_options()
 
 
+class MockQuadratureProvider:
+    """Mock quadrature provider for testing."""
+
+    pass
+
+
 class TestExtractIntegralMetadata:
     """Tests for extract_integral_metadata."""
 
@@ -40,8 +45,15 @@ class TestExtractIntegralMetadata:
         """Test metadata extraction for simple Laplacian form."""
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = runtime_dx(subdomain_id=1, domain=mesh, tag="quadrature")
-        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+        provider = MockQuadratureProvider()
+        dx = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=provider,
+            subdomain_id=1,
+            metadata={"quadrature_rule": "runtime"},
+        )
+        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
         runtime_info = build_runtime_info(a, options)
         result = extract_integral_metadata(runtime_info)
@@ -70,8 +82,15 @@ class TestExtractIntegralMetadata:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
         kappa = ufl.Coefficient(V)
-        dx_rt = runtime_dx(subdomain_id=1, domain=mesh, tag="quadrature")
-        a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+        provider = MockQuadratureProvider()
+        dx = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=provider,
+            subdomain_id=1,
+            metadata={"quadrature_rule": "runtime"},
+        )
+        a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
         runtime_info = build_runtime_info(a, options)
         result = extract_integral_metadata(runtime_info)
@@ -92,8 +111,15 @@ class TestExtractIntegralMetadata:
         """Test that Jacobian components are extracted."""
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = runtime_dx(subdomain_id=1, domain=mesh, tag="quadrature")
-        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+        provider = MockQuadratureProvider()
+        dx = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=provider,
+            subdomain_id=1,
+            metadata={"quadrature_rule": "runtime"},
+        )
+        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
         runtime_info = build_runtime_info(a, options)
         result = extract_integral_metadata(runtime_info)
@@ -113,8 +139,15 @@ class TestExtractIntegralMetadata:
         """Test max derivative tracking per element."""
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = runtime_dx(subdomain_id=1, domain=mesh, tag="quadrature")
-        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+        provider = MockQuadratureProvider()
+        dx = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=provider,
+            subdomain_id=1,
+            metadata={"quadrature_rule": "runtime"},
+        )
+        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
         runtime_info = build_runtime_info(a, options)
         result = extract_integral_metadata(runtime_info)
@@ -130,8 +163,15 @@ class TestExtractIntegralMetadata:
         """Test component tracking per element."""
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = runtime_dx(subdomain_id=1, domain=mesh, tag="quadrature")
-        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+        provider = MockQuadratureProvider()
+        dx = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=provider,
+            subdomain_id=1,
+            metadata={"quadrature_rule": "runtime"},
+        )
+        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
         runtime_info = build_runtime_info(a, options)
         result = extract_integral_metadata(runtime_info)

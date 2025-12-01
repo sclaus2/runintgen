@@ -53,7 +53,13 @@ def map_runtime_groups_to_ir(
 
         if itype in subdomain_ids_per_type:
             for idx, sid in enumerate(subdomain_ids_per_type[itype]):
+                # Match either by exact ID or by special "everywhere"/"otherwise" -> -1
                 if sid == gid:
+                    indices.append((itype, idx))
+                elif gid in ("everywhere", "otherwise") and sid == -1:
+                    # UFL 'everywhere' integral is stored as -1 in IR
+                    indices.append((itype, idx))
+                elif isinstance(gid, int) and gid == sid:
                     indices.append((itype, idx))
 
         mapping[group] = indices
@@ -86,17 +92,17 @@ def get_integral_from_ir(
     if idx >= len(subdomain_ids):
         return None
 
-    target_sid = subdomain_ids[idx]
-
     # Find the matching integral in ir.integrals
+    # Filter by integral type first, then by index within that type
+    matching_integrals = []
     for integral_ir in ir.integrals:
-        # IntegralIR has: expression, rank, enabled_coefficients, part
-        # The expression has a name that encodes the integral type and subdomain
         expr = integral_ir.expression
-        if hasattr(expr, "name"):
-            # Check if this integral matches the target
-            # The name format is like "cell_integral_0" etc.
-            if integral_type in expr.name:
-                return integral_ir
+        # Check integral_type attribute on expression
+        if hasattr(expr, "integral_type") and expr.integral_type == integral_type:
+            matching_integrals.append(integral_ir)
+
+    # Return the idx-th integral of this type
+    if idx < len(matching_integrals):
+        return matching_integrals[idx]
 
     return None

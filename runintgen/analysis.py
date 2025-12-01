@@ -17,7 +17,7 @@ from ffcx.analysis import analyze_ufl_objects
 from ffcx.ir.representation import compute_ir
 from ffcx.options import get_options
 
-from .measures import RuntimeQuadrature, is_runtime_integral
+from .measures import is_runtime_integral
 
 # Type alias for integral group keys
 Key = tuple[Any, str, tuple[Any, ...]]  # (domain, integral_type, subdomain_ids)
@@ -31,13 +31,13 @@ class RuntimeGroup:
         domain: The UFL mesh domain.
         integral_type: The type of integral ("cell", "exterior_facet", etc.).
         subdomain_ids: Tuple of subdomain identifiers.
-        marker: The RuntimeQuadrature marker for this group.
+        quadrature_provider: The quadrature provider object (e.g., C++ class).
     """
 
     domain: Any  # ufl.Mesh - use Any for hashability
     integral_type: str
     subdomain_ids: tuple[Any, ...]
-    marker: RuntimeQuadrature
+    quadrature_provider: Any = None
 
 
 @dataclass
@@ -55,6 +55,24 @@ class RuntimeInfo:
     groups: list[RuntimeGroup] = field(default_factory=list)
     form_data: Any = None
     meta: dict[str, Any] = field(default_factory=dict)
+
+
+def _strip_runtime_metadata(form: ufl.Form) -> ufl.Form:
+    """Strip quadrature_rule='runtime' metadata so FFCX doesn't choke on it.
+
+    FFCX tries to interpret quadrature_rule as a basix quadrature type.
+    We need to replace 'runtime' with a valid default (or remove it).
+    """
+    new_integrals = []
+    for integral in form.integrals():
+        md = dict(integral.metadata())
+        if md.get("quadrature_rule") == "runtime":
+            # Replace with default quadrature rule
+            md["quadrature_rule"] = "default"
+        new_integral = integral.reconstruct(metadata=md)
+        new_integrals.append(new_integral)
+
+    return ufl.Form(new_integrals)
 
 
 def build_runtime_info(form: ufl.Form, options: dict[str, Any]) -> RuntimeInfo:
@@ -87,16 +105,15 @@ def build_runtime_info(form: ufl.Form, options: dict[str, Any]) -> RuntimeInfo:
         complex_mode=complex_mode,
     )
 
-    # 2. First, extract runtime markers from the ORIGINAL form before processing
+    # 2. Extract quadrature providers from the ORIGINAL form before processing
     #    (because compute_form_data may strip subdomain_data)
-    original_markers: dict[tuple[str, int], RuntimeQuadrature] = {}
+    original_providers: dict[tuple[str, int], Any] = {}
     for integral in form.integrals():
-        sd = integral.subdomain_data()
-        if isinstance(sd, RuntimeQuadrature):
-            key = (integral.integral_type(), integral.subdomain_id())
-            original_markers[key] = sd
+        if is_runtime_integral(integral):
+            orig_key = (integral.integral_type(), integral.subdomain_id())
+            original_providers[orig_key] = integral.subdomain_data()
 
-    # 3. Scan integral_data for runtime markers (using metadata or original markers)
+    # 3. Scan integral_data for runtime integrals
     groups: dict[Key, RuntimeGroup] = {}
     for itg_data in form_data.integral_data:
         domain = itg_data.domain
@@ -104,45 +121,54 @@ def build_runtime_info(form: ufl.Form, options: dict[str, Any]) -> RuntimeInfo:
         subdomain_ids = tuple(itg_data.subdomain_id)
         key: Key = (domain, itype, subdomain_ids)
 
-        marker: RuntimeQuadrature | None = None
+        quadrature_provider: Any = None
+
         for integral in itg_data.integrals:
             if is_runtime_integral(integral):
-                # First try to get marker from subdomain_data (may be None after processing)
+                # Get the quadrature provider from subdomain_data
                 sd = integral.subdomain_data()
-                if isinstance(sd, RuntimeQuadrature):
-                    marker = sd
-                    break
-                # Otherwise, look up in original markers
-                for sid in subdomain_ids:
-                    orig_key = (itype, sid)
-                    if orig_key in original_markers:
-                        marker = original_markers[orig_key]
-                        break
-                # If still no marker but metadata says runtime, create a default one
-                if marker is None and integral.metadata().get("runintgen"):
-                    marker = RuntimeQuadrature(tag="runtime", payload=None)
-                if marker is not None:
+                if sd is not None:
+                    quadrature_provider = sd
+                else:
+                    # If subdomain_data was stripped, look up in original data
+                    for sid in subdomain_ids:
+                        lookup_key = (itype, sid)
+                        if lookup_key in original_providers:
+                            quadrature_provider = original_providers[lookup_key]
+                            break
+
+                if quadrature_provider is not None:
                     break
 
-        if marker is not None:
+        if quadrature_provider is not None:
             groups[key] = RuntimeGroup(
                 domain=domain,
                 integral_type=itype,
                 subdomain_ids=subdomain_ids,
-                marker=marker,
+                quadrature_provider=quadrature_provider,
+            )
+        elif any(is_runtime_integral(i) for i in itg_data.integrals):
+            # Runtime integral without provider (valid case)
+            groups[key] = RuntimeGroup(
+                domain=domain,
+                integral_type=itype,
+                subdomain_ids=subdomain_ids,
+                quadrature_provider=None,
             )
 
-    # 3. Let FFCX do the standard analysis/IR
+    # 4. Let FFCX do the standard analysis/IR
     #    IMPORTANT: do not override FFCX options related to integral scaling here,
     #    we already set that in compute_form_data.
+    #    Strip "runtime" quadrature_rule so FFCX doesn't try to interpret it.
+    form_for_ffcx = _strip_runtime_metadata(form)
     scalar_type = np.dtype(options.get("scalar_type", "float64"))
-    analysis = analyze_ufl_objects([form], scalar_type)
+    analysis = analyze_ufl_objects([form_for_ffcx], scalar_type)
 
     # Get full FFCX options for IR computation
     ffcx_options = get_options(options)
     ir = compute_ir(analysis, {}, "runint", ffcx_options, visualise=False)
 
-    # 4. Pack RuntimeInfo
+    # 5. Pack RuntimeInfo
     meta = {
         "form_rank": len(form.arguments()),
         "num_runtime_groups": len(groups),

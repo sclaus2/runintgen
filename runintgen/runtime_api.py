@@ -23,6 +23,7 @@ class RuntimeKernelInfo:
         c_declaration: The C function declaration (header).
         c_definition: The C function definition (implementation).
         tensor_shape: The shape of the output tensor, if known.
+        table_info: List of dicts describing required FE tables.
     """
 
     name: str
@@ -31,6 +32,7 @@ class RuntimeKernelInfo:
     c_declaration: str
     c_definition: str
     tensor_shape: tuple[int, ...] | None = None
+    table_info: list[dict[str, Any]] | None = None
 
 
 @dataclass
