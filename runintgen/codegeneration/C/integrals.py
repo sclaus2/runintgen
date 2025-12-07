@@ -10,9 +10,9 @@ from typing import Any
 
 import numpy as np
 
-from ...analysis import RuntimeInfo
-from ...ir_runtime_map import get_integral_from_ir, map_runtime_groups_to_ir
+from ...analysis import RuntimeAnalysisInfo
 from ...runtime_api import RuntimeKernelInfo
+from ...runtime_tables import build_runtime_element_mapping_from_ir
 from ..runtime_integrals import RuntimeIntegralGenerator
 from .integrals_template import (
     factory_runtime_kernel,
@@ -42,22 +42,21 @@ def dtype_to_scalar_dtype(dtype: str) -> str:
 
 
 def generate_C_runtime_kernels(
-    runtime_info: RuntimeInfo,
+    analysis: RuntimeAnalysisInfo,
     options: dict[str, Any],
 ) -> list[RuntimeKernelInfo]:
-    """Generate C kernels for all runtime groups in `runtime_info`.
+    """Generate C kernels for all runtime integrals in the analysis.
 
     Args:
-        runtime_info: RuntimeInfo object from analysis phase.
+        analysis: RuntimeAnalysisInfo object from analysis phase.
         options: Compilation options dictionary.
 
     Returns:
         List of RuntimeKernelInfo objects, one per runtime integral.
     """
-    from ...fe_tables import extract_integral_metadata
     from ...runtime_tables import build_runtime_element_mapping
 
-    ir = runtime_info.ir
+    ir = analysis.ir
 
     # Determine scalar and geometry types
     scalar_type = np.dtype(options.get("scalar_type", np.float64)).name
@@ -65,89 +64,98 @@ def generate_C_runtime_kernels(
     geom_c = dtype_to_c_type(dtype_to_scalar_dtype(scalar_type))
 
     # Create runtime integral generator
-    backend = None  # Placeholder for now
+    backend = None
     rig = RuntimeIntegralGenerator(ir, backend)
 
-    # Map runtime groups to IR indices
-    mapping = map_runtime_groups_to_ir(runtime_info)
-
-    # Extract FE table metadata
-    integral_metadata = extract_integral_metadata(runtime_info)
+    # Build mapping from (itype, ir_index) to subdomain_id via groups
+    key_to_subdomain: dict[tuple[str, int], int] = {}
+    for group in analysis.groups:
+        itype = group.integral_type
+        subdomain_id = group.subdomain_ids[0] if group.subdomain_ids else 0
+        # For simplicity, assign subdomain to any matching integral type
+        for key_itype, key_idx in analysis.integral_infos.keys():
+            if key_itype == itype:
+                key_to_subdomain[(key_itype, key_idx)] = subdomain_id
 
     kernels: list[RuntimeKernelInfo] = []
 
-    for group, indices in mapping.items():
-        # Get metadata for this group
-        meta = integral_metadata.get(group)
+    # Process each runtime integral
+    for (itype, ir_index), integral_info in analysis.integral_infos.items():
+        # Get the corresponding integral from IR
+        ir_type_counts: dict[str, int] = {}
+        integral_ir = None
+        for iir in ir.integrals:
+            t = iir.expression.integral_type
+            idx = ir_type_counts.get(t, 0)
+            ir_type_counts[t] = idx + 1
+            if t == itype and idx == ir_index:
+                integral_ir = iir
+                break
 
-        for itype, idx in indices:
-            # Get the corresponding integral from IR
-            integral_ir = get_integral_from_ir(ir, itype, idx)
+        if integral_ir is None:
+            continue
 
-            # Build element mapping for this integral
-            if meta is not None:
-                element_mapping = build_runtime_element_mapping(integral_ir, meta)
-            else:
-                from ...runtime_tables import RuntimeElementMapping
+        # Build element mapping from analysis
+        element_mapping = build_runtime_element_mapping(integral_info)
 
-                element_mapping = RuntimeElementMapping()
+        # Generate the kernel body
+        body_c = rig.generate_runtime(integral_ir, element_mapping)
 
-            # Generate the kernel body
-            body_c = rig.generate_runtime(integral_ir, element_mapping)
+        # Build function name - get subdomain_id from group mapping
+        subdomain_id = key_to_subdomain.get((itype, ir_index), 0)
+        func_name = f"runint_{itype}_{subdomain_id}_{ir_index}"
 
-            # Build function name (without tabulate_tensor_ prefix - template adds it)
-            subdomain_id = group.subdomain_ids[0] if group.subdomain_ids else 0
-            func_name = f"runint_{itype}_{subdomain_id}_{idx}"
+        # Format the complete C definition
+        c_def = factory_runtime_kernel.format(
+            factory_name=func_name,
+            scalar=scalar_c,
+            geom=geom_c,
+            body=body_c,
+        )
 
-            # Format the complete C definition
-            c_def = factory_runtime_kernel.format(
-                factory_name=func_name,
-                scalar=scalar_c,
-                geom=geom_c,
-                body=body_c,
+        # Format the declaration
+        c_decl = factory_runtime_kernel_decl.format(
+            factory_name=func_name,
+            scalar=scalar_c,
+            geom=geom_c,
+        )
+
+        # Collect element info for runtime
+        element_info = [
+            {
+                "index": e.index,
+                "element_id": e.element_id,
+                "ndofs": e.ndofs,
+                "ncomps": e.ncomps,
+                "max_derivative_order": e.max_derivative_order,
+                "is_argument": e.is_argument,
+                "is_test": e.is_test,
+                "is_trial": e.is_trial,
+                "is_coefficient": e.is_coefficient,
+                "is_coordinate": e.is_coordinate,
+                "usages": [
+                    {
+                        "role": u.role.name,
+                        "terminal_index": u.terminal_index,
+                        "component": u.component,
+                    }
+                    for u in e.usages
+                ],
+            }
+            for e in element_mapping.elements
+        ]
+
+        kernels.append(
+            RuntimeKernelInfo(
+                name=func_name,
+                integral_type=itype,
+                subdomain_id=subdomain_id,
+                c_declaration=c_decl,
+                c_definition=c_def,
+                tensor_shape=None,
+                table_info=element_info,
             )
-
-            # Format the declaration
-            c_decl = factory_runtime_kernel_decl.format(
-                factory_name=func_name,
-                scalar=scalar_c,
-                geom=geom_c,
-            )
-
-            # Collect element info for runtime
-            element_info = [
-                {
-                    "index": e.index,
-                    "element_hash": e.element_hash,
-                    "ndofs": e.ndofs,
-                    "ncomps": e.ncomps,
-                    "max_derivative_order": e.max_derivative_order,
-                    "is_argument": e.is_argument,
-                    "is_coefficient": e.is_coefficient,
-                    "is_coordinate": e.is_coordinate,
-                    "usages": [
-                        {
-                            "role": u.role,
-                            "terminal_index": u.terminal_index,
-                            "component": u.component,
-                        }
-                        for u in e.usages
-                    ],
-                }
-                for e in element_mapping.elements
-            ]
-
-            kernels.append(
-                RuntimeKernelInfo(
-                    name=func_name,
-                    integral_type=itype,
-                    subdomain_id=subdomain_id,
-                    c_declaration=c_decl,
-                    c_definition=c_def,
-                    tensor_shape=None,
-                    table_info=element_info,
-                )
-            )
+        )
 
     return kernels
 

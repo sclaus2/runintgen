@@ -31,7 +31,6 @@ from basix.ufl import element
 from runintgen import (
     compile_runtime_integrals,
     get_runintgen_data_struct,
-    runtime_dx,
 )
 
 
@@ -45,9 +44,10 @@ def main():
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
 
-    # Create a runtime measure
-    # The tag can be used to identify different quadrature schemes
-    dx_rt = runtime_dx(subdomain_id=1, domain=mesh, tag="custom_quadrature")
+    # Create a runtime measure using standard UFL with special metadata
+    dx_rt = ufl.Measure(
+        "dx", domain=mesh, subdomain_id=1, metadata={"quadrature_rule": "runtime"}
+    )
 
     # Define the Laplacian bilinear form
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
@@ -68,16 +68,18 @@ def main():
         print("=" * 70)
         print(f"Integral type: {kernel.integral_type}")
         print(f"Subdomain ID: {kernel.subdomain_id}")
-        print(f"Tag: {kernel.tag}")
         print()
 
-        print("Required FE tables:")
+        print("Required FE elements:")
         for t in kernel.table_info:
-            print(f"  Table {t['index']}:")
-            print(f"    FFCX name: {t['name']}")
-            print(f"    Role: {t['role']}[{t['terminal_index']}]")
-            print(f"    Derivative: {t['derivative']}")
+            print(f"  Element {t['index']}:")
+            print(f"    Element ID: {t['element_id']}")
             print(f"    DOFs: {t['ndofs']}")
+            print(f"    Components: {t['ncomps']}")
+            print(f"    Max derivative order: {t['max_derivative_order']}")
+            print(f"    Is argument: {t['is_argument']}")
+            print(f"    Is coordinate: {t['is_coordinate']}")
+            print(f"    Usages: {[u['role'] for u in t['usages']]}")
         print()
 
         print("C declaration:")

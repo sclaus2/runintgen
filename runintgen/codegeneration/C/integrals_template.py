@@ -17,69 +17,32 @@ from __future__ import annotations
 # This is passed via custom_data pointer
 # The caller is responsible for populating this structure
 #
-# Design for per-cell quadrature with caching:
-# - Multiple "quadrature configurations" can be defined
-# - Each configuration has its own quadrature points/weights and tabulated tables
-# - A cell-to-config map allows different cells to use different quadrature
-# - Cells sharing the same quadrature share the same tabulated tables (caching)
-#
-# For single-config usage (all cells same quadrature):
-# - Set num_configs=1, active_config=0, cell_config_map=NULL
-#
-# For multi-config usage (per-cell quadrature):
-# - Set num_configs to number of unique quadrature rules
-# - Set cell_config_map to map cell indices to config indices
-# - The kernel uses entity_local_index[0] as the cell index
+# Simplified single-config design:
+# - One quadrature rule (points/weights) per runintgen_data
+# - Element tables tabulated at those points
+# - For per-cell quadrature, create one runintgen_data per unique quadrature rule
+#   and use DOLFINx's custom integral infrastructure to route cells appropriately
 #
 runintgen_data_struct = r"""
-// Per-element table information for a single quadrature configuration
+// Per-element table information
 typedef struct
 {
   int ndofs;              // Number of DOFs for this element
   int nderivs;            // Number of derivative levels in table
-  const double* table;    // [nderivs, nq, ndofs] - basix tabulation output
+  const double* table;    // [nderivs * nq * ndofs] - basix tabulation output
   // Access: table[deriv_idx * nq * ndofs + q * ndofs + dof]
   // Derivative ordering follows basix: (0,0), (1,0), (0,1), (2,0), (1,1), (0,2), ...
 } runintgen_element;
 
-// A single quadrature configuration (points, weights, and tabulated tables)
+// Runtime data structure (single quadrature configuration)
 typedef struct
 {
-  // Quadrature data for this configuration
   int nq;                             // Number of quadrature points
   const double* points;               // [nq * tdim] - reference coordinates
   const double* weights;              // [nq] - quadrature weights
-
-  // Per-element table data (tabulated at this quadrature's points)
   int nelements;                      // Number of unique elements
   const runintgen_element* elements;  // [nelements] array of element info
-} runintgen_quadrature_config;
-
-// Main runtime data structure
-// Supports both single-config and multi-config (per-cell quadrature) modes
-typedef struct
-{
-  // Number of quadrature configurations
-  int num_configs;
-
-  // Array of quadrature configurations
-  // configs[i] contains quadrature rule i and its tabulated tables
-  const runintgen_quadrature_config* configs;
-
-  // For single-config mode: set active_config to the config index (0)
-  // For multi-config mode: set to -1 and use cell_config_map
-  int active_config;
-
-  // Per-cell configuration map (optional, for multi-config mode)
-  // If non-NULL: cell_config_map[cell_index] gives the config index for that cell
-  // If NULL: use active_config for all cells
-  const int* cell_config_map;
-
 } runintgen_data;
-
-// Legacy single-config alias for backwards compatibility
-// This is equivalent to runintgen_quadrature_config
-typedef runintgen_quadrature_config runintgen_data_single;
 """
 
 # Template for runtime kernel function
@@ -93,12 +56,6 @@ typedef runintgen_quadrature_config runintgen_data_single;
 # The function is named tabulate_tensor_{factory_name} to match FFCX naming
 # convention, enabling use with DOLFINx's standard assembler infrastructure.
 #
-# The kernel supports both single-config and multi-config modes:
-# - Single-config: data->active_config >= 0, uses that config for all cells
-# - Multi-config: data->active_config < 0, uses cell_config_map[cell_index]
-#
-# In multi-config mode, entity_local_index[0] is used as the cell index
-# to look up the appropriate quadrature configuration.
 factory_runtime_kernel = r"""
 #include <math.h>
 #include <stdint.h>
@@ -113,25 +70,11 @@ void tabulate_tensor_{factory_name}(
     void* restrict custom_data)
 {{
   // Unpack runtime data
-  const runintgen_data* rdata = (const runintgen_data*)custom_data;
-
-  // Select quadrature configuration
-  // - If active_config >= 0: use that config (single-config mode)
-  // - If active_config < 0: use cell_config_map[cell_index] (multi-config mode)
-  int config_idx;
-  if (rdata->active_config >= 0) {{
-    config_idx = rdata->active_config;
-  }} else {{
-    // Use entity_local_index[0] as cell index to look up config
-    int cell_idx = entity_local_index[0];
-    config_idx = rdata->cell_config_map[cell_idx];
-  }}
-
-  const runintgen_quadrature_config* data = &rdata->configs[config_idx];
+  const runintgen_data* data = (const runintgen_data*)custom_data;
   const int nq = data->nq;
 
   // Suppress unused variable warnings for standard signature params
-  (void)w; (void)c; (void)quadrature_permutation;
+  (void)w; (void)c; (void)quadrature_permutation; (void)entity_local_index;
 
 {body}
 }}

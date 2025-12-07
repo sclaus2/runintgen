@@ -1,10 +1,9 @@
 """Runtime table mapping for code generation.
 
-This module provides utilities to map between FFCX's compile-time table
-structure and the runtime table structure we use.
+This module provides utilities to map between the analysis results
+and the runtime table structure used in generated kernels.
 
 Key concepts:
-- FFCX uses named tables like "FE0_C0_D10_Q083" with shape [perm][entity][point][dof]
 - basix.tabulate returns shape [nderivs, nq, ndofs, ncomps] - all derivatives together
 - At runtime, we pass ONE table per unique element, containing all needed derivatives
 - Each table has shape [nderivs, nq, ndofs] (component flattened or separate tables)
@@ -12,7 +11,7 @@ Key concepts:
 Structure:
 1. UniqueElement: A distinct (element, max_derivative) that needs tabulation
 2. ElementUsage: How a unique element is used (test, trial, coefficient, coordinate)
-3. RuntimeElementInfo: Complete info for each unique element
+3. RuntimeElementMapping: Complete mapping for all elements in an integral
 
 The runtime kernel signature is:
     void kernel(
@@ -33,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .fe_tables import IntegralRuntimeMeta
+from .analysis import ArgumentRole, RuntimeIntegralInfo
 
 
 @dataclass
@@ -41,13 +40,13 @@ class ElementUsage:
     """How a unique element is used in the form.
 
     Attributes:
-        role: "argument", "coefficient", "jacobian", "coordinate".
+        role: ArgumentRole (TEST, TRIAL, COEFFICIENT, GEOMETRY).
         terminal_index: Argument number (0=test, 1=trial) or coefficient index.
         component: Flat component index for blocked elements.
         derivatives_needed: Set of derivative tuples needed for this usage.
     """
 
-    role: str
+    role: ArgumentRole
     terminal_index: int
     component: int = 0
     derivatives_needed: set[tuple[int, ...]] = field(default_factory=set)
@@ -63,43 +62,55 @@ class UniqueElementInfo:
     Attributes:
         index: Index into the runtime elements array.
         element: The basix/UFL element object.
-        element_hash: Hash for element identification.
+        element_id: String identifier for this element.
         ndofs: Number of DOFs for this element.
         ncomps: Number of components (1 for scalar, >1 for vector/tensor).
         max_derivative_order: Maximum derivative order needed across all usages.
+        derivative_tuples: Set of all derivative tuples needed.
         usages: List of how this element is used (test, trial, coefficients, etc.).
-        ffcx_table_names: Original FFCX table names that map to this element.
     """
 
     index: int
     element: Any  # basix element
-    element_hash: int
+    element_id: str
     ndofs: int
     ncomps: int
     max_derivative_order: int
+    derivative_tuples: set[tuple[int, ...]] = field(default_factory=set)
     usages: list[ElementUsage] = field(default_factory=list)
-    ffcx_table_names: list[str] = field(default_factory=list)
 
     @property
     def is_argument(self) -> bool:
         """Check if this element is used for any argument (test/trial)."""
-        return any(u.role == "argument" for u in self.usages)
+        return any(
+            u.role in (ArgumentRole.TEST, ArgumentRole.TRIAL) for u in self.usages
+        )
+
+    @property
+    def is_test(self) -> bool:
+        """Check if this element is used for test function."""
+        return any(u.role == ArgumentRole.TEST for u in self.usages)
+
+    @property
+    def is_trial(self) -> bool:
+        """Check if this element is used for trial function."""
+        return any(u.role == ArgumentRole.TRIAL for u in self.usages)
 
     @property
     def is_coefficient(self) -> bool:
         """Check if this element is used for any coefficient."""
-        return any(u.role == "coefficient" for u in self.usages)
+        return any(u.role == ArgumentRole.COEFFICIENT for u in self.usages)
 
     @property
     def is_coordinate(self) -> bool:
         """Check if this element is used for coordinate/jacobian."""
-        return any(u.role in ("jacobian", "coordinate") for u in self.usages)
+        return any(u.role == ArgumentRole.GEOMETRY for u in self.usages)
 
     def roles_str(self) -> str:
         """String representation of all roles."""
         parts = []
         for u in self.usages:
-            parts.append(f"{u.role}[{u.terminal_index}]")
+            parts.append(f"{u.role.name}[{u.terminal_index}]")
         return ", ".join(sorted(set(parts)))
 
 
@@ -138,7 +149,6 @@ class DerivativeMapping:
         import basix
 
         if len(deriv) != 2:
-            # Extend or truncate to 2D
             d0 = deriv[0] if len(deriv) > 0 else 0
             d1 = deriv[1] if len(deriv) > 1 else 0
             deriv = (d0, d1)
@@ -154,7 +164,6 @@ class DerivativeMapping:
         import basix
 
         if len(deriv) != 3:
-            # Extend or truncate to 3D
             d = list(deriv) + [0] * (3 - len(deriv))
             deriv = (d[0], d[1], d[2])
 
@@ -172,149 +181,184 @@ class RuntimeElementMapping:
 
     Attributes:
         elements: List of UniqueElementInfo objects (one per unique element).
-        hash_to_index: Map from element hash to element index.
-        ffcx_table_to_element: Map from FFCX table name to (element_idx, deriv, comp).
+        id_to_index: Map from element_id to element index.
         tdim: Topological dimension of the cell.
     """
 
     elements: list[UniqueElementInfo] = field(default_factory=list)
-    hash_to_index: dict[int, int] = field(default_factory=dict)
-    ffcx_table_to_element: dict[str, tuple[int, tuple[int, ...], int]] = field(
-        default_factory=dict
-    )
-    tdim: int = 2  # Will be set during construction
+    id_to_index: dict[str, int] = field(default_factory=dict)
+    tdim: int = 2
 
     def get_or_create_element(
         self,
         element: Any,
-        element_hash: int,
+        element_id: str,
         ndofs: int,
         ncomps: int = 1,
     ) -> UniqueElementInfo:
         """Get existing element or create new one."""
-        if element_hash in self.hash_to_index:
-            return self.elements[self.hash_to_index[element_hash]]
+        if element_id in self.id_to_index:
+            return self.elements[self.id_to_index[element_id]]
 
         idx = len(self.elements)
         info = UniqueElementInfo(
             index=idx,
             element=element,
-            element_hash=element_hash,
+            element_id=element_id,
             ndofs=ndofs,
             ncomps=ncomps,
             max_derivative_order=0,
         )
         self.elements.append(info)
-        self.hash_to_index[element_hash] = idx
+        self.id_to_index[element_id] = idx
         return info
 
     def add_usage(
         self,
-        element_hash: int,
-        role: str,
+        element_id: str,
+        role: ArgumentRole,
         terminal_index: int,
-        component: int,
-        derivative: tuple[int, ...],
-        ffcx_table_name: str,
+        derivatives: set[tuple[int, ...]],
     ) -> None:
         """Add a usage to an element."""
-        if element_hash not in self.hash_to_index:
-            raise ValueError(f"Element hash {element_hash} not found")
+        if element_id not in self.id_to_index:
+            raise ValueError(f"Element id {element_id} not found")
 
-        info = self.elements[self.hash_to_index[element_hash]]
-        deriv_order = sum(derivative)
+        info = self.elements[self.id_to_index[element_id]]
 
-        # Update max derivative order
-        if deriv_order > info.max_derivative_order:
-            info.max_derivative_order = deriv_order
+        # Update max derivative order and derivatives
+        for deriv in derivatives:
+            deriv_order = sum(deriv)
+            if deriv_order > info.max_derivative_order:
+                info.max_derivative_order = deriv_order
+            info.derivative_tuples.add(deriv)
 
         # Find or create usage for this role/terminal
         usage = None
         for u in info.usages:
-            if (
-                u.role == role
-                and u.terminal_index == terminal_index
-                and u.component == component
-            ):
+            if u.role == role and u.terminal_index == terminal_index:
                 usage = u
                 break
         if usage is None:
             usage = ElementUsage(
                 role=role,
                 terminal_index=terminal_index,
-                component=component,
                 derivatives_needed=set(),
             )
             info.usages.append(usage)
 
-        usage.derivatives_needed.add(derivative)
-
-        # Map FFCX table to this element
-        info.ffcx_table_names.append(ffcx_table_name)
-        self.ffcx_table_to_element[ffcx_table_name] = (
-            info.index,
-            derivative,
-            component,
-        )
+        usage.derivatives_needed.update(derivatives)
 
     def get_table_access(
         self,
-        ffcx_table_name: str,
+        element_id: str,
+        deriv: tuple[int, ...],
         q_idx: str,
         dof_idx: str,
     ) -> str:
         """Generate C code for accessing a table value.
 
         Args:
-            ffcx_table_name: Original FFCX table name.
+            element_id: Element identifier.
+            deriv: Derivative tuple.
             q_idx: C expression for quadrature point index.
             dof_idx: C expression for DOF index.
 
         Returns:
             C expression to access the table value.
         """
-        if ffcx_table_name not in self.ffcx_table_to_element:
-            raise ValueError(f"Unknown table: {ffcx_table_name}")
+        if element_id not in self.id_to_index:
+            raise ValueError(f"Unknown element: {element_id}")
 
-        elem_idx, derivative, component = self.ffcx_table_to_element[ffcx_table_name]
+        elem_idx = self.id_to_index[element_id]
         info = self.elements[elem_idx]
 
         # Compute derivative index in basix format
         if self.tdim == 2:
-            deriv_idx = DerivativeMapping.derivative_to_index_2d(derivative)
+            deriv_idx = DerivativeMapping.derivative_to_index_2d(deriv)
         else:
-            deriv_idx = DerivativeMapping.derivative_to_index_3d(derivative)
+            deriv_idx = DerivativeMapping.derivative_to_index_3d(deriv)
 
         ndofs = info.ndofs
-        ncomps = info.ncomps
 
-        # Access pattern: data->elements[elem_idx].table[deriv_idx][q * ndofs * ncomps + dof * ncomps + comp]
-        if ncomps == 1:
-            # Scalar element: data->elements[i].table[d_idx * nq * ndofs + q * ndofs + dof]
-            return (
-                f"data->elements[{elem_idx}].table["
-                f"{deriv_idx} * data->nq * {ndofs} + "
-                f"({q_idx}) * {ndofs} + ({dof_idx})]"
-            )
-        else:
-            # Vector/blocked element
-            return (
-                f"data->elements[{elem_idx}].table["
-                f"{deriv_idx} * data->nq * {ndofs} * {ncomps} + "
-                f"({q_idx}) * {ndofs} * {ncomps} + "
-                f"({dof_idx}) * {ncomps} + {component}]"
-            )
+        # Access pattern: data->elements[elem_idx].table[deriv_idx * nq * ndofs + q * ndofs + dof]
+        return (
+            f"data->elements[{elem_idx}].table["
+            f"{deriv_idx} * data->nq * {ndofs} + "
+            f"({q_idx}) * {ndofs} + ({dof_idx})]"
+        )
 
 
 def build_runtime_element_mapping(
-    integral_ir: Any,
-    meta: IntegralRuntimeMeta | None = None,
+    integral_info: RuntimeIntegralInfo,
 ) -> RuntimeElementMapping:
     """Build a mapping from unique elements to runtime table structure.
 
+    This function takes the analysis result (RuntimeIntegralInfo) and builds
+    the RuntimeElementMapping needed for code generation.
+
+    Args:
+        integral_info: The RuntimeIntegralInfo from the analysis phase.
+
+    Returns:
+        RuntimeElementMapping object with unique elements and derivative info.
+    """
+    mapping = RuntimeElementMapping()
+
+    # Process all elements from the analysis
+    for element_id, elem_info in integral_info.elements.items():
+        element = elem_info.element
+
+        # Get ncomps from element (for blocked elements)
+        ncomps = 1
+        if hasattr(element, "block_size"):
+            ncomps = element.block_size
+
+        # Get ndofs from element
+        # For blocked elements, use sub-element dimension (per-component ndofs)
+        ndofs = 1
+        if ncomps > 1 and hasattr(element, "sub_elements") and element.sub_elements:
+            # Blocked element: use sub-element's dimension
+            sub_elem = element.sub_elements[0]
+            if hasattr(sub_elem, "dim"):
+                ndofs = sub_elem.dim
+            elif hasattr(sub_elem, "space_dimension"):
+                ndofs = sub_elem.space_dimension()
+        elif hasattr(element, "dim"):
+            ndofs = element.dim
+        elif hasattr(element, "space_dimension"):
+            ndofs = element.space_dimension()
+
+        mapping.get_or_create_element(
+            element=element,
+            element_id=element_id,
+            ndofs=ndofs,
+            ncomps=ncomps,
+        )
+
+    # Process all arguments and their usages
+    for (role, index), arg_info in integral_info.arguments.items():
+        if arg_info.element_id in mapping.id_to_index:
+            mapping.add_usage(
+                element_id=arg_info.element_id,
+                role=role,
+                terminal_index=index,
+                derivatives=arg_info.derivative_tuples,
+            )
+
+    return mapping
+
+
+def build_runtime_element_mapping_from_ir(
+    integral_ir: Any,
+) -> RuntimeElementMapping:
+    """Build element mapping directly from FFCX IR.
+
+    This is an alternative entry point that works directly with the FFCX IR
+    without going through RuntimeIntegralInfo. Useful for backward compatibility.
+
     Args:
         integral_ir: The FFCX integral IR.
-        meta: The IntegralRuntimeMeta from our analysis (optional, not used yet).
 
     Returns:
         RuntimeElementMapping object with unique elements and derivative info.
@@ -327,9 +371,7 @@ def build_runtime_element_mapping(
     expr_ir = integral_ir.expression
 
     # Get topological dimension from cell type
-    # Collect all table references from the factorization graph
     for (cell_type_key, qrule), integrand_data in expr_ir.integrand.items():
-        # Set tdim based on cell type (basix.CellType is an enum)
         ct_name = (
             cell_type_key.name if hasattr(cell_type_key, "name") else str(cell_type_key)
         )
@@ -338,165 +380,8 @@ def build_runtime_element_mapping(
         elif "tetrahedron" in ct_name.lower() or "hexahedron" in ct_name.lower():
             mapping.tdim = 3
         else:
-            mapping.tdim = 2  # Default
+            mapping.tdim = 2
 
-        factorization = integrand_data.get("factorization")
-        if not factorization:
-            continue
-
-        for node_id, node_data in factorization.nodes.items():
-            tr = node_data.get("tr")  # Table reference
-            mt = node_data.get("mt")  # Modified terminal
-
-            if tr is None or mt is None:
-                continue
-
-            mte = get_modified_terminal_element(mt)
-            if mte is None:
-                continue
-
-            element, averaged, local_derivatives, flat_component = mte
-            terminal = mt.terminal
-
-            # Determine role and index
-            if isinstance(terminal, Argument):
-                role = "argument"
-                terminal_index = terminal.number()
-            elif isinstance(terminal, Coefficient):
-                role = "coefficient"
-                terminal_index = expr_ir.coefficient_numbering.get(terminal, -1)
-            elif isinstance(terminal, SpatialCoordinate):
-                role = "coordinate"
-                terminal_index = 0
-            elif isinstance(terminal, Jacobian):
-                role = "jacobian"
-                terminal_index = 0
-            else:
-                continue
-
-            # Get element hash and properties
-            element_hash = (
-                hash(element) if hasattr(element, "__hash__") else id(element)
-            )
-            ndofs = tr.values.shape[-1]
-            # Get number of components
-            ncomps = 1
-            if hasattr(element, "block_size"):
-                ncomps = element.block_size
-
-            # Get or create element info
-            mapping.get_or_create_element(
-                element=element,
-                element_hash=element_hash,
-                ndofs=ndofs,
-                ncomps=ncomps,
-            )
-
-            # Add this usage
-            mapping.add_usage(
-                element_hash=element_hash,
-                role=role,
-                terminal_index=terminal_index,
-                component=flat_component,
-                derivative=local_derivatives,
-                ffcx_table_name=tr.name,
-            )
-
-    return mapping
-
-
-# Keep old interface for backward compatibility
-@dataclass
-class TableUsage:
-    """A single usage of a table by a terminal (backward compat)."""
-
-    role: str
-    terminal_index: int
-
-
-@dataclass
-class RuntimeTableInfo:
-    """Information about a runtime FE table (backward compat)."""
-
-    index: int
-    name: str
-    element_hash: int
-    component: int
-    derivative: tuple[int, ...]
-    ndofs: int
-    usages: list[TableUsage] = field(default_factory=list)
-
-    @property
-    def role(self) -> str:
-        return self.usages[0].role if self.usages else "unknown"
-
-    @property
-    def terminal_index(self) -> int:
-        return self.usages[0].terminal_index if self.usages else -1
-
-
-@dataclass
-class RuntimeTableMapping:
-    """Mapping from FFCX table names to runtime table indices (backward compat)."""
-
-    tables: list[RuntimeTableInfo] = field(default_factory=list)
-    name_to_index: dict[str, int] = field(default_factory=dict)
-    request_to_index: dict[tuple, int] = field(default_factory=dict)
-
-    def add_table(
-        self,
-        name: str,
-        element_hash: int,
-        role: str,
-        terminal_index: int,
-        component: int,
-        derivative: tuple[int, ...],
-        ndofs: int,
-    ) -> int:
-        usage = TableUsage(role=role, terminal_index=terminal_index)
-
-        if name in self.name_to_index:
-            index = self.name_to_index[name]
-            info = self.tables[index]
-            if usage not in info.usages:
-                info.usages.append(usage)
-            key = (element_hash, role, terminal_index, component, derivative)
-            self.request_to_index[key] = index
-            return index
-
-        index = len(self.tables)
-        info = RuntimeTableInfo(
-            index=index,
-            name=name,
-            element_hash=element_hash,
-            component=component,
-            derivative=derivative,
-            ndofs=ndofs,
-            usages=[usage],
-        )
-        self.tables.append(info)
-        self.name_to_index[name] = index
-        key = (element_hash, role, terminal_index, component, derivative)
-        self.request_to_index[key] = index
-        return index
-
-    def get_index(self, name: str) -> int | None:
-        return self.name_to_index.get(name)
-
-
-def build_runtime_table_mapping(
-    integral_ir: Any,
-    meta: IntegralRuntimeMeta,
-) -> RuntimeTableMapping:
-    """Build a mapping from FFCX tables to runtime table indices (backward compat)."""
-    from ffcx.ir.elementtables import get_modified_terminal_element
-    from ufl import Argument, Coefficient
-    from ufl.classes import Jacobian, SpatialCoordinate
-
-    mapping = RuntimeTableMapping()
-    expr_ir = integral_ir.expression
-
-    for (cell_type, qrule), integrand_data in expr_ir.integrand.items():
         factorization = integrand_data.get("factorization")
         if not factorization:
             continue
@@ -515,51 +400,42 @@ def build_runtime_table_mapping(
             element, averaged, local_derivatives, flat_component = mte
             terminal = mt.terminal
 
+            # Determine role and index
             if isinstance(terminal, Argument):
-                role = "argument"
+                if terminal.number() == 0:
+                    role = ArgumentRole.TEST
+                else:
+                    role = ArgumentRole.TRIAL
                 terminal_index = terminal.number()
             elif isinstance(terminal, Coefficient):
-                role = "coefficient"
+                role = ArgumentRole.COEFFICIENT
                 terminal_index = expr_ir.coefficient_numbering.get(terminal, -1)
-            elif isinstance(terminal, SpatialCoordinate):
-                role = "coordinate"
-                terminal_index = 0
-            elif isinstance(terminal, Jacobian):
-                role = "jacobian"
+            elif isinstance(terminal, (SpatialCoordinate, Jacobian)):
+                role = ArgumentRole.GEOMETRY
                 terminal_index = 0
             else:
                 continue
 
-            element_hash = (
-                hash(element) if hasattr(element, "__hash__") else id(element)
-            )
+            element_id = str(hash(element))
             ndofs = tr.values.shape[-1]
+            ncomps = 1
+            if hasattr(element, "block_size"):
+                ncomps = element.block_size
 
-            mapping.add_table(
-                name=tr.name,
-                element_hash=element_hash,
+            # Get or create element info
+            mapping.get_or_create_element(
+                element=element,
+                element_id=element_id,
+                ndofs=ndofs,
+                ncomps=ncomps,
+            )
+
+            # Add this usage
+            mapping.add_usage(
+                element_id=element_id,
                 role=role,
                 terminal_index=terminal_index,
-                component=flat_component,
-                derivative=local_derivatives,
-                ndofs=ndofs,
+                derivatives={tuple(local_derivatives)},
             )
 
     return mapping
-
-
-def generate_runtime_table_access(
-    table_name: str,
-    mapping: RuntimeTableMapping,
-    quadrature_index: str,
-    dof_index: str,
-) -> str:
-    """Generate C code to access a runtime table (old interface)."""
-    idx = mapping.get_index(table_name)
-    if idx is None:
-        raise ValueError(f"Unknown table: {table_name}")
-
-    info = mapping.tables[idx]
-    ndofs = info.ndofs
-
-    return f"rtables[{idx}][({quadrature_index}) * {ndofs} + ({dof_index})]"

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..analysis import ArgumentRole
 from ..runtime_tables import (
     DerivativeMapping,
     RuntimeElementMapping,
@@ -89,14 +90,22 @@ class RuntimeIntegralGenerator:
                 coord_ndofs = elem.ndofs
                 break
 
-        # Find argument element (for test/trial functions)
-        arg_elem_idx = None
-        arg_ndofs = 3
+        # Find argument elements (for test/trial functions)
+        test_elem_idx = None
+        test_ndofs = 3
+        trial_elem_idx = None
+        trial_ndofs = 3
         for elem in element_mapping.elements:
-            if elem.is_argument:
-                arg_elem_idx = elem.index
-                arg_ndofs = elem.ndofs
-                break
+            if elem.is_test:
+                test_elem_idx = elem.index
+                test_ndofs = elem.ndofs
+            if elem.is_trial:
+                trial_elem_idx = elem.index
+                trial_ndofs = elem.ndofs
+
+        # Use test element as generic argument element if both are same
+        arg_elem_idx = test_elem_idx
+        arg_ndofs = test_ndofs
 
         parts.append("  // Main quadrature loop")
         parts.append("  for (int iq = 0; iq < nq; ++iq)")
@@ -128,7 +137,6 @@ class RuntimeIntegralGenerator:
                 f"        // d/dX derivatives at deriv_idx={dx_deriv_idx}, "
                 f"d/dY at deriv_idx={dy_deriv_idx}"
             )
-            # Access: table[deriv_idx * nq * ndofs + q * ndofs + dof]
             parts.append(
                 f"        const double dphi_dX = coord_table["
                 f"{dx_deriv_idx} * nq * coord_ndofs + iq * coord_ndofs + k];"
@@ -137,8 +145,6 @@ class RuntimeIntegralGenerator:
                 f"        const double dphi_dY = coord_table["
                 f"{dy_deriv_idx} * nq * coord_ndofs + iq * coord_ndofs + k];"
             )
-            # Component 0 = x, component 1 = y (for blocked coordinate element)
-            # But we use separate loops for each component of coordinate_dofs
             parts.append("        J[0][0] += coordinate_dofs[k * 3 + 0] * dphi_dX;")
             parts.append("        J[1][0] += coordinate_dofs[k * 3 + 1] * dphi_dX;")
             parts.append("        J[0][1] += coordinate_dofs[k * 3 + 0] * dphi_dY;")
@@ -163,8 +169,9 @@ class RuntimeIntegralGenerator:
 
         # Generate tensor computation for Laplacian
         parts.append("    // Compute contribution to element tensor")
+        parts.append("    // For Laplacian: A[i,j] += (grad phi_i . grad phi_j) * w")
         parts.append(
-            "    // For Laplacian: A[i,j] += (grad phi_i . grad phi_j) * |detJ| * w"
+            "    // Note: weight should already include |detJ| from runtime quadrature"
         )
 
         if arg_elem_idx is not None:
@@ -177,8 +184,6 @@ class RuntimeIntegralGenerator:
             )
             parts.append(f"    const int ndofs = {arg_ndofs};")
             parts.append("    const double* arg_table = arg_elem->table;")
-            parts.append("")
-            parts.append("    const double factor = fabs(detJ) * weight;")
             parts.append("")
             parts.append("    for (int i = 0; i < ndofs; ++i)")
             parts.append("    {")
@@ -224,7 +229,7 @@ class RuntimeIntegralGenerator:
             parts.append("        // Accumulate: inner product of gradients")
             parts.append(
                 "        A[i * ndofs + j] += "
-                "(grad_i_x * grad_j_x + grad_i_y * grad_j_y) * factor;"
+                "(grad_i_x * grad_j_x + grad_i_y * grad_j_y) * weight;"
             )
             parts.append("      }")
             parts.append("    }")

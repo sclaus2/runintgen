@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "runintgen"
@@ -24,6 +24,18 @@ dev = [
     "pytest-cov",
     "ruff",
 ]
+cpp = [
+    "nanobind>=2.0",
+]
+
+[tool.scikit-build]
+cmake.source-dir = "cpp/python"
+cmake.build-type = "Release"
+wheel.packages = ["runintgen"]
+cmake.args = ["-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_PREFIX_PATH = {env = "CMAKE_PREFIX_PATH", default = ""}
 
 [tool.setuptools.packages.find]
 where = ["."]

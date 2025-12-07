@@ -27,7 +27,7 @@ from runintgen.codegeneration.C.integrals_template import (
     factory_runtime_kernel,
 )
 from runintgen.codegeneration.runtime_integrals import RuntimeIntegralGenerator
-from runintgen.runtime_tables import build_runtime_element_mapping
+from runintgen.runtime_tables import build_runtime_element_mapping_from_ir
 from runintgen.runtime_data import CFFI_DEF
 
 
@@ -110,8 +110,8 @@ def get_runtime_laplacian_kernel_generated():
     # Get the integral IR
     integral_ir = ir.integrals[0]
 
-    # Build element mapping
-    element_mapping = build_runtime_element_mapping(integral_ir)
+    # Build element mapping directly from IR
+    element_mapping = build_runtime_element_mapping_from_ir(integral_ir)
 
     # Generate the kernel body using our code generation
     rig = RuntimeIntegralGenerator(ir, None)
@@ -227,12 +227,11 @@ def get_runtime_laplacian_kernel():
     Jinv[1][1] = J[0][0] * inv_detJ;
 
     // Compute contribution to element tensor
-    // For Laplacian: A[i,j] += (grad phi_i . grad phi_j) * |detJ| * w
+    // For Laplacian: A[i,j] += (grad phi_i . grad phi_j) * w
+    // Note: weight should already include |detJ| from runtime quadrature
     const runintgen_element* arg_elem = &data->elements[0];
     const int ndofs = 3;
     const double* arg_table = arg_elem->table;
-
-    const double factor = fabs(detJ) * weight;
 
     for (int i = 0; i < ndofs; ++i)
     {
@@ -252,7 +251,7 @@ def get_runtime_laplacian_kernel():
         const double grad_j_y = Jinv[0][1] * dphi_j_dX + Jinv[1][1] * dphi_j_dY;
 
         // Accumulate: inner product of gradients
-        A[i * ndofs + j] += (grad_i_x * grad_j_x + grad_i_y * grad_j_y) * factor;
+        A[i * ndofs + j] += (grad_i_x * grad_j_x + grad_i_y * grad_j_y) * weight;
       }
     }
   }  // end quadrature loop
@@ -334,6 +333,18 @@ def compute_runtime_jit(coordinate_dofs, quadrature_degree=2):
     qpts, qwts = basix.make_quadrature(basix.CellType.triangle, quadrature_degree)
     nq = len(qwts)
 
+    # Compute Jacobian determinant for the cell (constant for P1 geometry)
+    # J = [dx/dX, dx/dY; dy/dX, dy/dY]
+    # For P1 triangle: J is computed from vertex coordinates
+    x0, y0 = coordinate_dofs[0, 0], coordinate_dofs[0, 1]
+    x1, y1 = coordinate_dofs[1, 0], coordinate_dofs[1, 1]
+    x2, y2 = coordinate_dofs[2, 0], coordinate_dofs[2, 1]
+    # Jacobian: J = [[x1-x0, x2-x0], [y1-y0, y2-y0]]
+    detJ = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+
+    # Scale weights by |detJ| - runtime kernels expect pre-scaled weights
+    qwts_scaled = qwts * np.abs(detJ)
+
     # Create P1 Lagrange element and tabulate
     P1_element = basix.create_element(basix.ElementFamily.P, basix.CellType.triangle, 1)
 
@@ -347,7 +358,7 @@ def compute_runtime_jit(coordinate_dofs, quadrature_degree=2):
 
     # Ensure arrays are contiguous
     qpts_flat = np.ascontiguousarray(qpts.flatten(), dtype=np.float64)
-    qwts_flat = np.ascontiguousarray(qwts, dtype=np.float64)
+    qwts_flat = np.ascontiguousarray(qwts_scaled, dtype=np.float64)
     coords_flat = np.ascontiguousarray(coordinate_dofs.flatten(), dtype=np.float64)
     table_flat = np.ascontiguousarray(table_flat)
 
@@ -357,20 +368,13 @@ def compute_runtime_jit(coordinate_dofs, quadrature_degree=2):
     elem.nderivs = 3  # (0,0), (1,0), (0,1)
     elem.table = ffi.cast("const double*", table_flat.ctypes.data)
 
-    # Create quadrature config (new multi-config structure)
-    config = ffi.new("runintgen_quadrature_config*")
-    config.nq = nq
-    config.points = ffi.cast("const double*", qpts_flat.ctypes.data)
-    config.weights = ffi.cast("const double*", qwts_flat.ctypes.data)
-    config.nelements = 1
-    config.elements = elem
-
-    # Create main runtime data struct (single-config mode)
+    # Create main runtime data struct (simplified single-config)
     data = ffi.new("runintgen_data*")
-    data.num_configs = 1
-    data.configs = config
-    data.active_config = 0  # Single-config mode
-    data.cell_config_map = ffi.NULL
+    data.nq = nq
+    data.points = ffi.cast("const double*", qpts_flat.ctypes.data)
+    data.weights = ffi.cast("const double*", qwts_flat.ctypes.data)
+    data.nelements = 1
+    data.elements = elem
 
     # Output array
     ndofs = 3
@@ -578,6 +582,18 @@ def compute_runtime_jit_generated(coordinate_dofs, quadrature_degree=2):
     qpts, qwts = basix.make_quadrature(basix.CellType.triangle, quadrature_degree)
     nq = len(qwts)
 
+    # Compute Jacobian determinant for the cell (constant for P1 geometry)
+    # J = [dx/dX, dx/dY; dy/dX, dy/dY]
+    # For P1 triangle: J is computed from vertex coordinates
+    x0, y0 = coordinate_dofs[0, 0], coordinate_dofs[0, 1]
+    x1, y1 = coordinate_dofs[1, 0], coordinate_dofs[1, 1]
+    x2, y2 = coordinate_dofs[2, 0], coordinate_dofs[2, 1]
+    # Jacobian: J = [[x1-x0, x2-x0], [y1-y0, y2-y0]]
+    detJ = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+
+    # Scale weights by |detJ| - runtime kernels expect pre-scaled weights
+    qwts_scaled = qwts * np.abs(detJ)
+
     # Create P1 Lagrange element and tabulate
     P1_element = basix.create_element(basix.ElementFamily.P, basix.CellType.triangle, 1)
 
@@ -599,7 +615,7 @@ def compute_runtime_jit_generated(coordinate_dofs, quadrature_degree=2):
 
     # Ensure arrays are contiguous
     qpts_flat = np.ascontiguousarray(qpts.flatten(), dtype=np.float64)
-    qwts_flat = np.ascontiguousarray(qwts, dtype=np.float64)
+    qwts_flat = np.ascontiguousarray(qwts_scaled, dtype=np.float64)
     coords_flat = np.ascontiguousarray(coordinate_dofs.flatten(), dtype=np.float64)
 
     # Create array of 2 element info structs
@@ -615,20 +631,13 @@ def compute_runtime_jit_generated(coordinate_dofs, quadrature_degree=2):
     elems[1].nderivs = 3
     elems[1].table = ffi.cast("const double*", table1_flat.ctypes.data)
 
-    # Create quadrature config (new multi-config structure)
-    config = ffi.new("runintgen_quadrature_config*")
-    config.nq = nq
-    config.points = ffi.cast("const double*", qpts_flat.ctypes.data)
-    config.weights = ffi.cast("const double*", qwts_flat.ctypes.data)
-    config.nelements = 2
-    config.elements = elems
-
-    # Create main runtime data struct (single-config mode)
+    # Create main runtime data struct (simplified single-config)
     data = ffi.new("runintgen_data*")
-    data.num_configs = 1
-    data.configs = config
-    data.active_config = 0  # Single-config mode
-    data.cell_config_map = ffi.NULL
+    data.nq = nq
+    data.points = ffi.cast("const double*", qpts_flat.ctypes.data)
+    data.weights = ffi.cast("const double*", qwts_flat.ctypes.data)
+    data.nelements = 2
+    data.elements = elems
 
     # Output array
     ndofs = 3

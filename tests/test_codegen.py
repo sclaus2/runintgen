@@ -102,16 +102,9 @@ class TestCodeGeneration:
         """Test that runintgen_data struct definition is available."""
         struct_def = get_runintgen_data_struct()
 
-        # Check main struct with multi-config support
+        # Check main struct (simplified single-config design)
         assert "typedef struct" in struct_def
         assert "runintgen_data" in struct_def
-        assert "num_configs" in struct_def
-        assert "runintgen_quadrature_config* configs" in struct_def
-        assert "active_config" in struct_def
-        assert "cell_config_map" in struct_def
-
-        # Check quadrature config structure
-        assert "runintgen_quadrature_config" in struct_def
         assert "int nq;" in struct_def
         assert "const double* points;" in struct_def
         assert "const double* weights;" in struct_def
@@ -123,6 +116,12 @@ class TestCodeGeneration:
         assert "int ndofs;" in struct_def
         assert "int nderivs;" in struct_def
         assert "const double* table;" in struct_def
+
+        # Verify old multi-config fields are NOT present
+        assert "num_configs" not in struct_def
+        assert "active_config" not in struct_def
+        assert "cell_config_map" not in struct_def
+        assert "runintgen_quadrature_config" not in struct_def
 
     def test_kernel_declaration(self):
         """Test that kernel declarations are generated correctly."""
@@ -170,8 +169,7 @@ class TestRuntimeElementMapping:
 
     def test_element_sharing_p1(self):
         """Test that P1 test/trial/coefficient share same element."""
-        from runintgen.analysis import build_runtime_info
-        from runintgen.fe_tables import extract_integral_metadata
+        from runintgen.analysis import build_runtime_analysis
         from runintgen.runtime_tables import build_runtime_element_mapping
 
         mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
@@ -185,35 +183,29 @@ class TestRuntimeElementMapping:
         dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
         a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
-        runtime_info = build_runtime_info(a, options={})
-        integral_metadata = extract_integral_metadata(runtime_info)
-        ir = runtime_info.ir
+        analysis = build_runtime_analysis(a, options={})
 
-        for group, meta in integral_metadata.items():
-            for integral_ir in ir.integrals:
-                if integral_ir.expression.integral_type == group.integral_type:
-                    mapping = build_runtime_element_mapping(integral_ir, meta)
+        for key, integral_info in analysis.integral_infos.items():
+            mapping = build_runtime_element_mapping(integral_info)
 
-                    # Should have 2 unique elements: P1 (shared) and coordinate
-                    assert len(mapping.elements) == 2
+            # Should have 2 unique elements: P1 (shared) and coordinate
+            assert len(mapping.elements) == 2
 
-                    # Find P1 element (ndofs=3, not coordinate)
-                    p1_elem = None
-                    for elem in mapping.elements:
-                        if elem.ndofs == 3 and not elem.is_coordinate:
-                            p1_elem = elem
-                            break
-
-                    assert p1_elem is not None
-                    assert p1_elem.is_argument
-                    assert p1_elem.is_coefficient
-                    assert p1_elem.max_derivative_order == 1
+            # Find P1 element (ndofs=3, not coordinate)
+            p1_elem = None
+            for elem in mapping.elements:
+                if elem.ndofs == 3 and not elem.is_coordinate:
+                    p1_elem = elem
                     break
+
+            assert p1_elem is not None
+            assert p1_elem.is_argument
+            assert p1_elem.is_coefficient
+            assert p1_elem.max_derivative_order == 1
 
     def test_element_separation_different_elements(self):
         """Test that different elements for coefficient are kept separate."""
-        from runintgen.analysis import build_runtime_info
-        from runintgen.fe_tables import extract_integral_metadata
+        from runintgen.analysis import build_runtime_analysis
         from runintgen.runtime_tables import build_runtime_element_mapping
 
         mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
@@ -229,41 +221,36 @@ class TestRuntimeElementMapping:
         dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
         a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
-        runtime_info = build_runtime_info(a, options={})
-        integral_metadata = extract_integral_metadata(runtime_info)
-        ir = runtime_info.ir
+        analysis = build_runtime_analysis(a, options={})
 
-        for group, meta in integral_metadata.items():
-            for integral_ir in ir.integrals:
-                if integral_ir.expression.integral_type == group.integral_type:
-                    mapping = build_runtime_element_mapping(integral_ir, meta)
+        for key, integral_info in analysis.integral_infos.items():
+            mapping = build_runtime_element_mapping(integral_info)
 
-                    # Should have 3 unique elements: P2, DG0, and coordinate
-                    assert len(mapping.elements) == 3
+            # Should have 3 unique elements: P2, DG0, and coordinate
+            assert len(mapping.elements) == 3
 
-                    # Find each element type
-                    p2_elem = dg0_elem = coord_elem = None
-                    for elem in mapping.elements:
-                        if elem.ndofs == 6:
-                            p2_elem = elem
-                        elif elem.ndofs == 1:
-                            dg0_elem = elem
-                        elif elem.is_coordinate:
-                            coord_elem = elem
+            # Find each element type
+            p2_elem = dg0_elem = coord_elem = None
+            for elem in mapping.elements:
+                if elem.ndofs == 6:
+                    p2_elem = elem
+                elif elem.ndofs == 1:
+                    dg0_elem = elem
+                elif elem.is_coordinate:
+                    coord_elem = elem
 
-                    assert p2_elem is not None
-                    assert p2_elem.is_argument
-                    assert not p2_elem.is_coefficient
-                    assert p2_elem.max_derivative_order == 1
+            assert p2_elem is not None
+            assert p2_elem.is_argument
+            assert not p2_elem.is_coefficient
+            assert p2_elem.max_derivative_order == 1
 
-                    assert dg0_elem is not None
-                    assert dg0_elem.is_coefficient
-                    assert not dg0_elem.is_argument
-                    assert dg0_elem.max_derivative_order == 0  # Only values
+            assert dg0_elem is not None
+            assert dg0_elem.is_coefficient
+            assert not dg0_elem.is_argument
+            assert dg0_elem.max_derivative_order == 0  # Only values
 
-                    assert coord_elem is not None
-                    assert coord_elem.is_coordinate
-                    break
+            assert coord_elem is not None
+            assert coord_elem.is_coordinate
 
     def test_derivative_to_index_2d(self):
         """Test derivative tuple to basix index mapping for 2D."""

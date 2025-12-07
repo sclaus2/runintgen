@@ -32,9 +32,15 @@ pip install -e .
 ## Quick Start
 
 ```python
+import numpy as np
+import basix
 import ufl
 from basix.ufl import element
-from runintgen import compile_runtime_integrals
+
+from runintgen import (
+    compile_runtime_integrals,
+    prepare_runtime_data_for_cell,
+)
 
 # Define mesh and function space
 mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
@@ -44,7 +50,7 @@ u = ufl.TrialFunction(V)
 v = ufl.TestFunction(V)
 
 # Create a runtime measure using standard UFL with special metadata
-dx_rt = ufl.Measure("dx", domain=mesh, subdomain_id=1,
+dx_rt = ufl.Measure("dx", domain=mesh,
                     metadata={"quadrature_rule": "runtime"})
 
 # Define a bilinear form using the runtime measure
@@ -57,7 +63,11 @@ module = compile_runtime_integrals(a)
 for kernel in module.kernels:
     print(f"Kernel: {kernel.name}")
     print(f"Integral type: {kernel.integral_type}")
-    print(f"Subdomain ID: {kernel.subdomain_id}")
+    print(f"Required element tables: {len(kernel.table_info)}")
+
+    # Inspect element table requirements
+    for t in kernel.table_info:
+        print(f"  - ndofs={t['ndofs']}, max_deriv={t['max_derivative_order']}")
 ```
 
 ## Key Concepts
@@ -70,16 +80,15 @@ Use standard UFL measures with `metadata={"quadrature_rule": "runtime"}` to mark
 import ufl
 
 # Cell integral with runtime quadrature
-dx_rt = ufl.Measure("dx", domain=mesh, subdomain_id=1,
+dx_rt = ufl.Measure("dx", domain=mesh,
                     metadata={"quadrature_rule": "runtime"})
 
 # Exterior facet integral with runtime quadrature  
-ds_rt = ufl.Measure("ds", domain=mesh, subdomain_id=2,
+ds_rt = ufl.Measure("ds", domain=mesh,
                     metadata={"quadrature_rule": "runtime"})
 
-# You can also pass a quadrature provider object via subdomain_data
-provider = MyQuadratureProvider()
-dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=provider,
+# Interior facet integral with runtime quadrature
+dS_rt = ufl.Measure("dS", domain=mesh,
                     metadata={"quadrature_rule": "runtime"})
 ```
 
@@ -92,142 +101,116 @@ dx_rt = ufl.Measure("dx", domain=mesh,
                     metadata={"quadrature_rule": RUNTIME_QUADRATURE_RULE})
 ```
 
-### FE Table Metadata Extraction
-
-Extract information about which finite elements, components, and derivatives are needed:
-
-```python
-from runintgen import extract_integral_metadata
-from runintgen.analysis import build_runtime_info
-from ffcx.options import get_options
-
-# Build runtime info from a form
-runtime_info = build_runtime_info(a, get_options())
-
-# Extract metadata for each runtime integral
-metadata = extract_integral_metadata(runtime_info)
-
-for group, meta in metadata.items():
-    print(f"Integral type: {group.integral_type}")
-    print(f"Component requests: {len(meta.component_requests)}")
-    for req in meta.component_requests:
-        print(f"  - {req.role}[{req.index}]: deriv={req.local_derivatives}")
-```
-
 ### Runtime Data Structures
 
-The compiled kernels use a runtime data structure to receive quadrature and FE tables:
+The compiled kernels use a simplified runtime data structure:
 
 ```c
 typedef struct {
-    int ndofs;
-    int ncomps;
-    double* table;  // [nderivs * nq * ndofs]
+  int ndofs;
+  int nderivs;
+  const double* table;  // [nderivs, nq, ndofs] flattened
 } runintgen_element;
 
 typedef struct {
-    int nq;
-    const double* weights;
-    const double* points;
-    int nelements;
-    runintgen_element* elements;
-} runintgen_quadrature_config;
-
-typedef struct {
-    int active_config;      // >= 0: single-config mode, < 0: multi-config mode
-    int nconfigs;
-    runintgen_quadrature_config* configs;
-    int* cell_config_map;   // For multi-config: maps cell index to config
+  int nq;                              // Number of quadrature points
+  const double* points;                // [nq * tdim] quadrature points
+  const double* weights;               // [nq] weights (should include |detJ|)
+  int nelements;                       // Number of element tables
+  const runintgen_element* elements;   // Array of element tables
 } runintgen_data;
 ```
 
-Build runtime data using the Python API:
+**Important**: The weights should already include `|detJ|` (Jacobian determinant). The generated kernel does NOT multiply by `|detJ|` internally—this is the caller's responsibility.
+
+### Preparing Runtime Data
+
+Use the tabulation utilities to automatically prepare runtime data from kernel metadata:
 
 ```python
-from runintgen import RuntimeDataBuilder, QuadratureConfig, tabulate_element
-import basix
-
-# Create quadrature rule
-qpts, qwts = basix.make_quadrature(basix.CellType.triangle, 2)
-
-# Create P1 element and tabulate
-P1 = basix.create_element(basix.ElementFamily.P, basix.CellType.triangle, 1)
-
-# Build runtime data
-builder = RuntimeDataBuilder(ffi)  # ffi from cffi
-
-config = QuadratureConfig(points=qpts, weights=qwts)
-config.elements.append(tabulate_element(P1, qpts, max_deriv_order=1))
-config.elements.append(tabulate_element(P1, qpts, max_deriv_order=1))  # coord element
-
-builder.add_config(config)
-runtime_data = builder.build()  # Single-config mode
-
-# For multi-config (different cells use different quadrature):
-cell_config_map = np.array([0, 0, 1, 0, 1], dtype=np.int32)  
-runtime_data = builder.build(cell_config_map=cell_config_map)
-```
-
-### DOLFINx Integration
-
-Use runtime kernels with the DOLFINx assembler:
-
-```python
-from mpi4py import MPI
-from dolfinx import mesh, fem
 from runintgen import (
-    compile_runtime_kernels,
-    create_dolfinx_form_with_runtime,
-    set_runtime_data,
-    RuntimeDataBuilder,
-    QuadratureConfig,
-    tabulate_element,
+    compile_runtime_integrals,
+    prepare_runtime_data_for_cell,
 )
 
-# Create mesh and function space
-msh = mesh.create_unit_square(MPI.COMM_WORLD, 4, 4)
-V = fem.functionspace(msh, ("Lagrange", 1))
+# Compile the form
+module = compile_runtime_integrals(form)
+kernel_info = module.kernels[0]
 
-# Define UFL form with runtime quadrature
-u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
-dx_rt = ufl.Measure("dx", domain=msh.ufl_domain(),
-                    metadata={"quadrature_rule": "runtime"})
-a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+# Define cell coordinates
+coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
 
-# Compile kernels (JIT compiles C code)
-runtime_info = compile_runtime_kernels(a)
+# Prepare runtime data (auto-computes |detJ| and scales weights)
+prepared = prepare_runtime_data_for_cell(
+    kernel_info, coords, quadrature_degree=4
+)
 
-# Set up quadrature data
-builder = RuntimeDataBuilder(runtime_info.ffi)
-config = QuadratureConfig(points=qpts, weights=qwts)
-# ... add element tables ...
-builder.add_config(config)
-rdata = builder.build()
-
-# Create DOLFINx form with custom kernel
-form = create_dolfinx_form_with_runtime([V, V], runtime_info, msh)
-
-# Set runtime data pointer
-data_ptr = int(runtime_info.ffi.cast("intptr_t", rdata))
-set_runtime_data(form, fem.IntegralType.cell, subdomain_id, data_ptr)
-
-# Assemble
-A = fem.assemble_matrix(form)
-A.scatter_reverse()
+# Build the C data structure
+data = prepared.builder.build()
 ```
 
-See `examples/dolfinx_integration.py` for a complete working example.
+For more control, use `prepare_runtime_data()` with pre-scaled weights:
 
-### Component Requests
+```python
+from runintgen import prepare_runtime_data, compute_detJ_triangle
+import basix
 
-Each `ComponentRequest` contains:
+# Get quadrature rule
+points, weights = basix.make_quadrature(basix.CellType.triangle, 4)
 
-- `element`: The basix finite element
-- `role`: "argument", "coefficient", "jacobian", or "coordinate"
-- `index`: Argument number (0=test, 1=trial) or coefficient index
-- `component`: Flat component index for vector/tensor elements
-- `max_deriv`: Maximum derivative order needed
-- `local_derivatives`: Tuple of derivative counts per reference direction
+# Compute and apply |detJ|
+detJ = compute_detJ_triangle(coords)
+weights_scaled = weights * np.abs(detJ)
+
+# Prepare runtime data
+prepared = prepare_runtime_data(kernel_info, points, weights_scaled)
+data = prepared.builder.build()
+```
+
+### Low-Level RuntimeDataBuilder API
+
+For maximum control, use `RuntimeDataBuilder` directly:
+
+```python
+from runintgen import RuntimeDataBuilder, ElementTableInfo, CFFI_DEF
+import cffi
+
+# Create FFI instance
+ffi = cffi.FFI()
+ffi.cdef(CFFI_DEF)
+
+# Create builder
+builder = RuntimeDataBuilder(ffi)
+
+# Set quadrature (weights should include |detJ|)
+builder.set_quadrature(points, weights_scaled)
+
+# Add element tables
+builder.add_element_table(ElementTableInfo(
+    ndofs=3,
+    nderivs=3,  # (0,0), (1,0), (0,1)
+    table=table_array  # shape [nderivs, nq, ndofs]
+))
+
+# Build the structure
+data = builder.build()
+```
+
+### Kernel Table Info
+
+Each `RuntimeKernelInfo` contains `table_info` describing required element tables:
+
+```python
+for kernel in module.kernels:
+    for t in kernel.table_info:
+        print(f"Element {t['index']}:")
+        print(f"  ndofs: {t['ndofs']}")
+        print(f"  ncomps: {t['ncomps']}")
+        print(f"  max_derivative_order: {t['max_derivative_order']}")
+        print(f"  is_argument: {t['is_argument']}")
+        print(f"  is_coordinate: {t['is_coordinate']}")
+        print(f"  usages: {[u['role'] for u in t['usages']]}")
+```
 
 ## Architecture
 
@@ -235,25 +218,22 @@ Each `ComponentRequest` contains:
 UFL form with runtime measure (metadata={"quadrature_rule": "runtime"})
   │
   v
-runintgen.analysis.build_runtime_info
-  │  (scan form_data.integral_data, identify runtime integrals)
+runintgen.analysis.build_runtime_analysis
+  │  (scan form, identify runtime integrals, extract element info)
   v
-FFCX analysis + IR (with stripped runtime metadata)
+FFCX analysis + IR computation
   │
-  v
-runintgen.fe_tables.extract_integral_metadata
-  │  (extract element/component/derivative requirements)
   v
 runintgen.codegeneration.generate_C_runtime_kernels
-  │  (generate C code for runtime integrals)
+  │  (generate C code with runtime quadrature/tables)
   v
-C runtime kernels + metadata
-  │
+RunintModule with RuntimeKernelInfo
+  │  (contains C code + table_info metadata)
   v
-JIT compile with cffi → function pointers
-  │
+prepare_runtime_data / RuntimeDataBuilder
+  │  (tabulate elements, build C structures)
   v
-DOLFINx Form with custom kernel + custom_data
+Call kernel with runintgen_data*
 ```
 
 ## API Reference
@@ -267,34 +247,41 @@ DOLFINx Form with custom kernel + custom_data
 ### Compilation
 
 - `compile_runtime_integrals(form, options=None)`: Compile a form, returns `RunintModule`
-- `compile_runtime_kernels(form, options=None)`: Compile and JIT, returns `RuntimeFormInfo`
-- `RunintModule`: Container for compiled runtime kernels (C code)
-- `RuntimeKernelInfo`: Information about a single runtime kernel
-- `RuntimeFormInfo`: Compiled kernels with function pointers
-- `CompiledKernel`: A compiled kernel ready for DOLFINx
+- `RunintModule`: Container for compiled runtime kernels
+- `RuntimeKernelInfo`: Information about a single runtime kernel (name, C code, table_info)
 
-### DOLFINx Integration
+### Tabulation Utilities
 
-- `create_dolfinx_form_with_runtime(spaces, runtime_info, mesh)`: Create DOLFINx Form
-- `set_runtime_data(form, integral_type, subdomain_id, data_ptr)`: Set custom_data
+- `prepare_runtime_data(kernel_info, points, weights)`: Prepare data from kernel metadata
+- `prepare_runtime_data_for_cell(kernel_info, coords, quadrature_degree)`: Auto-compute |detJ|
+- `tabulate_from_table_info(table_info, points)`: Tabulate single element from metadata
+- `compute_detJ_triangle(coords)`: Compute Jacobian determinant for P1 triangle
+- `PreparedTables`: Container with builder, ffi, and table arrays
 
 ### Runtime Data
 
-- `RuntimeDataBuilder`: Builder for runtime quadrature data structures
-- `QuadratureConfig`: Configuration for a quadrature rule
-- `tabulate_element(element, points, max_deriv_order)`: Tabulate element at points
-- `get_runintgen_data_struct()`: Get C struct definition
+- `RuntimeDataBuilder`: Builder for runtime data structures
+- `ElementTableInfo`: Container for element tabulation data
+- `tabulate_element(element, points, max_deriv_order)`: Tabulate basix element
+- `CFFI_DEF`: C struct definitions for CFFI
+- `to_intptr(ffi, data)`: Convert pointer to integer for FFI
 
-### Metadata Extraction
+### Analysis
 
-- `extract_integral_metadata(runtime_info)`: Extract FE table metadata from IR
-- `ComponentRequest`: Request for a specific element component
-- `IntegralRuntimeMeta`: Aggregated metadata for an integral
+- `build_runtime_analysis(form, options)`: Full analysis returning `RuntimeAnalysisInfo`
+- `RuntimeAnalysisInfo`: Contains IR, runtime groups, and integral metadata
+- `ArgumentInfo`, `ElementInfo`, `RuntimeIntegralInfo`: Analysis data structures
+
+### Code Generation
+
+- `get_runintgen_data_struct()`: Get C struct definition string
 
 ## Examples
 
-- `examples/simple_example.py`: Basic usage showing kernel generation
-- `examples/dolfinx_integration.py`: Full DOLFINx integration with assembly
+- `examples/laplacian_runtime.py`: Basic P2 Laplacian kernel generation
+- `examples/elasticity_runtime.py`: Vector-valued linear elasticity
+- `examples/stokes_runtime.py`: Mixed Stokes problem (Taylor-Hood P2-P1)
+- `examples/tabulation_example.py`: Generic tabulation workflow
 
 ## License
 
