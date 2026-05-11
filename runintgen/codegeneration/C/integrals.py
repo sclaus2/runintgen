@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from ...analysis import RuntimeAnalysisInfo
+from ...form_metadata import FormRuntimeMetadata, Role
 from ...runtime_api import RuntimeKernelInfo
 from ...runtime_tables import build_runtime_element_mapping_from_ir
 from ..runtime_integrals import RuntimeIntegralGenerator
@@ -44,12 +45,14 @@ def dtype_to_scalar_dtype(dtype: str) -> str:
 def generate_C_runtime_kernels(
     analysis: RuntimeAnalysisInfo,
     options: dict[str, Any],
+    form_metadata: FormRuntimeMetadata | None = None,
 ) -> list[RuntimeKernelInfo]:
     """Generate C kernels for all runtime integrals in the analysis.
 
     Args:
         analysis: RuntimeAnalysisInfo object from analysis phase.
         options: Compilation options dictionary.
+        form_metadata: Optional FormRuntimeMetadata for Plan v2 table slots.
 
     Returns:
         List of RuntimeKernelInfo objects, one per runtime integral.
@@ -120,7 +123,7 @@ def generate_C_runtime_kernels(
             geom=geom_c,
         )
 
-        # Collect element info for runtime
+        # Collect element info for runtime (legacy format)
         element_info = [
             {
                 "index": e.index,
@@ -145,15 +148,27 @@ def generate_C_runtime_kernels(
             for e in element_mapping.elements
         ]
 
+        # Build table_slots from form_metadata (Plan v2)
+        table_slots: dict[str, int] | None = None
+        if form_metadata is not None:
+            layout = form_metadata.get_integral_layout(itype, ir_index)
+            if layout is not None:
+                table_slots = {
+                    f"{role.name.lower()}_{tidx}": slot
+                    for (role, tidx), slot in layout.terminal_to_table_slot.items()
+                }
+
         kernels.append(
             RuntimeKernelInfo(
                 name=func_name,
                 integral_type=itype,
                 subdomain_id=subdomain_id,
+                ir_index=ir_index,
                 c_declaration=c_decl,
                 c_definition=c_def,
                 tensor_shape=None,
                 table_info=element_info,
+                table_slots=table_slots,
             )
         )
 

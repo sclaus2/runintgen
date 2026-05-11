@@ -21,6 +21,18 @@ from .dolfinx_utils import (
     create_dolfinx_form_with_runtime,
     set_runtime_data,
 )
+from .form_metadata import (
+    ElementKey,
+    FormElementInfo,
+    FormRuntimeMetadata,
+    IntegralElementUsage,
+    IntegralRuntimeLayout,
+    Role,
+    build_form_runtime_metadata,
+    element_key_from_basix,
+    element_key_from_ufl,
+    export_metadata_for_cpp,
+)
 from .geometry import (
     generate_subcell_quadrature,
     map_quadrature_to_subcell,
@@ -76,6 +88,17 @@ __all__ = [
     "compile_runtime_kernels",
     "create_dolfinx_form_with_runtime",
     "set_runtime_data",
+    # Form metadata (Plan v2)
+    "ElementKey",
+    "FormElementInfo",
+    "FormRuntimeMetadata",
+    "IntegralElementUsage",
+    "IntegralRuntimeLayout",
+    "Role",
+    "build_form_runtime_metadata",
+    "element_key_from_basix",
+    "element_key_from_ufl",
+    "export_metadata_for_cpp",
     # Geometry utilities
     "generate_subcell_quadrature",
     "map_quadrature_to_subcell",
