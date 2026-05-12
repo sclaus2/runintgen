@@ -190,6 +190,26 @@ class TestBuildRuntimeAnalysis:
         assert 1 in group.subdomain_ids
         assert group.quadrature_provider is provider
 
+    def test_standard_and_runtime_same_integral_type_coexist(self, mesh, V, options):
+        """Test only runtime-marked integral-data groups are selected."""
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=0)
+        dx_runtime = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_id=2,
+            metadata={"quadrature_rule": "runtime"},
+        )
+        a = ufl.inner(u, v) * dx_standard
+        a += ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_runtime
+
+        analysis = build_runtime_analysis(a, options)
+
+        assert list(analysis.integral_infos) == [("cell", 1)]
+        info = analysis.integral_infos[("cell", 1)]
+        assert info.subdomain_id == 2
+
 
 class TestElementInfo:
     """Tests for ElementInfo dataclass."""

@@ -321,7 +321,10 @@ def example_dolfinx_integration():
 
     # Create Form with custom kernel
     active_coeffs = np.array([], dtype=np.int8)
-    integrals = {IntegralType.cell: [(0, kernel_ptr, cells, active_coeffs)]}
+    runtime_data_ptr = int(ffi.cast("intptr_t", runtime_data))
+    integrals = {
+        IntegralType.cell: [(0, kernel_ptr, cells, active_coeffs, runtime_data_ptr)]
+    }
 
     form = Form(
         _cpp.fem.Form_float64(
@@ -334,11 +337,6 @@ def example_dolfinx_integration():
             mesh=mesh._cpp_object,
         )
     )
-
-    # Set custom_data on the form using the new DOLFINx API
-    # This passes the runtime data pointer directly to the kernel
-    runtime_data_ptr = int(ffi.cast("intptr_t", runtime_data))
-    form._cpp_object.set_custom_data(IntegralType.cell, 0, 0, runtime_data_ptr)
 
     # Assemble the matrix
     A = fem.assemble_matrix(form)

@@ -219,12 +219,13 @@ def create_dolfinx_form_with_runtime(
     cells: npt.NDArray[np.int32] | None = None,
     coefficients: list | None = None,
     constants: list | None = None,
+    custom_data: int | dict[tuple[Any, ...], int | None] | None = None,
 ) -> "Form":
     """Create a DOLFINx Form using compiled runtime kernels.
 
     This creates a Form that uses runtime kernels instead of FFCX-generated
-    kernels. The custom_data pointer will need to be set with runtime
-    quadrature data before assembly.
+    kernels. Runtime quadrature data must be supplied at construction time
+    through ``custom_data``.
 
     Args:
         function_spaces: List of DOLFINx function spaces [test, trial] or [test].
@@ -234,16 +235,16 @@ def create_dolfinx_form_with_runtime(
             If None, all cells are used.
         coefficients: Optional list of coefficients.
         constants: Optional list of constants.
+        custom_data: Optional runtime data pointer used for all kernels, or
+            a dictionary keyed by ``(integral_type, subdomain_id, kernel_idx)``
+            for per-integral pointers. ``None`` passes a null pointer.
 
     Returns:
-        A DOLFINx Form ready for assembly (after setting custom_data).
+        A DOLFINx Form ready for assembly.
 
     Example:
         >>> form = create_dolfinx_form_with_runtime(
-        ...     [V, V], runtime_info, mesh
-        ... )
-        >>> form._cpp_object.set_custom_data(
-        ...     IntegralType.cell, subdomain_id, 0, runtime_data_ptr
+        ...     [V, V], runtime_info, mesh, custom_data=runtime_data_ptr
         ... )
         >>> A = fem.assemble_matrix(form)
     """
@@ -261,7 +262,7 @@ def create_dolfinx_form_with_runtime(
     # Build integrals dict for DOLFINx
     integrals: dict[IntegralType, list] = {}
 
-    for kernel in runtime_info.kernels:
+    for kernel_idx, kernel in enumerate(runtime_info.kernels):
         itype = _ufl_to_dolfinx_integral_type(kernel.integral_type)
 
         if itype not in integrals:
@@ -270,8 +271,12 @@ def create_dolfinx_form_with_runtime(
         # Empty active coefficients for now (could be extracted from kernel info)
         active_coeffs = np.array([], dtype=np.int8)
 
+        data_ptr = _resolve_custom_data(
+            custom_data, itype, kernel.subdomain_id, kernel_idx
+        )
+
         integrals[itype].append(
-            (kernel.subdomain_id, kernel.kernel_ptr, cells, active_coeffs)
+            (kernel.subdomain_id, kernel.kernel_ptr, cells, active_coeffs, data_ptr)
         )
 
     # Create the Form
@@ -311,6 +316,31 @@ def _ufl_to_dolfinx_integral_type(ufl_type: str) -> "IntegralType":
     return mapping[ufl_type]
 
 
+def _resolve_custom_data(
+    custom_data: int | dict[tuple[Any, ...], int | None] | None,
+    integral_type: Any,
+    subdomain_id: int,
+    kernel_idx: int,
+) -> int | None:
+    """Resolve a custom data pointer for one generated kernel."""
+    if custom_data is None:
+        return None
+    if not isinstance(custom_data, dict):
+        return int(custom_data)
+
+    keys = (
+        (integral_type, subdomain_id, kernel_idx),
+        (integral_type, subdomain_id),
+        (subdomain_id, kernel_idx),
+        (subdomain_id,),
+    )
+    for key in keys:
+        if key in custom_data:
+            value = custom_data[key]
+            return None if value is None else int(value)
+    return None
+
+
 def set_runtime_data(
     form: "Form",
     integral_type: "IntegralType",
@@ -319,6 +349,9 @@ def set_runtime_data(
     kernel_idx: int = 0,
 ) -> None:
     """Set the runtime data pointer for a runtime integral.
+
+    Runtime data is now attached through the DOLFINx Form constructor. Pass
+    ``custom_data`` to ``create_dolfinx_form_with_runtime`` instead.
 
     Args:
         form: The DOLFINx Form.
@@ -329,11 +362,14 @@ def set_runtime_data(
 
     Example:
         >>> data_ptr = int(ffi.cast("intptr_t", rdata))
-        >>> set_runtime_data(form, IntegralType.cell, 1, data_ptr)
+        >>> form = create_dolfinx_form_with_runtime(
+        ...     [V, V], runtime_info, mesh, custom_data=data_ptr
+        ... )
     """
     if not HAS_DOLFINX:
         raise ImportError("DOLFINx is required for this function")
 
-    form._cpp_object.set_custom_data(
-        integral_type, subdomain_id, kernel_idx, runtime_data_ptr
+    raise RuntimeError(
+        "DOLFINx custom_data is set at Form construction time. Pass "
+        "custom_data to create_dolfinx_form_with_runtime instead."
     )

@@ -26,8 +26,10 @@ class RuntimeKernelInfo:
         c_declaration: The C function declaration (header).
         c_definition: The C function definition (implementation).
         tensor_shape: The shape of the output tensor, if known.
-        table_info: List of dicts describing required FE tables (legacy).
-        table_slots: Map from (role, terminal_index) to table slot index.
+        table_info: List of dicts describing required FFCx table requests.
+        table_slots: Map from FFCx table name to table slot index.
+        scalar_type: NumPy scalar type used for A, w, and c.
+        geometry_type: Real NumPy type used for coordinate_dofs, following FFCx.
     """
 
     name: str
@@ -39,6 +41,10 @@ class RuntimeKernelInfo:
     tensor_shape: tuple[int, ...] | None = None
     table_info: list[dict[str, Any]] | None = None
     table_slots: dict[str, int] | None = None
+    domain: str | None = None
+    kernel_id: int = 0
+    scalar_type: str | None = None
+    geometry_type: str | None = None
 
 
 @dataclass
@@ -89,6 +95,7 @@ def compile_runtime_integrals(
     from .form_metadata import build_form_runtime_metadata
 
     options = dict(options or {})
+    options["sum_factorization"] = False
     runtime_info = build_runtime_info(form, options)
 
     # Build form-level metadata (Plan v2)

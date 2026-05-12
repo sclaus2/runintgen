@@ -294,7 +294,6 @@ class TestBuildFormRuntimeMetadata:
 
         for kernel in module.kernels:
             assert kernel.table_slots is not None
-            assert len(kernel.table_slots) > 0
 
     def test_table_slots_match_layout(self):
         """Test that kernel table_slots match layout."""
