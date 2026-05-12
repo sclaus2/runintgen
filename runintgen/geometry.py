@@ -208,7 +208,7 @@ def push_forward(
     celem = create_coordinate_element(cell_type, degree=1, dtype=X.dtype)
 
     # Tabulate basis functions (no derivatives)
-    tab = celem.tabulate(0, X.reshape(-1))  # shape: (1, num_points, num_dofs, 1)
+    tab = celem.tabulate(0, X)  # shape: (1, num_points, num_dofs, 1)
     phi = tab[0, :, :, 0]  # shape: (num_points, num_dofs)
 
     # x = phi @ coord_dofs
@@ -238,7 +238,7 @@ def pull_back_affine(
 
     # Tabulate at reference origin to get Jacobian
     origin = np.zeros((1, tdim), dtype=x.dtype)
-    tab = celem.tabulate(1, origin.reshape(-1))
+    tab = celem.tabulate(1, origin)
 
     # Extract derivatives: dphi[d] has shape (1, num_dofs, 1)
     # We want dphi shape (tdim, num_dofs)
@@ -281,7 +281,7 @@ def map_quadrature_to_physical(
     num_points = ref_points.shape[0]
 
     # Tabulate with first derivatives
-    tab = celem.tabulate(1, ref_points.reshape(-1))
+    tab = celem.tabulate(1, ref_points)
 
     # Compute physical points: x = phi @ coord_dofs
     phi = tab[0, :, :, 0]  # (num_points, num_dofs)
@@ -376,7 +376,7 @@ def scale_weights_by_jacobian(
 
     # Tabulate derivatives at origin (constant for affine elements)
     origin = np.zeros((1, tdim), dtype=weights.dtype)
-    tab = celem.tabulate(1, origin.reshape(-1))
+    tab = celem.tabulate(1, origin)
 
     dphi = np.zeros((tdim, tab.shape[2]), dtype=weights.dtype)
     for d in range(tdim):

@@ -1,18 +1,4 @@
-"""Runtime data structures for runintgen kernels.
-
-This module provides Python classes and helpers to create and manage
-the runtime data structures (runintgen_data) that are passed
-to generated kernels via the custom_data pointer.
-
-Usage:
-    # Create runtime data
-    builder = RuntimeDataBuilder(ffi)
-    builder.set_quadrature(quadrature_points, quadrature_weights)
-    builder.add_element_table(ElementTableInfo(ndofs=3, nderivs=3, table=...))
-    data_ptr = builder.build()
-
-    # Use with DOLFINx Form via custom_data
-"""
+"""Runtime C ABI helpers for runintgen kernels."""
 
 from __future__ import annotations
 
@@ -22,218 +8,178 @@ from typing import TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
+from .runtime_abi import RUNTIME_ABI_CDEF
+
 if TYPE_CHECKING:
     import cffi
 
 
-@dataclass
-class ElementTableInfo:
-    """Information about a finite element's tabulated values.
+CFFI_DEF = RUNTIME_ABI_CDEF
 
-    Attributes:
-        ndofs: Number of degrees of freedom.
-        nderivs: Number of derivative components in the table.
-        table: Tabulated values with shape [nderivs, nq, ndofs] or flattened.
+
+@dataclass
+class RuntimeQuadratureRule:
+    """Reference quadrature carried by ``custom_data``.
+
+    Weights are expected to be pre-scaled by the runtime integration provider,
+    including the relevant cell/facet/cut measure scaling.
     """
 
-    ndofs: int
-    nderivs: int
-    table: npt.NDArray[np.float64]
+    points: npt.NDArray[np.float64]
+    weights: npt.NDArray[np.float64]
+
+    def __post_init__(self) -> None:
+        """Normalise quadrature arrays."""
+        self.points = np.ascontiguousarray(self.points, dtype=np.float64)
+        self.weights = np.ascontiguousarray(self.weights, dtype=np.float64)
+        if self.points.ndim != 2:
+            raise ValueError("Runtime quadrature points must have shape (nq, tdim).")
+        if self.points.shape[0] != self.weights.shape[0]:
+            raise ValueError("Runtime quadrature points and weights disagree on nq.")
+
+    @property
+    def nq(self) -> int:
+        """Number of quadrature points."""
+        return int(self.weights.shape[0])
+
+    @property
+    def tdim(self) -> int:
+        """Reference point dimension."""
+        return int(self.points.shape[1])
 
 
-class RuntimeDataBuilder:
-    """Builder for runintgen_data structures.
+@dataclass
+class RuntimeBasixElement:
+    """Opaque Basix element handle carried by ``custom_data``."""
 
-    This class helps construct the C structures needed by runtime kernels,
-    handling memory management and layout for CFFI.
+    handle: int = 0
+    tabulate: int = 0
 
-    Example:
-        builder = RuntimeDataBuilder(ffi)
-        builder.set_quadrature(points, weights)
-        builder.add_element_table(ElementTableInfo(ndofs=3, nderivs=3, table=table))
-        data = builder.build()
-        # data can be passed to kernel via custom_data
+
+@dataclass
+class RuntimeTableRequest:
+    """Generated request for one FFCx table-reference slot."""
+
+    slot: int
+    element_index: int
+    derivative_counts: tuple[int, ...] = ()
+    flat_component: int | None = None
+    num_permutations: int = 1
+    num_entities: int = 1
+    num_dofs: int = 0
+    block_size: int | None = None
+    offset: int | None = None
+    is_uniform: bool = False
+    is_permuted: bool = False
+
+    @property
+    def derivative_order(self) -> int:
+        """Total derivative order."""
+        return int(sum(self.derivative_counts))
+
+
+@dataclass
+class RuntimeTableView:
+    """One flattened runtime view of an FFCx table reference."""
+
+    values: npt.NDArray[np.float64]
+    num_permutations: int
+    num_entities: int
+    num_points: int
+    num_dofs: int
+
+    def __post_init__(self) -> None:
+        """Normalise values to contiguous float64 storage."""
+        self.values = np.ascontiguousarray(self.values, dtype=np.float64)
+        expected = (
+            self.num_permutations
+            * self.num_entities
+            * self.num_points
+            * self.num_dofs
+        )
+        if self.values.size != expected:
+            raise ValueError(
+                f"Runtime table has {self.values.size} values, expected {expected}."
+            )
+
+
+class RuntimeContextBuilder:
+    """Pack a runtime context into CFFI structures.
+
+    This helper is intended for tests and lightweight JIT use. Production
+    DOLFINx/CutFEMx integration should populate the same C ABI from C++ and
+    implement each element's `tabulate` function pointer using real Basix
+    elements and wrapper-owned scratch storage.
     """
 
     def __init__(self, ffi: "cffi.FFI") -> None:
-        """Initialize the builder.
-
-        Args:
-            ffi: CFFI FFI instance with runintgen struct definitions.
-        """
+        """Initialise the builder."""
         self.ffi = ffi
-        self._points: npt.NDArray[np.float64] | None = None
-        self._weights: npt.NDArray[np.float64] | None = None
-        self._elements: list[ElementTableInfo] = []
-        # Keep references to prevent garbage collection
-        self._refs: list = []
+        self._refs: list[object] = []
 
-    def set_quadrature(
+    def build_context(
         self,
-        points: npt.NDArray[np.float64],
-        weights: npt.NDArray[np.float64],
-    ) -> None:
-        """Set the quadrature rule.
-
-        Args:
-            points: Quadrature points, shape [nq, tdim].
-            weights: Quadrature weights, shape [nq].
-        """
-        points = np.asarray(points, dtype=np.float64)
-        weights = np.asarray(weights, dtype=np.float64)
-        if points.shape[0] != weights.shape[0]:
-            raise ValueError(
-                f"Number of points ({points.shape[0]}) must match "
-                f"number of weights ({weights.shape[0]})"
-            )
-        self._points = points
-        self._weights = weights
-
-    def add_element_table(self, table_info: ElementTableInfo) -> int:
-        """Add an element table.
-
-        Args:
-            table_info: ElementTableInfo with tabulated values.
-
-        Returns:
-            The index of the added element in data->elements.
-        """
-        self._elements.append(table_info)
-        return len(self._elements) - 1
-
-    def build(self) -> "cffi.CData":
-        """Build the runintgen_data structure.
-
-        Returns:
-            A CFFI pointer to the runintgen_data structure.
-        """
-        if self._points is None or self._weights is None:
-            raise ValueError("Quadrature not set. Call set_quadrature() first.")
-        if not self._elements:
-            raise ValueError("No element tables added. Call add_element_table() first.")
-
+        quadrature: RuntimeQuadratureRule | list[RuntimeQuadratureRule],
+        basix_elements: list[RuntimeBasixElement] | None = None,
+        scratch: "cffi.CData | None" = None,
+    ) -> "cffi.CData":
+        """Build a ``runintgen_context*``."""
         ffi = self.ffi
-        nq = self._points.shape[0]
+        rules = quadrature if isinstance(quadrature, list) else [quadrature]
+        c_rules = ffi.new(f"runintgen_quadrature_rule[{len(rules)}]")
+        self._refs.append(c_rules)
+        for i, rule in enumerate(rules):
+            points = np.ascontiguousarray(rule.points.ravel(), dtype=np.float64)
+            weights = np.ascontiguousarray(rule.weights, dtype=np.float64)
+            self._refs.extend([points, weights])
+            c_rules[i].nq = rule.nq
+            c_rules[i].tdim = rule.tdim
+            c_rules[i].points = ffi.cast("const double*", points.ctypes.data)
+            c_rules[i].weights = ffi.cast("const double*", weights.ctypes.data)
 
-        # Ensure arrays are contiguous
-        points = np.ascontiguousarray(self._points.flatten(), dtype=np.float64)
-        weights = np.ascontiguousarray(self._weights, dtype=np.float64)
-        self._refs.extend([points, weights])
-
-        # Allocate element array
-        nelements = len(self._elements)
-        c_elements = ffi.new(f"runintgen_element[{nelements}]")
+        elements = basix_elements or []
+        c_elements = ffi.new(f"runintgen_basix_element[{len(elements)}]")
         self._refs.append(c_elements)
+        for i, element in enumerate(elements):
+            c_elements[i].handle = ffi.cast("const void*", element.handle)
+            c_elements[i].tabulate = (
+                ffi.cast("runintgen_element_tabulate_fn", element.tabulate)
+                if element.tabulate
+                else ffi.NULL
+            )
 
-        for j, elem in enumerate(self._elements):
-            table = np.ascontiguousarray(elem.table.flatten(), dtype=np.float64)
-            expected_size = elem.nderivs * nq * elem.ndofs
-            if table.size != expected_size:
-                raise ValueError(
-                    f"Element {j} table size mismatch: got {table.size}, "
-                    f"expected {expected_size} (nderivs={elem.nderivs}, nq={nq}, ndofs={elem.ndofs})"
-                )
-            self._refs.append(table)
+        ctx = ffi.new("runintgen_context*")
+        self._refs.append(ctx)
+        ctx.num_rules = len(rules)
+        ctx.rules = c_rules
+        ctx.num_elements = len(elements)
+        ctx.elements = c_elements
+        ctx.scratch = scratch or ffi.NULL
+        return ctx
 
-            c_elements[j].ndofs = elem.ndofs
-            c_elements[j].nderivs = elem.nderivs
-            c_elements[j].table = ffi.cast("const double*", table.ctypes.data)
-
-        # Allocate main structure
-        c_data = ffi.new("runintgen_data*")
-        self._refs.append(c_data)
-
-        c_data.nq = nq
-        c_data.points = ffi.cast("const double*", points.ctypes.data)
-        c_data.weights = ffi.cast("const double*", weights.ctypes.data)
-        c_data.nelements = nelements
-        c_data.elements = c_elements
-
-        return c_data
+    def build_request(self, request: RuntimeTableRequest) -> "cffi.CData":
+        """Build and retain a ``runintgen_table_request*``."""
+        ffi = self.ffi
+        c_request = ffi.new("runintgen_table_request*")
+        self._refs.append(c_request)
+        c_request.slot = request.slot
+        c_request.element_index = request.element_index
+        c_request.derivative_order = request.derivative_order
+        for i, count in enumerate(request.derivative_counts[:4]):
+            c_request.derivative_counts[i] = int(count)
+        c_request.flat_component = (
+            -1 if request.flat_component is None else int(request.flat_component)
+        )
+        c_request.num_permutations = request.num_permutations
+        c_request.num_entities = request.num_entities
+        c_request.num_dofs = request.num_dofs
+        c_request.block_size = -1 if request.block_size is None else request.block_size
+        c_request.offset = -1 if request.offset is None else request.offset
+        c_request.is_uniform = int(request.is_uniform)
+        c_request.is_permuted = int(request.is_permuted)
+        return c_request
 
 
 def to_intptr(ffi: "cffi.FFI", data: "cffi.CData") -> int:
-    """Return an intptr_t representation of a runintgen_data*.
-
-    This is useful for passing the pointer to DOLFINx.
-
-    Args:
-        ffi: CFFI FFI instance.
-        data: A runintgen_data* pointer.
-
-    Returns:
-        Integer representation of the pointer.
-    """
+    """Return an ``intptr_t`` representation of a CFFI pointer."""
     return int(ffi.cast("intptr_t", data))
-
-
-def tabulate_element(
-    element,  # basix.finite_element
-    points: npt.NDArray[np.float64],
-    max_deriv_order: int = 1,
-) -> ElementTableInfo:
-    """Tabulate a basix element at given points.
-
-    Args:
-        element: A basix finite element.
-        points: Quadrature points, shape [nq, tdim].
-        max_deriv_order: Maximum derivative order to tabulate.
-
-    Returns:
-        ElementTableInfo with tabulated values.
-    """
-    # basix.tabulate returns [nderivs, nq, ndofs, ncomps]
-    tables = element.tabulate(max_deriv_order, points)
-
-    # For scalar elements, ncomps=1, so squeeze that dimension
-    if tables.shape[-1] == 1:
-        tables = tables[..., 0]  # [nderivs, nq, ndofs]
-
-    return ElementTableInfo(
-        ndofs=element.dim,
-        nderivs=tables.shape[0],
-        table=tables,
-    )
-
-
-def create_quadrature_config(
-    points: npt.NDArray[np.float64],
-    weights: npt.NDArray[np.float64],
-    elements: list,  # List of basix elements
-    max_deriv_order: int = 1,
-) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], list[ElementTableInfo]]:
-    """Create quadrature and element tables for a runtime integral.
-
-    Args:
-        points: Quadrature points, shape [nq, tdim].
-        weights: Quadrature weights, shape [nq].
-        elements: List of basix finite elements to tabulate.
-        max_deriv_order: Maximum derivative order.
-
-    Returns:
-        Tuple of (points, weights, element_tables).
-    """
-    element_tables = []
-    for elem in elements:
-        element_tables.append(tabulate_element(elem, points, max_deriv_order))
-
-    return np.asarray(points), np.asarray(weights), element_tables
-
-
-# CFFI definition string for the runtime structures
-# This should be passed to ffi.cdef() before using RuntimeDataBuilder
-CFFI_DEF = """
-typedef struct {
-  int ndofs;
-  int nderivs;
-  const double* table;
-} runintgen_element;
-
-typedef struct {
-  int nq;
-  const double* points;
-  const double* weights;
-  int nelements;
-  const runintgen_element* elements;
-} runintgen_data;
-"""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import ufl
 from basix.ufl import element
 
@@ -41,20 +42,23 @@ class TestCodeGeneration:
         kernel = module.kernels[0]
 
         # Check basic properties
-        assert kernel.name == "runint_cell_1_0"
+        assert kernel.name.startswith("integral_")
+        assert kernel.name.endswith("_triangle")
         assert kernel.integral_type == "cell"
         assert kernel.subdomain_id == 1
 
-        # Check table info - P1/P1 should have 2 tables (shared)
-        assert len(kernel.table_info) == 2
+        # P1 gradients are piecewise constants, so no runtime FE table slot
+        # is needed for this specific form.
+        assert len(kernel.table_info) == 0
 
         # Check C code contains expected patterns
-        assert "runintgen_data" in kernel.c_definition
-        assert "for (int iq = 0; iq < nq; ++iq)" in kernel.c_definition
-        assert "Jacobian" in kernel.c_definition
-        assert "data->elements[" in kernel.c_definition
-        assert "arg_elem->table" in kernel.c_definition
-        assert "ndofs = 3" in kernel.c_definition
+        assert "runintgen_context" in get_runintgen_data_struct()
+        assert "const int local_index = " in kernel.c_definition
+        assert "&data->rules[local_index]" in kernel.c_definition
+        assert "for (int iq = 0; iq < rt_nq; ++iq)" in kernel.c_definition
+        assert "rt_weights" in kernel.c_definition
+        assert ".tabulate(" not in kernel.c_definition
+        assert "arg_elem->table" not in kernel.c_definition
 
     def test_laplacian_p1_p2(self):
         """Test Laplacian with P1 mesh and P2 solution (separate tables)."""
@@ -74,29 +78,25 @@ class TestCodeGeneration:
 
         # Check basic properties
         assert kernel.subdomain_id == 2
+        assert kernel.scalar_type == "float64"
+        assert kernel.geometry_type == "float64"
 
-        # Check table info - P1/P2 should have 2 unique elements
-        # (one for P2 argument, one for P1 coordinate)
+        # Check runtime table info - P2 gradients need dynamic FE table slots
         assert len(kernel.table_info) == 2
 
-        # Check elements by their properties
-        # Element with is_argument=True should be P2 (6 dofs)
-        arg_elements = [t for t in kernel.table_info if t.get("is_argument", False)]
-        # Element with is_coordinate=True should be P1 (3 dofs)
-        coord_elements = [t for t in kernel.table_info if t.get("is_coordinate", False)]
-
-        assert len(arg_elements) == 1
-        assert len(coord_elements) == 1
-
-        # Argument element should have 6 DOFs (P2)
-        assert arg_elements[0]["ndofs"] == 6
-
-        # Coordinate element should have 3 DOFs (P1)
-        assert coord_elements[0]["ndofs"] == 3
+        assert {tuple(t["derivative_counts"]) for t in kernel.table_info} == {
+            (1, 0),
+            (0, 1),
+        }
+        assert all(t["shape"][-1] == 6 for t in kernel.table_info)
+        assert {t["element_index"] for t in kernel.table_info} == {0}
+        assert all(t["role"] == "trial" for t in kernel.table_info)
 
         # Check C code contains expected patterns
-        assert "ndofs = 6" in kernel.c_definition
-        assert "coord_ndofs = 3" in kernel.c_definition
+        assert "rt_FE" in kernel.c_definition
+        assert "static const runintgen_table_request" in kernel.c_definition
+        assert "elements[0].tabulate(" in kernel.c_definition
+        assert "rt_view_0.values" in kernel.c_definition
 
     def test_runintgen_data_struct(self):
         """Test that runintgen_data struct definition is available."""
@@ -104,18 +104,23 @@ class TestCodeGeneration:
 
         # Check main struct (simplified single-config design)
         assert "typedef struct" in struct_def
-        assert "runintgen_data" in struct_def
+        assert "runintgen_context" in struct_def
+        assert "runintgen_quadrature_rule" in struct_def
+        assert "runintgen_basix_element" in struct_def
         assert "int nq;" in struct_def
         assert "const double* points;" in struct_def
         assert "const double* weights;" in struct_def
 
-        # Check per-element structure
-        assert "runintgen_element" in struct_def
-        assert "int nelements;" in struct_def
-        assert "const runintgen_element* elements;" in struct_def
-        assert "int ndofs;" in struct_def
-        assert "int nderivs;" in struct_def
-        assert "const double* table;" in struct_def
+        # Check runtime table and callback structures
+        assert "runintgen_table_view" in struct_def
+        assert "runintgen_table_request" in struct_def
+        assert "runintgen_element_tabulate_fn" in struct_def
+        assert "const runintgen_basix_element* elements;" in struct_def
+        assert "int num_rules;" in struct_def
+        assert "const runintgen_quadrature_rule* rules;" in struct_def
+        assert "void* scratch;" in struct_def
+        assert "runintgen_prepare_fn" not in struct_def
+        assert "runintgen_tabulate_fn" not in struct_def
 
         # Verify old multi-config fields are NOT present
         assert "num_configs" not in struct_def
@@ -139,13 +144,85 @@ class TestCodeGeneration:
 
         # Check declaration format
         decl = kernel.c_declaration
-        assert "void tabulate_tensor_runint_cell_" in decl
-        assert "double* A" in decl
-        assert "void* custom_data" in decl
-        assert decl.strip().endswith(");")
+        assert decl.strip() == f"extern ufcx_integral {kernel.name};"
+        assert f"tabulate_tensor_{kernel.name}" in kernel.c_definition
+        assert decl.strip().endswith(";")
 
-    def test_definition_includes(self):
-        """Test that kernel definitions have required includes."""
+    def test_default_subdomain_uses_ffcx_integral_name(self):
+        """Test default subdomain ids use FFCx integral object names."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+
+        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        a = ufl.inner(u, v) * dx_rt
+
+        module = compile_runtime_integrals(a)
+        kernel = module.kernels[0]
+
+        assert kernel.subdomain_id == -1
+        assert kernel.name.startswith("integral_")
+        assert kernel.name.endswith("_triangle")
+        assert f"tabulate_tensor_{kernel.name}" in kernel.c_definition
+        assert "tabulate_tensor_runint_cell_-1_0" not in kernel.c_definition
+
+    def test_static_and_runtime_integrals_same_type_coexist(self):
+        """Test codegen skips standard integrals before runtime integrals."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=0)
+        dx_runtime = runtime_dx(subdomain_id=2, domain=mesh)
+        a = ufl.inner(u, v) * dx_standard
+        a += ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_runtime
+
+        module = compile_runtime_integrals(a)
+
+        assert len(module.kernels) == 1
+        kernel = module.kernels[0]
+        assert kernel.subdomain_id == 2
+        assert kernel.ir_index == 1
+        assert kernel.name.startswith("integral_")
+        assert kernel.name.endswith("_triangle")
+
+    def test_write_runtime_code_files(self, tmp_path):
+        """Test generated kernels can be written as inspectable files."""
+        from runintgen import write_runtime_code
+
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 2)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx_rt = runtime_dx(subdomain_id=2, domain=mesh)
+        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+
+        module = compile_runtime_integrals(a)
+        files = write_runtime_code(module, prefix="laplace-p2", output_dir=tmp_path)
+
+        assert files.header.name == "laplace_p2.h"
+        assert files.source.name == "laplace_p2.c"
+        assert files.abi_header.name == "runintgen_runtime_abi.h"
+        assert not (tmp_path / "laplace_p2.json").exists()
+
+        header_text = files.header.read_text()
+        source_text = files.source.read_text()
+        abi_text = files.abi_header.read_text()
+
+        assert "extern ufcx_integral" in header_text
+        assert "#include <ufcx.h>" in header_text
+        assert "runintgen_context" not in header_text
+        assert '#include "runintgen_runtime_abi.h"' in source_text
+        assert "runintgen_prepare_runtime" not in abi_text
+        assert "runintgen_element_tabulate_fn" in abi_text
+        assert "runintgen_context" in abi_text
+
+    def test_definition_includes_ufcx_integral_object(self):
+        """Test that kernel definitions have the UFCx integral object."""
         mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
         V_el = element("Lagrange", "triangle", 1)
         V = ufl.FunctionSpace(mesh, V_el)
@@ -158,10 +235,66 @@ class TestCodeGeneration:
         module = compile_runtime_integrals(a)
         kernel = module.kernels[0]
 
-        # Check includes
         defn = kernel.c_definition
-        assert "#include <math.h>" in defn
-        assert "#include <stdint.h>" in defn
+        assert f"ufcx_integral {kernel.name}" in defn
+        assert ".enabled_coefficients =" in defn
+        assert ".coordinate_element_hash = UINT64_C(" in defn
+
+    def test_coordinate_dofs_type_matches_ffcx(self):
+        """Test coordinate_dofs uses FFCx's real geometry scalar strategy."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        a = ufl.inner(u, v) * dx_rt
+
+        complex128_module = compile_runtime_integrals(
+            a, options={"scalar_type": np.complex128}
+        )
+        complex128_kernel = complex128_module.kernels[0]
+        assert "double _Complex* restrict A" in complex128_kernel.c_definition
+        assert "const double* restrict coordinate_dofs" in (
+            complex128_kernel.c_definition
+        )
+        assert complex128_kernel.geometry_type == "float64"
+        assert ".tabulate_tensor_complex128 = tabulate_tensor_" in (
+            complex128_kernel.c_definition
+        )
+
+        complex64_module = compile_runtime_integrals(
+            a, options={"scalar_type": np.complex64}
+        )
+        complex64_kernel = complex64_module.kernels[0]
+        assert "float _Complex* restrict A" in complex64_kernel.c_definition
+        assert "const float* restrict coordinate_dofs" in complex64_kernel.c_definition
+        assert complex64_kernel.geometry_type == "float32"
+        assert ".tabulate_tensor_complex64 = tabulate_tensor_" in (
+            complex64_kernel.c_definition
+        )
+
+    def test_runtime_local_index_slots(self):
+        """Test generated kernels use the DOLFINx extension local-index layout."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+
+        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        ds_rt = ufl.Measure("ds", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dS_rt = ufl.Measure("dS", domain=mesh, metadata={"quadrature_rule": "runtime"})
+
+        cell_kernel = compile_runtime_integrals(ufl.inner(u, v) * dx_rt).kernels[0]
+        exterior_kernel = compile_runtime_integrals(ufl.inner(u, v) * ds_rt).kernels[0]
+        interior_kernel = compile_runtime_integrals(
+            ufl.inner(ufl.jump(u), ufl.jump(v)) * dS_rt
+        ).kernels[0]
+
+        assert "entity_local_index[0]" in cell_kernel.c_definition
+        assert "entity_local_index[1]" in exterior_kernel.c_definition
+        assert "entity_local_index[2]" in interior_kernel.c_definition
 
 
 class TestRuntimeElementMapping:

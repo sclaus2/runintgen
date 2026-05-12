@@ -21,7 +21,7 @@ import numpy as np
 
 import ufl
 
-from ffcx.analysis import analyze_ufl_objects
+from ffcx.analysis import UFLData, analyze_ufl_objects
 from ffcx.ir.representation import compute_ir
 from ffcx.ir.elementtables import get_modified_terminal_element
 from ffcx.options import get_options
@@ -187,6 +187,43 @@ def _strip_runtime_metadata(form: ufl.Form) -> ufl.Form:
     return ufl.Form(new_integrals)
 
 
+def _compute_unscaled_ffcx_form_data(
+    form: ufl.Form,
+    scalar_type: np.dtype,
+) -> Any:
+    """Compute FFCx-compatible form data without measure scaling."""
+    complex_mode = np.issubdtype(scalar_type, np.complexfloating)
+    form_data = ufl.algorithms.compute_form_data(
+        form,
+        do_apply_function_pullbacks=True,
+        do_apply_integral_scaling=False,
+        do_apply_geometry_lowering=True,
+        preserve_geometry_types=(ufl.classes.Jacobian,),
+        do_apply_restrictions=True,
+        do_append_everywhere_integrals=False,
+        complex_mode=complex_mode,
+    )
+
+    for integral_data in form_data.integral_data:
+        for i, integral in enumerate(integral_data.integrals):
+            metadata = dict(integral.metadata() or {})
+            if "quadrature_rule" not in metadata:
+                metadata["quadrature_rule"] = "default"
+            if "quadrature_degree" not in metadata:
+                qd = metadata.get("estimated_polynomial_degree", 0)
+                if isinstance(qd, (tuple, list)):
+                    qd = max(qd) if qd else 0
+                metadata["quadrature_degree"] = int(qd)
+            integral_data.integrals[i] = integral.reconstruct(metadata=metadata)
+
+    return form_data
+
+
+def _replace_analysis_form_data(analysis: UFLData, form_data: Any) -> UFLData:
+    """Return FFCx analysis data using custom form data for IR generation."""
+    return analysis._replace(form_data=(form_data,))
+
+
 def _build_runtime_groups_and_map(
     form: ufl.Form,
     form_data: Any,
@@ -241,24 +278,19 @@ def _build_runtime_groups_and_map(
 
     groups = list(groups_dict.values())
 
-    # Build mapping from IR integrals to runtime groups
+    # FFCx creates one IntegralIR per form_data.integral_data entry, with an
+    # index counted per integral type. Preserve that ordering so standard and
+    # runtime integrals of the same type can coexist without being conflated.
     ir_to_group: dict[IntegralKey, RuntimeGroup] = {}
-
-    if not ir.forms:
-        return groups, ir_to_group
-
-    # Map each IR integral to a runtime group
     ir_type_counts: dict[str, int] = {}
-    for integral_ir in ir.integrals:
-        itype = integral_ir.expression.integral_type
+    for itg_data in form_data.integral_data:
+        itype = itg_data.integral_type
         idx = ir_type_counts.get(itype, 0)
         ir_type_counts[itype] = idx + 1
 
-        # Match based on integral type
-        for group in groups:
-            if group.integral_type == itype:
-                ir_to_group[(itype, idx)] = group
-                break
+        key: Key = (itg_data.domain, itype, tuple(itg_data.subdomain_id))
+        if key in groups_dict:
+            ir_to_group[(itype, idx)] = groups_dict[key]
 
     return groups, ir_to_group
 
@@ -268,10 +300,9 @@ def _analyse_single_runtime_integral(
     integral_type: str,
     ir_index: int,
     form_data: Any,
+    subdomain_id: int,
 ) -> RuntimeIntegralInfo:
     """Extract ArgumentInfo + ElementInfo for one runtime integral."""
-
-    subdomain_id = getattr(integral_ir.expression, "subdomain_id", 0)
 
     info = RuntimeIntegralInfo(
         integral_type=integral_type,
@@ -365,6 +396,7 @@ def build_runtime_analysis(
         RuntimeAnalysisInfo containing IR, runtime groups, and integral analysis.
     """
     options = dict(options or {})
+    options["sum_factorization"] = False
     complex_mode = options.get("scalar_type", "float64") in ("complex64", "complex128")
 
     # 1. Compute form_data with disabled integral scaling
@@ -379,12 +411,18 @@ def build_runtime_analysis(
         complex_mode=complex_mode,
     )
 
-    # 2. Let FFCX do the standard analysis/IR
+    # 2. Let FFCX do the standard analysis/IR, but use unscaled form data
+    # for the actual IR so runtime weights remain the only measure scaling.
     form_for_ffcx = _strip_runtime_metadata(form)
     scalar_type = np.dtype(options.get("scalar_type", "float64"))
     analysis = analyze_ufl_objects([form_for_ffcx], scalar_type)
+    unscaled_form_data = _compute_unscaled_ffcx_form_data(
+        form_for_ffcx, scalar_type
+    )
+    analysis = _replace_analysis_form_data(analysis, unscaled_form_data)
 
     ffcx_options = get_options(options)
+    ffcx_options["sum_factorization"] = False
     ir = compute_ir(analysis, {}, "runint", ffcx_options, visualise=False)
 
     # 3. Build runtime groups and IR mapping
@@ -400,14 +438,18 @@ def build_runtime_analysis(
         ir_type_counts[itype] = idx + 1
 
         key: IntegralKey = (itype, idx)
-        if key not in ir_to_group:
+        group = ir_to_group.get(key)
+        if group is None:
             continue  # Not a runtime integral
+        subdomain_id = group.subdomain_ids[0] if group.subdomain_ids else 0
+        subdomain_id = -1 if subdomain_id == "otherwise" else int(subdomain_id)
 
         info = _analyse_single_runtime_integral(
             integral_ir=integral_ir,
             integral_type=itype,
             ir_index=idx,
             form_data=form_data,
+            subdomain_id=subdomain_id,
         )
         integral_infos[key] = info
 

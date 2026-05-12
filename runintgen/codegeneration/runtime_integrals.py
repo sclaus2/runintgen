@@ -1,242 +1,391 @@
-"""Runtime integral generator using FFCX backend.
+"""Runtime integral generation using FFCx IR.
 
-This module provides a specialized generator that derives from FFCX's
-IntegralGenerator but treats element tables and quadrature data as
-external runtime arrays.
-
-The key differences from standard FFCX code generation:
-1. Quadrature weights and points are passed at runtime (not static arrays)
-2. FE tables are passed at runtime per unique element
-3. The number of quadrature points is dynamic
-4. Each element's table contains all derivatives: [nderivs, nq, ndofs]
-
-The runtime kernel signature is:
-    void kernel(
-        scalar_t* restrict A,
-        const scalar_t* restrict w,
-        const scalar_t* restrict c,
-        const geometry_t* restrict coordinate_dofs,
-        const int* restrict entity_local_index,
-        const uint8_t* restrict quadrature_permutation,
-        void* restrict custom_data  // -> runintgen_data*
-    );
-
-The runintgen_data contains:
-    - nq, weights, points (quadrature)
-    - nelements, elements[] (per-element tables with all derivatives)
+This module adapts FFCx's ``IntegralGenerator`` instead of hand-writing form
+specific tensor code. Runtime integrals keep the UFCx kernel signature, but
+quadrature weights, points, and Basix element handles are read from
+``custom_data``. Non-piecewise FE tables are tabulated inside the generated C
+kernel through a small Basix C wrapper function pointer.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
-from ..analysis import ArgumentRole
-from ..runtime_tables import (
-    DerivativeMapping,
-    RuntimeElementMapping,
+import basix
+import ffcx.codegeneration.lnodes as L
+from ffcx.codegeneration.access import FFCXBackendAccess
+from ffcx.codegeneration.C.formatter import Formatter
+from ffcx.codegeneration.definitions import FFCXBackendDefinitions
+from ffcx.codegeneration.integral_generator import IntegralGenerator
+from ffcx.codegeneration.symbols import FFCXBackendSymbols
+from ffcx.ir.elementtables import (
+    UniqueTableReferenceT,
+    get_modified_terminal_element,
+    piecewise_ttypes,
 )
+from ffcx.ir.representation import IntegralIR
+from ffcx.ir.representationutils import QuadratureRule
+
+
+@dataclass(frozen=True)
+class RuntimeTableReferenceInfo:
+    """Runtime representation of one FFCx table reference."""
+
+    slot: int
+    name: str
+    c_symbol: str
+    shape: tuple[int, int, int, int]
+    offset: int | None
+    block_size: int | None
+    ttype: str | None
+    is_uniform: bool
+    is_permuted: bool
+    element_index: int
+    element_hash: int | None = None
+    averaged: str | None = None
+    derivative_counts: tuple[int, ...] = ()
+    flat_component: int | None = None
+    role: str | None = None
+    terminal_index: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable table description."""
+        return {
+            "slot": self.slot,
+            "name": self.name,
+            "c_symbol": self.c_symbol,
+            "shape": list(self.shape),
+            "offset": self.offset,
+            "block_size": self.block_size,
+            "ttype": self.ttype,
+            "is_uniform": self.is_uniform,
+            "is_permuted": self.is_permuted,
+            "element_index": self.element_index,
+            "element_hash": self.element_hash,
+            "averaged": self.averaged,
+            "derivative_counts": list(self.derivative_counts),
+            "flat_component": self.flat_component,
+            "role": self.role,
+            "terminal_index": self.terminal_index,
+        }
+
+
+class RuntimeTableRegistry:
+    """Assign runtime slots to non-piecewise FFCx table references."""
+
+    def __init__(self, table_metadata: dict[str, dict[str, Any]] | None = None) -> None:
+        """Initialise an empty registry."""
+        self._name_to_slot: dict[str, int] = {}
+        self._element_to_index: dict[int | str, int] = {}
+        self.references: list[RuntimeTableReferenceInfo] = []
+        self.table_metadata = table_metadata or {}
+
+    def register(self, tabledata: UniqueTableReferenceT) -> RuntimeTableReferenceInfo:
+        """Register a table reference and return its runtime slot info."""
+        if tabledata.has_tensor_factorisation:
+            raise NotImplementedError(
+                "Runtime integrals do not support FFCx sum-factorized tables yet."
+            )
+
+        if tabledata.name in self._name_to_slot:
+            return self.references[self._name_to_slot[tabledata.name]]
+
+        slot = len(self.references)
+        c_symbol = f"rt_{tabledata.name}"
+        metadata = self.table_metadata.get(tabledata.name, {})
+        element_key = metadata.get("element_hash")
+        if element_key is None:
+            element_key = f"table:{tabledata.name}"
+        if element_key not in self._element_to_index:
+            self._element_to_index[element_key] = len(self._element_to_index)
+        element_index = self._element_to_index[element_key]
+        info = RuntimeTableReferenceInfo(
+            slot=slot,
+            name=tabledata.name,
+            c_symbol=c_symbol,
+            shape=tuple(int(i) for i in tabledata.values.shape),
+            offset=tabledata.offset,
+            block_size=tabledata.block_size,
+            ttype=tabledata.ttype,
+            is_uniform=tabledata.is_uniform,
+            is_permuted=tabledata.is_permuted,
+            element_index=element_index,
+            element_hash=metadata.get("element_hash"),
+            averaged=metadata.get("averaged"),
+            derivative_counts=tuple(metadata.get("derivative_counts", ())),
+            flat_component=metadata.get("flat_component"),
+            role=metadata.get("role"),
+            terminal_index=metadata.get("terminal_index"),
+        )
+        self._name_to_slot[tabledata.name] = slot
+        self.references.append(info)
+        return info
+
+
+class RuntimeBackendSymbols(FFCXBackendSymbols):
+    """FFCx symbols redirected to runtime view aliases."""
+
+    def weights_table(self, quadrature_rule: QuadratureRule) -> L.Symbol:
+        """Return the runtime weights pointer symbol."""
+        return L.Symbol("rt_weights", dtype=L.DataType.REAL)
+
+    def points_table(self, quadrature_rule: QuadratureRule) -> L.Symbol:
+        """Return the runtime reference points pointer symbol."""
+        return L.Symbol("rt_points", dtype=L.DataType.REAL)
+
+
+class RuntimeBackendAccess(FFCXBackendAccess):
+    """FFCx backend access with runtime FE table lookups."""
+
+    def __init__(
+        self,
+        entity_type: str,
+        integral_type: str,
+        symbols: RuntimeBackendSymbols,
+        options: dict[str, Any],
+        table_registry: RuntimeTableRegistry,
+    ) -> None:
+        """Initialise runtime access hooks."""
+        super().__init__(entity_type, integral_type, symbols, options)
+        self.table_registry = table_registry
+
+    def table_access(
+        self,
+        tabledata: UniqueTableReferenceT,
+        entity_type: str,
+        restriction: str | None,
+        quadrature_index: L.MultiIndex,
+        dof_index: L.MultiIndex,
+    ) -> tuple[L.LExpr, list[L.Symbol]]:
+        """Access an FE table from the runtime view.
+
+        Piecewise/fixed/ones/zeros tables stay static exactly as in FFCx. All
+        other table references are exposed as one flattened runtime table slot
+        with FFCx's table axes:
+        ``[permutation][entity][point][dof]``.
+        """
+        if tabledata.ttype in piecewise_ttypes:
+            return super().table_access(
+                tabledata, entity_type, restriction, quadrature_index, dof_index
+            )
+
+        table_ref = self.table_registry.register(tabledata)
+        table_symbol = L.Symbol(table_ref.c_symbol, dtype=L.DataType.REAL)
+        self.symbols.element_tables[tabledata.name] = table_symbol
+
+        entity = self.symbols.entity(entity_type, restriction)
+        if tabledata.is_uniform:
+            entity = L.LiteralInt(0)
+
+        qp: L.LExpr = L.LiteralInt(0)
+        if tabledata.is_permuted:
+            qp = self.symbols.quadrature_permutation[0]
+            if restriction == "-":
+                qp = self.symbols.quadrature_permutation[1]
+
+        iq = quadrature_index.global_index
+        ic = dof_index.global_index
+        num_entities = table_ref.shape[1]
+        num_dofs = table_ref.shape[3]
+        rt_nq = L.Symbol("rt_nq", dtype=L.DataType.INT)
+
+        flat_index = ((qp * num_entities + entity) * rt_nq + iq) * num_dofs + ic
+        return table_symbol[flat_index], [table_symbol]
+
+
+class RuntimeFFCXBackend:
+    """FFCx backend assembled from runtime-aware pieces."""
+
+    def __init__(
+        self,
+        ir: IntegralIR,
+        options: dict[str, Any],
+        table_registry: RuntimeTableRegistry,
+    ) -> None:
+        """Initialise runtime backend."""
+        coefficient_numbering = ir.expression.coefficient_numbering
+        coefficient_offsets = ir.expression.coefficient_offsets
+        original_constant_offsets = ir.expression.original_constant_offsets
+
+        self.symbols = RuntimeBackendSymbols(
+            coefficient_numbering, coefficient_offsets, original_constant_offsets
+        )
+        self.access = RuntimeBackendAccess(
+            ir.expression.entity_type,
+            ir.expression.integral_type,
+            self.symbols,
+            options,
+            table_registry,
+        )
+        self.definitions = FFCXBackendDefinitions(
+            ir.expression.entity_type, ir.expression.integral_type, self.access, options
+        )
+
+
+class RuntimeFFCXIntegralGenerator(IntegralGenerator):
+    """FFCx integral generator with runtime quadrature/table sources."""
+
+    def generate_quadrature_tables(self, domain: basix.CellType) -> list[L.LNode]:
+        """Runtime kernels never emit static quadrature weight tables."""
+        return []
+
+    def generate_element_tables(self, domain: basix.CellType) -> list[L.LNode]:
+        """Emit only static piecewise tables; runtime tables come from ABI slots."""
+        parts: list[L.LNode] = []
+        tables = self.ir.expression.unique_tables[domain]
+        table_types = self.ir.expression.unique_table_types[domain]
+        table_names = [
+            name
+            for name in sorted(tables)
+            if table_types[name] in piecewise_ttypes
+        ]
+
+        for name in table_names:
+            parts += self.declare_table(name, tables[name])
+
+        return L.commented_code_list(
+            parts,
+            [
+                "Static piecewise basis tables",
+                "Runtime-varying FE tables are supplied through custom_data",
+            ],
+        )
+
+    def generate_quadrature_loop(
+        self, quadrature_rule: QuadratureRule, domain: basix.CellType
+    ) -> list[L.LNode]:
+        """Generate a quadrature loop whose extent is ``rt_nq``."""
+        if quadrature_rule.has_tensor_factors:
+            raise NotImplementedError(
+                "Runtime integrals do not support tensor-factor quadrature yet."
+            )
+
+        definitions, intermediates_0 = self.generate_varying_partition(
+            quadrature_rule, domain
+        )
+        tensor_comp, intermediates_fw = self.generate_dofblock_partition(
+            quadrature_rule, domain
+        )
+        assert all(isinstance(tc, L.Section) for tc in tensor_comp)
+
+        inputs: list[L.Symbol] = []
+        for definition in definitions:
+            assert isinstance(definition, L.Section)
+            inputs += definition.output
+
+        output: list[L.Symbol] = []
+        declarations: list[L.VariableDecl] = []
+        for fw in intermediates_fw:
+            assert isinstance(fw, L.VariableDecl)
+            output += [fw.symbol]
+            declarations += [L.VariableDecl(fw.symbol, 0)]
+            intermediates_0 += [L.Assign(fw.symbol, fw.value)]
+
+        intermediates = [
+            L.Section("Intermediates", intermediates_0, declarations, inputs, output)
+        ]
+
+        iq_symbol = self.backend.symbols.quadrature_loop_index
+        iq = L.MultiIndex(
+            [L.Symbol(iq_symbol.name, dtype=L.DataType.INT)],
+            [L.Symbol("rt_nq", dtype=L.DataType.INT)],
+        )
+
+        # FFCx's loop optimizer assumes static FE table semantics when deciding
+        # which products can be hoisted across dof loops. Runtime table accesses
+        # depend on dynamic quadrature/table pointers, so keep the unoptimized
+        # section structure until a runtime-aware optimizer exists.
+        code = definitions + intermediates + tensor_comp
+        return [L.create_nested_for_loops([iq], code)]
+
+
+@dataclass
+class RuntimeGeneratedKernel:
+    """Generated runtime kernel body and table metadata."""
+
+    body: str
+    runtime_tables: list[RuntimeTableReferenceInfo]
 
 
 class RuntimeIntegralGenerator:
-    """Specialised generator for runtime integrals.
+    """Generate runtime C code bodies from FFCx integral IR."""
 
-    We use the same machinery as FFCX but treat element tables and
-    quadrature-related data as external (runtime) arrays.
-    """
+    def __init__(self, options: dict[str, Any]) -> None:
+        """Initialise with FFCx options."""
+        self.options = options
 
-    def __init__(self, ir: Any, backend: Any) -> None:
-        """Initialize the generator.
+    def _table_metadata(self, integral_ir: IntegralIR) -> dict[str, dict[str, Any]]:
+        """Extract FFCx table metadata needed by the runtime wrapper."""
+        metadata: dict[str, dict[str, Any]] = {}
+        expr_ir = integral_ir.expression
 
-        Args:
-            ir: FFCX IR (DataIR).
-            backend: FFCX backend instance (or None for now).
-        """
-        self.ir = ir
-        self.backend = backend
+        for integrand_data in expr_ir.integrand.values():
+            factorization = integrand_data.get("factorization")
+            if factorization is None:
+                continue
+
+            for node_data in factorization.nodes.values():
+                mt = node_data.get("mt")
+                tr = node_data.get("tr")
+                if mt is None or tr is None:
+                    continue
+
+                mte = get_modified_terminal_element(mt)
+                if mte is None:
+                    continue
+
+                element, averaged, local_derivatives, flat_component = mte
+                terminal = mt.terminal
+                role = type(terminal).__name__.lower()
+                terminal_index: int | None = None
+
+                if hasattr(terminal, "number"):
+                    number = terminal.number()
+                    role = "test" if number == 0 else "trial"
+                    terminal_index = int(number)
+                elif terminal in expr_ir.coefficient_numbering:
+                    role = "coefficient"
+                    terminal_index = int(expr_ir.coefficient_numbering[terminal])
+                elif "Jacobian" in type(terminal).__name__:
+                    role = "geometry"
+                    terminal_index = 0
+                elif "SpatialCoordinate" in type(terminal).__name__:
+                    role = "geometry"
+                    terminal_index = 0
+
+                element_hash = None
+                if hasattr(element, "basix_hash"):
+                    element_hash = int(element.basix_hash())
+                elif hasattr(element, "_element") and hasattr(element._element, "hash"):
+                    element_hash = int(element._element.hash())
+
+                metadata[tr.name] = {
+                    "element_hash": element_hash,
+                    "averaged": averaged,
+                    "derivative_counts": tuple(int(i) for i in local_derivatives),
+                    "flat_component": (
+                        int(flat_component) if flat_component is not None else None
+                    ),
+                    "role": role,
+                    "terminal_index": terminal_index,
+                }
+
+        return metadata
 
     def generate_runtime(
         self,
-        integral_ir: Any,
-        element_mapping: RuntimeElementMapping,
-    ) -> str:
-        """Generate C code using per-element table structure.
+        integral_ir: IntegralIR,
+        domain: basix.CellType,
+    ) -> RuntimeGeneratedKernel:
+        """Generate a runtime kernel body for one FFCx integral/domain pair."""
+        table_registry = RuntimeTableRegistry(self._table_metadata(integral_ir))
+        backend = RuntimeFFCXBackend(integral_ir, self.options, table_registry)
+        generator = RuntimeFFCXIntegralGenerator(integral_ir, backend)
+        parts = generator.generate(domain)
+        body = Formatter(self.options["scalar_type"])(parts)
 
-        This version uses the RuntimeElementMapping which stores ONE table
-        per unique element, with all derivatives in a single array following
-        basix.tabulate output format [nderivs, nq, ndofs].
-
-        Args:
-            integral_ir: The integral IR from FFCX.
-            element_mapping: Mapping from unique elements to runtime indices.
-
-        Returns:
-            A string containing C code for the kernel body.
-        """
-        parts: list[str] = []
-
-        # Build helper to get derivative index
-        def deriv_idx(deriv: tuple[int, ...]) -> int:
-            return DerivativeMapping.derivative_to_index_2d(deriv)
-
-        parts.append("  // Runtime integral - per-element tables with all derivatives")
-        parts.append("")
-
-        # Find coordinate element (for Jacobian computation)
-        coord_elem_idx = None
-        coord_ndofs = 3
-        for elem in element_mapping.elements:
-            if elem.is_coordinate:
-                coord_elem_idx = elem.index
-                coord_ndofs = elem.ndofs
-                break
-
-        # Find argument elements (for test/trial functions)
-        test_elem_idx = None
-        test_ndofs = 3
-        trial_elem_idx = None
-        trial_ndofs = 3
-        for elem in element_mapping.elements:
-            if elem.is_test:
-                test_elem_idx = elem.index
-                test_ndofs = elem.ndofs
-            if elem.is_trial:
-                trial_elem_idx = elem.index
-                trial_ndofs = elem.ndofs
-
-        # Use test element as generic argument element if both are same
-        arg_elem_idx = test_elem_idx
-        arg_ndofs = test_ndofs
-
-        parts.append("  // Main quadrature loop")
-        parts.append("  for (int iq = 0; iq < nq; ++iq)")
-        parts.append("  {")
-        parts.append("    const double weight = data->weights[iq];")
-        parts.append("")
-
-        # Generate Jacobian computation using coordinate element
-        parts.append("    // Compute Jacobian at quadrature point")
-        parts.append("    // J[i][j] = sum_k coord_dofs[k*gdim + i] * dphi_k/dX_j")
-        parts.append("    double J[2][2] = {{0.0, 0.0}, {0.0, 0.0}};")
-
-        if coord_elem_idx is not None:
-            # Derivative indices for d/dX and d/dY
-            dx_deriv_idx = deriv_idx((1, 0))
-            dy_deriv_idx = deriv_idx((0, 1))
-
-            parts.append("    {")
-            parts.append(
-                f"      const runintgen_element* coord_elem = "
-                f"&data->elements[{coord_elem_idx}];"
-            )
-            parts.append(f"      const int coord_ndofs = {coord_ndofs};")
-            parts.append("      const double* coord_table = coord_elem->table;")
-            parts.append("")
-            parts.append("      for (int k = 0; k < coord_ndofs; ++k)")
-            parts.append("      {")
-            parts.append(
-                f"        // d/dX derivatives at deriv_idx={dx_deriv_idx}, "
-                f"d/dY at deriv_idx={dy_deriv_idx}"
-            )
-            parts.append(
-                f"        const double dphi_dX = coord_table["
-                f"{dx_deriv_idx} * nq * coord_ndofs + iq * coord_ndofs + k];"
-            )
-            parts.append(
-                f"        const double dphi_dY = coord_table["
-                f"{dy_deriv_idx} * nq * coord_ndofs + iq * coord_ndofs + k];"
-            )
-            parts.append("        J[0][0] += coordinate_dofs[k * 3 + 0] * dphi_dX;")
-            parts.append("        J[1][0] += coordinate_dofs[k * 3 + 1] * dphi_dX;")
-            parts.append("        J[0][1] += coordinate_dofs[k * 3 + 0] * dphi_dY;")
-            parts.append("        J[1][1] += coordinate_dofs[k * 3 + 1] * dphi_dY;")
-            parts.append("      }")
-            parts.append("    }")
-        else:
-            parts.append("    // WARNING: No coordinate element found")
-
-        parts.append("")
-
-        # Compute detJ and inverse Jacobian
-        parts.append("    // Compute determinant and inverse Jacobian")
-        parts.append("    const double detJ = J[0][0] * J[1][1] - J[0][1] * J[1][0];")
-        parts.append("    const double inv_detJ = 1.0 / detJ;")
-        parts.append("    double Jinv[2][2];")
-        parts.append("    Jinv[0][0] = J[1][1] * inv_detJ;")
-        parts.append("    Jinv[0][1] = -J[0][1] * inv_detJ;")
-        parts.append("    Jinv[1][0] = -J[1][0] * inv_detJ;")
-        parts.append("    Jinv[1][1] = J[0][0] * inv_detJ;")
-        parts.append("")
-
-        # Generate tensor computation for Laplacian
-        parts.append("    // Compute contribution to element tensor")
-        parts.append("    // For Laplacian: A[i,j] += (grad phi_i . grad phi_j) * w")
-        parts.append(
-            "    // Note: weight should already include |detJ| from runtime quadrature"
+        return RuntimeGeneratedKernel(
+            body=body,
+            runtime_tables=table_registry.references,
         )
-
-        if arg_elem_idx is not None:
-            dx_deriv_idx = deriv_idx((1, 0))
-            dy_deriv_idx = deriv_idx((0, 1))
-
-            parts.append(
-                f"    const runintgen_element* arg_elem = "
-                f"&data->elements[{arg_elem_idx}];"
-            )
-            parts.append(f"    const int ndofs = {arg_ndofs};")
-            parts.append("    const double* arg_table = arg_elem->table;")
-            parts.append("")
-            parts.append("    for (int i = 0; i < ndofs; ++i)")
-            parts.append("    {")
-            parts.append("      // Reference gradients of test function i")
-            parts.append(
-                f"      const double dphi_i_dX = arg_table["
-                f"{dx_deriv_idx} * nq * ndofs + iq * ndofs + i];"
-            )
-            parts.append(
-                f"      const double dphi_i_dY = arg_table["
-                f"{dy_deriv_idx} * nq * ndofs + iq * ndofs + i];"
-            )
-            parts.append("      // Physical gradients: grad = Jinv^T * ref_grad")
-            parts.append(
-                "      const double grad_i_x = "
-                "Jinv[0][0] * dphi_i_dX + Jinv[1][0] * dphi_i_dY;"
-            )
-            parts.append(
-                "      const double grad_i_y = "
-                "Jinv[0][1] * dphi_i_dX + Jinv[1][1] * dphi_i_dY;"
-            )
-            parts.append("")
-            parts.append("      for (int j = 0; j < ndofs; ++j)")
-            parts.append("      {")
-            parts.append("        // Reference gradients of trial function j")
-            parts.append(
-                f"        const double dphi_j_dX = arg_table["
-                f"{dx_deriv_idx} * nq * ndofs + iq * ndofs + j];"
-            )
-            parts.append(
-                f"        const double dphi_j_dY = arg_table["
-                f"{dy_deriv_idx} * nq * ndofs + iq * ndofs + j];"
-            )
-            parts.append(
-                "        const double grad_j_x = "
-                "Jinv[0][0] * dphi_j_dX + Jinv[1][0] * dphi_j_dY;"
-            )
-            parts.append(
-                "        const double grad_j_y = "
-                "Jinv[0][1] * dphi_j_dX + Jinv[1][1] * dphi_j_dY;"
-            )
-            parts.append("")
-            parts.append("        // Accumulate: inner product of gradients")
-            parts.append(
-                "        A[i * ndofs + j] += "
-                "(grad_i_x * grad_j_x + grad_i_y * grad_j_y) * weight;"
-            )
-            parts.append("      }")
-            parts.append("    }")
-        else:
-            parts.append("    // TODO: Generate tensor computation for this form")
-            parts.append("    // No argument element found in mapping")
-
-        parts.append("  }  // end quadrature loop")
-
-        return "\n".join(parts)

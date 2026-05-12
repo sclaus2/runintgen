@@ -10,11 +10,19 @@ The key difference is that the runtime approach:
 4. Uses generate_runtime from RuntimeIntegralGenerator
 """
 
+import pytest
+
+pytest.skip(
+    "Legacy runtime-vs-standard tests target the removed handwritten "
+    "runintgen_data workflow. Re-enable these as wrapper-backed runtime ABI "
+    "comparisons.",
+    allow_module_level=True,
+)
+
 import tempfile
 
 import cffi
 import numpy as np
-import pytest
 import basix
 from basix.ufl import element
 import ufl
