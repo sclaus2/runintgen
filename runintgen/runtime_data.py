@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
-from .runtime_abi import RUNTIME_ABI_CDEF
+from .cpp_headers import runtime_abi_cdef
 
 if TYPE_CHECKING:
     import cffi
 
 
-CFFI_DEF = RUNTIME_ABI_CDEF
+CFFI_DEF = runtime_abi_cdef()
 
 
 @dataclass
@@ -80,22 +80,26 @@ class RuntimeTableRequest:
 
 @dataclass
 class RuntimeTableView:
-    """One flattened runtime view of an FFCx table reference."""
+    """One raw Basix tabulation view.
+
+    Values are flattened in Basix tabulate order:
+    ``[derivative][point][dof][component]``.
+    """
 
     values: npt.NDArray[np.float64]
-    num_permutations: int
-    num_entities: int
+    num_derivatives: int
     num_points: int
     num_dofs: int
+    num_components: int
 
     def __post_init__(self) -> None:
         """Normalise values to contiguous float64 storage."""
         self.values = np.ascontiguousarray(self.values, dtype=np.float64)
         expected = (
-            self.num_permutations
-            * self.num_entities
+            self.num_derivatives
             * self.num_points
             * self.num_dofs
+            * self.num_components
         )
         if self.values.size != expected:
             raise ValueError(
@@ -121,6 +125,7 @@ class RuntimeContextBuilder:
         self,
         quadrature: RuntimeQuadratureRule | list[RuntimeQuadratureRule],
         basix_elements: list[RuntimeBasixElement] | None = None,
+        form_context: "cffi.CData | None" = None,
         scratch: "cffi.CData | None" = None,
     ) -> "cffi.CData":
         """Build a ``runintgen_context*``."""
@@ -137,6 +142,27 @@ class RuntimeContextBuilder:
             c_rules[i].points = ffi.cast("const double*", points.ctypes.data)
             c_rules[i].weights = ffi.cast("const double*", weights.ctypes.data)
 
+        if form_context is None:
+            form_context = self.build_form_context(
+                basix_elements=basix_elements,
+                scratch=scratch,
+            )
+
+        ctx = ffi.new("runintgen_context*")
+        self._refs.append(ctx)
+        ctx.num_rules = len(rules)
+        ctx.rules = c_rules
+        ctx.form = form_context
+        return ctx
+
+    def build_form_context(
+        self,
+        basix_elements: list[RuntimeBasixElement] | None = None,
+        descriptor: "cffi.CData | None" = None,
+        scratch: "cffi.CData | None" = None,
+    ) -> "cffi.CData":
+        """Build and retain a ``runintgen_form_context*``."""
+        ffi = self.ffi
         elements = basix_elements or []
         c_elements = ffi.new(f"runintgen_basix_element[{len(elements)}]")
         self._refs.append(c_elements)
@@ -148,14 +174,13 @@ class RuntimeContextBuilder:
                 else ffi.NULL
             )
 
-        ctx = ffi.new("runintgen_context*")
-        self._refs.append(ctx)
-        ctx.num_rules = len(rules)
-        ctx.rules = c_rules
-        ctx.num_elements = len(elements)
-        ctx.elements = c_elements
-        ctx.scratch = scratch or ffi.NULL
-        return ctx
+        form = ffi.new("runintgen_form_context*")
+        self._refs.append(form)
+        form.num_elements = len(elements)
+        form.elements = c_elements
+        form.descriptor = descriptor or ffi.NULL
+        form.scratch = scratch or ffi.NULL
+        return form
 
     def build_request(self, request: RuntimeTableRequest) -> "cffi.CData":
         """Build and retain a ``runintgen_table_request*``."""

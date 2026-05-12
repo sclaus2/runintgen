@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from ...runtime_abi import RUNTIME_ABI_SOURCE
+from ...cpp_headers import runtime_abi_cdef
 
-runintgen_data_struct = RUNTIME_ABI_SOURCE
+runintgen_data_struct = runtime_abi_cdef()
 
 factory_runtime_kernel = r"""
 // Code for runtime integral {factory_name}
@@ -28,7 +28,8 @@ void tabulate_tensor_{factory_name}({scalar}* restrict A,
   if (local_index < 0 || local_index >= data->num_rules)
     return;
   const runintgen_quadrature_rule* rule = &data->rules[local_index];
-  const runintgen_basix_element* elements = data->elements;
+  const runintgen_form_context* form = data->form;
+  const runintgen_basix_element* elements = (form == 0 ? 0 : form->elements);
 
   const int rt_nq = rule->nq;
   const double* rt_weights = rule->weights;
@@ -40,6 +41,7 @@ void tabulate_tensor_{factory_name}({scalar}* restrict A,
   (void)c;
   (void)entity_local_index;
   (void)quadrature_permutation;
+  (void)form;
   (void)elements;
   (void)rt_points;
 

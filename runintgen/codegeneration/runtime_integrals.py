@@ -45,6 +45,7 @@ class RuntimeTableReferenceInfo:
     element_hash: int | None = None
     averaged: str | None = None
     derivative_counts: tuple[int, ...] = ()
+    derivative_index: int = 0
     flat_component: int | None = None
     role: str | None = None
     terminal_index: int | None = None
@@ -65,6 +66,7 @@ class RuntimeTableReferenceInfo:
             "element_hash": self.element_hash,
             "averaged": self.averaged,
             "derivative_counts": list(self.derivative_counts),
+            "derivative_index": self.derivative_index,
             "flat_component": self.flat_component,
             "role": self.role,
             "terminal_index": self.terminal_index,
@@ -80,6 +82,22 @@ class RuntimeTableRegistry:
         self._element_to_index: dict[int | str, int] = {}
         self.references: list[RuntimeTableReferenceInfo] = []
         self.table_metadata = table_metadata or {}
+
+    @staticmethod
+    def _derivative_index(counts: tuple[int, ...]) -> int:
+        """Return the Basix derivative axis index for derivative counts."""
+        if not counts:
+            return 0
+        if len(counts) == 1:
+            return int(basix.index(counts[0]))
+        if len(counts) == 2:
+            return int(basix.index(counts[0], counts[1]))
+        if len(counts) == 3:
+            return int(basix.index(counts[0], counts[1], counts[2]))
+        raise NotImplementedError(
+            "Runtime integrals only support Basix derivative counts up to "
+            "topological dimension 3."
+        )
 
     def register(self, tabledata: UniqueTableReferenceT) -> RuntimeTableReferenceInfo:
         """Register a table reference and return its runtime slot info."""
@@ -100,6 +118,7 @@ class RuntimeTableRegistry:
         if element_key not in self._element_to_index:
             self._element_to_index[element_key] = len(self._element_to_index)
         element_index = self._element_to_index[element_key]
+        derivative_counts = tuple(metadata.get("derivative_counts", ()))
         info = RuntimeTableReferenceInfo(
             slot=slot,
             name=tabledata.name,
@@ -113,7 +132,8 @@ class RuntimeTableRegistry:
             element_index=element_index,
             element_hash=metadata.get("element_hash"),
             averaged=metadata.get("averaged"),
-            derivative_counts=tuple(metadata.get("derivative_counts", ())),
+            derivative_counts=derivative_counts,
+            derivative_index=self._derivative_index(derivative_counts),
             flat_component=metadata.get("flat_component"),
             role=metadata.get("role"),
             terminal_index=metadata.get("terminal_index"),
@@ -161,9 +181,8 @@ class RuntimeBackendAccess(FFCXBackendAccess):
         """Access an FE table from the runtime view.
 
         Piecewise/fixed/ones/zeros tables stay static exactly as in FFCx. All
-        other table references are exposed as one flattened runtime table slot
-        with FFCx's table axes:
-        ``[permutation][entity][point][dof]``.
+        other table references are exposed as raw Basix tabulations flattened as
+        ``[derivative][point][dof][component]``.
         """
         if tabledata.ttype in piecewise_ttypes:
             return super().table_access(
@@ -174,23 +193,30 @@ class RuntimeBackendAccess(FFCXBackendAccess):
         table_symbol = L.Symbol(table_ref.c_symbol, dtype=L.DataType.REAL)
         self.symbols.element_tables[tabledata.name] = table_symbol
 
-        entity = self.symbols.entity(entity_type, restriction)
-        if tabledata.is_uniform:
-            entity = L.LiteralInt(0)
-
-        qp: L.LExpr = L.LiteralInt(0)
-        if tabledata.is_permuted:
-            qp = self.symbols.quadrature_permutation[0]
-            if restriction == "-":
-                qp = self.symbols.quadrature_permutation[1]
-
         iq = quadrature_index.global_index
         ic = dof_index.global_index
-        num_entities = table_ref.shape[1]
-        num_dofs = table_ref.shape[3]
+        derivative = L.LiteralInt(table_ref.derivative_index)
+        component = L.LiteralInt(
+            0 if table_ref.flat_component is None else table_ref.flat_component
+        )
         rt_nq = L.Symbol("rt_nq", dtype=L.DataType.INT)
+        raw_num_dofs = L.Symbol(
+            f"{table_ref.c_symbol}_num_dofs", dtype=L.DataType.INT
+        )
+        num_components = L.Symbol(
+            f"{table_ref.c_symbol}_num_components", dtype=L.DataType.INT
+        )
 
-        flat_index = ((qp * num_entities + entity) * rt_nq + iq) * num_dofs + ic
+        raw_dof: L.LExpr = ic
+        if table_ref.offset is not None:
+            offset = L.LiteralInt(table_ref.offset)
+            if table_ref.block_size is not None and table_ref.block_size > 0:
+                raw_dof = offset + L.LiteralInt(table_ref.block_size) * ic
+            else:
+                raw_dof = offset + ic
+
+        flat_index = ((derivative * rt_nq + iq) * raw_num_dofs + raw_dof)
+        flat_index = flat_index * num_components + component
         return table_symbol[flat_index], [table_symbol]
 
 

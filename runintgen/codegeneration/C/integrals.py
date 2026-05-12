@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -72,6 +73,22 @@ def _padded_derivative_counts(counts: tuple[int, ...]) -> tuple[int, int, int, i
     return tuple(padded)  # type: ignore[return-value]
 
 
+def _max_source_dof(table: Any) -> int:
+    """Return the largest raw Basix dof index a table access can request."""
+    num_dofs = int(table.shape[3])
+    if num_dofs <= 0:
+        return -1
+
+    offset = -1 if table.offset is None else int(table.offset)
+    block_size = -1 if table.block_size is None else int(table.block_size)
+    last = num_dofs - 1
+    if offset >= 0 and block_size > 0:
+        return offset + block_size * last
+    if offset >= 0:
+        return offset + last
+    return last
+
+
 def _table_requests(runtime_tables: list[Any]) -> str:
     """Generate static C table requests for runtime FE table slots."""
     lines = []
@@ -106,9 +123,12 @@ def _table_preparation(runtime_tables: list[Any]) -> str:
     """Generate in-kernel Basix wrapper calls for runtime FE table slots."""
     lines = []
     for table in runtime_tables:
+        component = 0 if table.flat_component is None else int(table.flat_component)
+        max_source_dof = _max_source_dof(table)
         lines.extend(
             [
-                f"  if (elements == 0 || data->num_elements <= {table.element_index})",
+                f"  if (form == 0 || elements == 0 || "
+                f"form->num_elements <= {table.element_index})",
                 "    return;",
                 f"  if (elements[{table.element_index}].tabulate == 0)",
                 "    return;",
@@ -119,6 +139,15 @@ def _table_preparation(runtime_tables: list[Any]) -> str:
                 "    return;",
                 f"  const double* {table.c_symbol} = rt_view_{table.slot}.values;",
                 f"  if ({table.c_symbol} == 0)",
+                "    return;",
+                f"  const int {table.c_symbol}_num_dofs = "
+                f"rt_view_{table.slot}.num_dofs;",
+                f"  const int {table.c_symbol}_num_components = "
+                f"rt_view_{table.slot}.num_components;",
+                f"  if (rt_view_{table.slot}.num_points != rt_nq || "
+                f"rt_view_{table.slot}.num_derivatives <= {table.derivative_index} "
+                f"|| {table.c_symbol}_num_dofs <= {max_source_dof} "
+                f"|| {table.c_symbol}_num_components <= {component})",
                 "    return;",
                 "",
             ]
@@ -158,6 +187,62 @@ def _tabulate_tensor_initializers(
     return code
 
 
+def _basix_hash(element: Any) -> int | None:
+    """Return a Basix element hash when available."""
+    basix_element = element
+    if hasattr(element, "_element"):
+        basix_element = element._element
+    elif hasattr(element, "basix_element"):
+        basix_element = element.basix_element
+
+    if hasattr(basix_element, "basix_hash"):
+        return int(basix_element.basix_hash())
+    if hasattr(basix_element, "hash"):
+        return int(basix_element.hash())
+    return None
+
+
+def _form_element_indices_by_hash(
+    form_metadata: FormRuntimeMetadata | None,
+) -> dict[int, int]:
+    """Map Basix hashes to form-level element indices."""
+    if form_metadata is None:
+        return {}
+
+    indices: dict[int, int] = {}
+    for element in form_metadata.unique_elements:
+        element_hash = _basix_hash(element.element)
+        if element_hash is not None:
+            indices[element_hash] = element.form_elem_index
+    return indices
+
+
+def _apply_form_element_indices(
+    runtime_tables: list[Any],
+    element_indices_by_hash: dict[int, int],
+) -> list[Any]:
+    """Return runtime table metadata with form-level element indices."""
+    if not element_indices_by_hash:
+        return runtime_tables
+
+    resolved = []
+    for table in runtime_tables:
+        if table.element_hash in element_indices_by_hash:
+            resolved.append(
+                replace(
+                    table,
+                    element_index=element_indices_by_hash[table.element_hash],
+                )
+            )
+        else:
+            raise ValueError(
+                "Could not resolve runtime table "
+                f"{table.name!r} with Basix hash {table.element_hash!r} "
+                "to a form-level element index."
+            )
+    return resolved
+
+
 def generate_C_runtime_kernels(
     analysis: RuntimeAnalysisInfo,
     options: dict[str, Any],
@@ -173,6 +258,7 @@ def generate_C_runtime_kernels(
     geom_c = dtype_to_c_type(geometry_type)
 
     subdomain_by_key = _subdomain_ids_by_integral(analysis)
+    element_indices_by_hash = _form_element_indices_by_hash(form_metadata)
     generator = RuntimeIntegralGenerator(ffcx_options)
 
     kernels: list[RuntimeKernelInfo] = []
@@ -191,6 +277,9 @@ def generate_C_runtime_kernels(
         domains = _domains_for_integral(integral_ir)
         for domain_id, domain in enumerate(domains):
             generated = generator.generate_runtime(integral_ir, domain)
+            runtime_tables = _apply_form_element_indices(
+                generated.runtime_tables, element_indices_by_hash
+            )
             func_name = _kernel_name(integral_ir, domain)
             kernel_id = ir_index * 1024 + domain_id
             enabled_coefficients_init, enabled_coefficients = _enabled_coefficients(
@@ -205,8 +294,8 @@ def generate_C_runtime_kernels(
                 enabled_coefficients_init=enabled_coefficients_init,
                 enabled_coefficients=enabled_coefficients,
                 local_index_expr=_local_index_expr(integral_type),
-                table_requests=_table_requests(generated.runtime_tables),
-                table_preparation=_table_preparation(generated.runtime_tables),
+                table_requests=_table_requests(runtime_tables),
+                table_preparation=_table_preparation(runtime_tables),
                 tabulate_tensor_float32=tabulate_tensor["tabulate_tensor_float32"],
                 tabulate_tensor_float64=tabulate_tensor["tabulate_tensor_float64"],
                 tabulate_tensor_complex64=tabulate_tensor[
@@ -231,10 +320,8 @@ def generate_C_runtime_kernels(
                 factory_name=func_name,
             )
 
-            table_info = [table.to_dict() for table in generated.runtime_tables]
-            table_slots = {
-                table.name: table.slot for table in generated.runtime_tables
-            }
+            table_info = [table.to_dict() for table in runtime_tables]
+            table_slots = {table.name: table.slot for table in runtime_tables}
 
             kernels.append(
                 RuntimeKernelInfo(

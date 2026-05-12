@@ -18,6 +18,7 @@ from .codegen_files import (
     format_runtime_abi_header,
     format_runtime_header,
     format_runtime_source,
+    runtime_abi_header_path,
     write_runtime_code,
 )
 from .codegeneration.C.integrals import get_runintgen_data_struct
@@ -80,6 +81,7 @@ __all__ = [
     "format_runtime_abi_header",
     "format_runtime_header",
     "format_runtime_source",
+    "runtime_abi_header_path",
     "write_runtime_code",
     # Form metadata (Plan v2)
     "ElementKey",

@@ -33,7 +33,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
-
 # -----------------------------------------------------------------------------
 # ElementKey - Efficient element identification using basix properties
 # -----------------------------------------------------------------------------
@@ -538,6 +537,22 @@ def _get_element_dims(element: Any) -> tuple[int, int]:
     return ndofs, ncomps
 
 
+def _basix_hash(element: Any) -> int:
+    """Return the Basix element hash, or zero when unavailable."""
+    if hasattr(element, "_element"):
+        basix_elem = element._element
+    elif hasattr(element, "basix_element"):
+        basix_elem = element.basix_element
+    else:
+        basix_elem = element
+
+    if hasattr(basix_elem, "basix_hash"):
+        return int(basix_elem.basix_hash())
+    if hasattr(basix_elem, "hash"):
+        return int(basix_elem.hash())
+    return 0
+
+
 # -----------------------------------------------------------------------------
 # Export utilities for C++
 # -----------------------------------------------------------------------------
@@ -560,6 +575,7 @@ def export_metadata_for_cpp(metadata: FormRuntimeMetadata) -> dict[str, Any]:
             {
                 "form_elem_index": fe.form_elem_index,
                 "element_key": fe.element_key.to_dict(),
+                "basix_hash": _basix_hash(fe.element),
                 "role": fe.role.name.lower(),
                 "index": fe.index,
                 "ndofs": fe.ndofs,

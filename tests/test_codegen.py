@@ -105,6 +105,9 @@ class TestCodeGeneration:
         # Check main struct (simplified single-config design)
         assert "typedef struct" in struct_def
         assert "runintgen_context" in struct_def
+        assert "runintgen_form_context" in struct_def
+        assert "runintgen_form_descriptor" in struct_def
+        assert "runintgen_form_element_descriptor" in struct_def
         assert "runintgen_quadrature_rule" in struct_def
         assert "runintgen_basix_element" in struct_def
         assert "int nq;" in struct_def
@@ -118,6 +121,7 @@ class TestCodeGeneration:
         assert "const runintgen_basix_element* elements;" in struct_def
         assert "int num_rules;" in struct_def
         assert "const runintgen_quadrature_rule* rules;" in struct_def
+        assert "const runintgen_form_context* form;" in struct_def
         assert "void* scratch;" in struct_def
         assert "runintgen_prepare_fn" not in struct_def
         assert "runintgen_tabulate_fn" not in struct_def
@@ -207,19 +211,26 @@ class TestCodeGeneration:
         assert files.header.name == "laplace_p2.h"
         assert files.source.name == "laplace_p2.c"
         assert files.abi_header.name == "runintgen_runtime_abi.h"
+        assert files.abi_header.parent.name == "cpp"
         assert not (tmp_path / "laplace_p2.json").exists()
+        assert not (tmp_path / "runintgen_runtime_abi.h").exists()
 
         header_text = files.header.read_text()
         source_text = files.source.read_text()
         abi_text = files.abi_header.read_text()
 
         assert "extern ufcx_integral" in header_text
+        assert "extern const runintgen_form_descriptor" in header_text
         assert "#include <ufcx.h>" in header_text
+        assert '#include "runintgen_runtime_abi.h"' in header_text
         assert "runintgen_context" not in header_text
         assert '#include "runintgen_runtime_abi.h"' in source_text
+        assert "runintgen_form_elements_laplace_p2" in source_text
+        assert "runintgen_form_descriptor_laplace_p2" in source_text
         assert "runintgen_prepare_runtime" not in abi_text
         assert "runintgen_element_tabulate_fn" in abi_text
         assert "runintgen_context" in abi_text
+        assert "runintgen_form_element_descriptor" in abi_text
 
     def test_definition_includes_ufcx_integral_object(self):
         """Test that kernel definitions have the UFCx integral object."""
@@ -295,6 +306,51 @@ class TestCodeGeneration:
         assert "entity_local_index[0]" in cell_kernel.c_definition
         assert "entity_local_index[1]" in exterior_kernel.c_definition
         assert "entity_local_index[2]" in interior_kernel.c_definition
+
+    def test_table_requests_use_form_element_indices(self):
+        """Test table requests refer to the form-level element descriptor list."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 2)
+        W_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        W = ufl.FunctionSpace(mesh, W_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        kappa = ufl.Coefficient(W)
+
+        dx_rt = runtime_dx(subdomain_id=4, domain=mesh)
+        module = compile_runtime_integrals(kappa * ufl.inner(u, v) * dx_rt)
+        kernel = module.kernels[0]
+
+        elements_by_role = {
+            (element.role.name.lower(), element.index): element.form_elem_index
+            for element in module.form_metadata.unique_elements
+        }
+        assert elements_by_role[("test", 0)] == 0
+        assert elements_by_role[("coefficient", 0)] == 1
+
+        table_by_role = {table["role"]: table for table in kernel.table_info}
+        assert table_by_role["coefficient"]["element_index"] == 1
+        assert table_by_role["trial"]["element_index"] == 0
+        assert ".element_index = 1," in kernel.c_definition
+        assert ".element_index = 0," in kernel.c_definition
+
+    def test_blocked_element_tables_use_basix_component_stride(self):
+        """Test blocked element table accesses keep Basix dof/component strides."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 2, shape=(2,))
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+
+        dx_rt = runtime_dx(subdomain_id=5, domain=mesh)
+        module = compile_runtime_integrals(ufl.inner(u, v) * dx_rt)
+        kernel = module.kernels[0]
+
+        assert any(table["flat_component"] == 1 for table in kernel.table_info)
+        assert any(table["block_size"] == 2 for table in kernel.table_info)
+        assert "num_components" in kernel.c_definition
+        assert "+ 1]" in kernel.c_definition
 
 
 class TestRuntimeElementMapping:

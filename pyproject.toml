@@ -32,6 +32,9 @@ cpp = [
 where = ["."]
 include = ["runintgen*"]
 
+[tool.setuptools.package-data]
+runintgen = ["cpp/*.h", "cpp/*.cpp", "dolfinx/*.h", "dolfinx/*.cpp"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py310"
