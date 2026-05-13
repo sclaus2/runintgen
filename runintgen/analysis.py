@@ -18,12 +18,10 @@ from enum import Enum, auto
 from typing import Any
 
 import numpy as np
-
 import ufl
-
-from ffcx.analysis import UFLData, analyze_ufl_objects
-from ffcx.ir.representation import compute_ir
+from ffcx.analysis import UFLData
 from ffcx.ir.elementtables import get_modified_terminal_element
+from ffcx.ir.representation import compute_ir
 from ffcx.options import get_options
 
 from .measures import is_runtime_integral
@@ -32,6 +30,7 @@ from .measures import is_runtime_integral
 DerivTuple = tuple[int, ...]  # e.g. (1, 0) in 2D
 IntegralKey = tuple[str, int]  # (integral_type, ir_index)
 Key = tuple[Any, str, tuple[Any, ...]]  # (domain, integral_type, subdomain_ids)
+ProviderKey = tuple[Any, str, Any]  # (domain, integral_type, subdomain_id)
 
 
 # -----------------------------------------------------------------------------
@@ -65,7 +64,7 @@ class ElementInfo:
 
 @dataclass
 class ArgumentInfo:
-    """Usage of one logical argument (test/trial/coef/geometry) in a runtime integral."""
+    """Usage of one logical argument in a runtime integral."""
 
     role: ArgumentRole
     index: int  # argument index, coefficient index, or 0 for geometry
@@ -170,23 +169,6 @@ def _get_element_id(element: Any) -> str:
     return str(hash(element))
 
 
-def _strip_runtime_metadata(form: ufl.Form) -> ufl.Form:
-    """Strip quadrature_rule='runtime' metadata so FFCX doesn't choke on it.
-
-    FFCX tries to interpret quadrature_rule as a basix quadrature type.
-    We need to replace 'runtime' with a valid default (or remove it).
-    """
-    new_integrals = []
-    for integral in form.integrals():
-        md = dict(integral.metadata())
-        if md.get("quadrature_rule") == "runtime":
-            md["quadrature_rule"] = "default"
-        new_integral = integral.reconstruct(metadata=md)
-        new_integrals.append(new_integral)
-
-    return ufl.Form(new_integrals)
-
-
 def _compute_unscaled_ffcx_form_data(
     form: ufl.Form,
     scalar_type: np.dtype,
@@ -207,9 +189,14 @@ def _compute_unscaled_ffcx_form_data(
     for integral_data in form_data.integral_data:
         for i, integral in enumerate(integral_data.integrals):
             metadata = dict(integral.metadata() or {})
-            if "quadrature_rule" not in metadata:
+            if metadata.get("quadrature_rule") == "runtime":
                 metadata["quadrature_rule"] = "default"
-            if "quadrature_degree" not in metadata:
+            elif "quadrature_rule" not in metadata:
+                metadata["quadrature_rule"] = "default"
+            if (
+                "quadrature_degree" not in metadata
+                or metadata["quadrature_degree"] < 0
+            ):
                 qd = metadata.get("estimated_polynomial_degree", 0)
                 if isinstance(qd, (tuple, list)):
                     qd = max(qd) if qd else 0
@@ -219,9 +206,53 @@ def _compute_unscaled_ffcx_form_data(
     return form_data
 
 
-def _replace_analysis_form_data(analysis: UFLData, form_data: Any) -> UFLData:
-    """Return FFCx analysis data using custom form data for IR generation."""
-    return analysis._replace(form_data=(form_data,))
+def _build_ffcx_analysis(form_data: Any) -> UFLData:
+    """Build the FFCx analysis wrapper from already processed form data."""
+    elements = list(form_data.unique_sub_elements)
+    coordinate_elements = list(form_data.coordinate_elements)
+    elements += ufl.algorithms.analysis.extract_sub_elements(elements)
+
+    unique_elements = ufl.algorithms.sort_elements(set(elements))
+    unique_coordinate_elements = sorted(set(coordinate_elements), key=lambda x: repr(x))
+    element_numbers = {element: i for i, element in enumerate(unique_elements)}
+
+    return UFLData(
+        form_data=(form_data,),
+        unique_elements=unique_elements,
+        element_numbers=element_numbers,
+        unique_coordinate_elements=unique_coordinate_elements,
+        expressions=[],
+    )
+
+
+def _normalised_subdomain_ids(subdomain_id: Any) -> tuple[Any, ...]:
+    """Return subdomain ids in the form used by FFCx form_data."""
+    if isinstance(subdomain_id, (tuple, list)):
+        subdomain_ids = tuple(subdomain_id)
+    else:
+        subdomain_ids = (subdomain_id,)
+    return tuple(
+        "otherwise" if sid == "everywhere" else sid for sid in subdomain_ids
+    )
+
+
+def _lookup_runtime_provider(
+    domain: Any,
+    integral_type: str,
+    subdomain_id: Any,
+    original_providers: dict[ProviderKey, Any],
+    original_providers_by_id: dict[tuple[str, Any], Any],
+) -> tuple[bool, Any]:
+    """Look up runtime-integral presence and provider for an integral group."""
+    provider_key = (domain, integral_type, subdomain_id)
+    if provider_key in original_providers:
+        return True, original_providers[provider_key]
+
+    fallback_key = (integral_type, subdomain_id)
+    if fallback_key in original_providers_by_id:
+        return True, original_providers_by_id[fallback_key]
+
+    return False, None
 
 
 def _build_runtime_groups_and_map(
@@ -235,11 +266,16 @@ def _build_runtime_groups_and_map(
         Tuple of (groups list, mapping from (integral_type, ir_index) to RuntimeGroup)
     """
     # Extract quadrature providers from the ORIGINAL form before processing
-    original_providers: dict[tuple[str, int], Any] = {}
+    original_providers: dict[ProviderKey, Any] = {}
+    original_providers_by_id: dict[tuple[str, Any], Any] = {}
     for integral in form.integrals():
         if is_runtime_integral(integral):
-            orig_key = (integral.integral_type(), integral.subdomain_id())
-            original_providers[orig_key] = integral.subdomain_data()
+            for sid in _normalised_subdomain_ids(integral.subdomain_id()):
+                provider_key = (integral.ufl_domain(), integral.integral_type(), sid)
+                original_providers[provider_key] = integral.subdomain_data()
+                original_providers_by_id[(integral.integral_type(), sid)] = (
+                    integral.subdomain_data()
+                )
 
     # Scan integral_data for runtime integrals
     groups_dict: dict[Key, RuntimeGroup] = {}
@@ -251,24 +287,32 @@ def _build_runtime_groups_and_map(
         key: Key = (domain, itype, subdomain_ids)
 
         quadrature_provider: Any = None
+        runtime_integrals = [
+            integral for integral in itg_data.integrals if is_runtime_integral(integral)
+        ]
 
-        for integral in itg_data.integrals:
-            if is_runtime_integral(integral):
-                sd = integral.subdomain_data()
-                if sd is not None:
-                    quadrature_provider = sd
-                else:
-                    for sid in subdomain_ids:
-                        lookup_key = (itype, sid)
-                        if lookup_key in original_providers:
-                            quadrature_provider = original_providers[lookup_key]
-                            break
-                if quadrature_provider is not None:
+        for integral in runtime_integrals:
+            sd = integral.subdomain_data()
+            if sd is not None:
+                quadrature_provider = sd
+                break
+
+        is_runtime_group = bool(runtime_integrals)
+        if quadrature_provider is None:
+            for sid in subdomain_ids:
+                found, provider = _lookup_runtime_provider(
+                    itg_data.domain,
+                    itype,
+                    sid,
+                    original_providers,
+                    original_providers_by_id,
+                )
+                is_runtime_group = is_runtime_group or found
+                if provider is not None:
+                    quadrature_provider = provider
                     break
 
-        if quadrature_provider is not None or any(
-            is_runtime_integral(i) for i in itg_data.integrals
-        ):
+        if is_runtime_group:
             groups_dict[key] = RuntimeGroup(
                 domain=domain,
                 integral_type=itype,
@@ -397,29 +441,12 @@ def build_runtime_analysis(
     """
     options = dict(options or {})
     options["sum_factorization"] = False
-    complex_mode = options.get("scalar_type", "float64") in ("complex64", "complex128")
-
-    # 1. Compute form_data with disabled integral scaling
-    form_data = ufl.algorithms.compute_form_data(
-        form,
-        do_apply_function_pullbacks=True,
-        do_apply_integral_scaling=False,
-        do_apply_geometry_lowering=True,
-        preserve_geometry_types=(ufl.classes.Jacobian,),
-        do_apply_restrictions=True,
-        do_append_everywhere_integrals=False,
-        complex_mode=complex_mode,
-    )
-
-    # 2. Let FFCX do the standard analysis/IR, but use unscaled form data
-    # for the actual IR so runtime weights remain the only measure scaling.
-    form_for_ffcx = _strip_runtime_metadata(form)
     scalar_type = np.dtype(options.get("scalar_type", "float64"))
-    analysis = analyze_ufl_objects([form_for_ffcx], scalar_type)
-    unscaled_form_data = _compute_unscaled_ffcx_form_data(
-        form_for_ffcx, scalar_type
-    )
-    analysis = _replace_analysis_form_data(analysis, unscaled_form_data)
+
+    # Compute the single form_data object used by runintgen and FFCx IR. It is
+    # unscaled so runtime weights remain the only measure scaling source.
+    form_data = _compute_unscaled_ffcx_form_data(form, scalar_type)
+    analysis = _build_ffcx_analysis(form_data)
 
     ffcx_options = get_options(options)
     ffcx_options["sum_factorization"] = False
