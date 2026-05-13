@@ -252,7 +252,9 @@ class RuntimeFFCXBackend:
 class RuntimeFFCXIntegralGenerator(IntegralGenerator):
     """FFCx integral generator with runtime quadrature/table sources."""
 
-    def generate_quadrature_tables(self, domain: basix.CellType) -> list[L.LNode]:
+    def generate_quadrature_tables(
+        self, domain: basix.CellType, _expression: Any | None = None
+    ) -> list[L.LNode]:
         """Runtime kernels never emit static quadrature weight tables."""
         return []
 

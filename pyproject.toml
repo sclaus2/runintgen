@@ -2,7 +2,7 @@
 requires = [
     "scikit-build-core>=0.10",
     "nanobind>=2.0",
-    "fenics-basix>=0.10.0",
+    "fenics-basix>=0.11.0.dev0",
     "numpy",
 ]
 build-backend = "scikit_build_core.build"
@@ -15,17 +15,21 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "FEniCSx Developers"}
+    {name = "Runintgen Developers"}
 ]
 dependencies = [
     "numpy",
-    "fenics-basix>=0.10.0",
-    "fenics-ufl>=2025.0.0",
-    "fenics-ffcx>=0.10.0",
+    "fenics-basix>=0.11.0.dev0",
+    "fenics-ufl>=2025.3.0.dev0",
+    "fenics-ffcx>=0.11.0.dev0",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "setuptools",
+    "wheel",
+    "scikit-build-core>=0.10",
+    "nanobind>=2.0",
     "pytest",
     "pytest-cov",
     "ruff",

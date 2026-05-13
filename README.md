@@ -24,8 +24,22 @@ Basix tabulation callbacks supplied by the runtime context.
 
 ## Installation
 
+For this development branch, use Basix, UFL, and FFCx from their `main`
+branches so the Python codegen imports and Basix C++ ABI stay consistent:
+
 ```bash
-pip install -e .
+# Install build tools
+python -m pip install --upgrade pip setuptools wheel scikit-build-core nanobind numpy cffi
+
+# Install FEniCSx main packages directly from GitHub
+python -m pip install --upgrade --force-reinstall --no-deps \
+  "fenics-basix @ git+https://github.com/FEniCS/basix.git@main" \
+  "fenics-ufl @ git+https://github.com/FEniCS/ufl.git@main" \
+  "fenics-ffcx @ git+https://github.com/FEniCS/ffcx.git@main"
+
+# Install runintgen against that stack
+cd PATH_TO/runintgen
+python -m pip install --no-build-isolation --no-deps --force-reinstall .
 ```
 
 The default install builds the Basix-only runtime extension used to construct
@@ -38,7 +52,8 @@ library ABI.
 
 - Python >= 3.10.
 - NumPy.
-- FEniCSx Python packages: UFL, FFCx, and Basix.
+- FEniCSx Python packages: Basix >= 0.11.0.dev0,
+  UFL >= 2025.3.0.dev0, and FFCx >= 0.11.0.dev0.
 - UFCx headers and a C/C++ compiler when compiling generated kernels.
 - DOLFINx is optional and only needed when constructing DOLFINx forms.
 - `cffi` is optional and mainly useful for Python-side ABI tests/prototypes.
