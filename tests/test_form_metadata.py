@@ -1,8 +1,5 @@
 """Tests for form_metadata module (Plan v2)."""
 
-import pytest
-import numpy as np
-
 import basix
 import ufl
 from basix.ufl import element
@@ -15,7 +12,6 @@ from runintgen.form_metadata import (
     IntegralElementUsage,
     IntegralRuntimeLayout,
     Role,
-    build_form_runtime_metadata,
     element_key_from_basix,
     export_metadata_for_cpp,
 )
@@ -296,31 +292,17 @@ class TestBuildFormRuntimeMetadata:
             assert kernel.table_slots is not None
 
     def test_table_slots_match_layout(self):
-        """Test that kernel table_slots match layout."""
+        """Test that kernel table_slots match runtime table references."""
         form = create_laplacian_form()
         module = compile_runtime_integrals(form)
 
-        metadata = module.form_metadata
-
         for kernel in module.kernels:
-            layout = metadata.get_integral_layout(kernel.integral_type, kernel.ir_index)
-            if layout is not None:
-                # table_slots in kernel should match layout
-                for key, slot in kernel.table_slots.items():
-                    # Parse "role_index" format
-                    parts = key.rsplit("_", 1)
-                    role_str = parts[0]
-                    terminal_idx = int(parts[1])
-
-                    # Find matching entry in layout
-                    from runintgen.form_metadata import Role
-
-                    role = getattr(Role, role_str.upper())
-                    layout_slot = layout.terminal_to_table_slot.get(
-                        (role, terminal_idx)
-                    )
-
-                    assert layout_slot == slot
+            table_slots = kernel.table_slots or {}
+            table_info = kernel.table_info or []
+            assert table_slots == {
+                table["name"]: table["slot"] for table in table_info
+            }
+            assert set(table_slots.values()) == {0}
 
 
 class TestExportMetadataForCpp:

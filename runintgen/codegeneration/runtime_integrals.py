@@ -22,7 +22,6 @@ from ffcx.codegeneration.symbols import FFCXBackendSymbols
 from ffcx.ir.elementtables import (
     UniqueTableReferenceT,
     get_modified_terminal_element,
-    piecewise_ttypes,
 )
 from ffcx.ir.representation import IntegralIR
 from ffcx.ir.representationutils import QuadratureRule
@@ -32,6 +31,7 @@ from ffcx.ir.representationutils import QuadratureRule
 class RuntimeTableReferenceInfo:
     """Runtime representation of one FFCx table reference."""
 
+    reference_index: int
     slot: int
     name: str
     c_symbol: str
@@ -53,6 +53,7 @@ class RuntimeTableReferenceInfo:
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable table description."""
         return {
+            "reference_index": self.reference_index,
             "slot": self.slot,
             "name": self.name,
             "c_symbol": self.c_symbol,
@@ -78,8 +79,8 @@ class RuntimeTableRegistry:
 
     def __init__(self, table_metadata: dict[str, dict[str, Any]] | None = None) -> None:
         """Initialise an empty registry."""
-        self._name_to_slot: dict[str, int] = {}
-        self._element_to_index: dict[int | str, int] = {}
+        self._name_to_reference_index: dict[str, int] = {}
+        self._element_to_slot: dict[int | str, int] = {}
         self.references: list[RuntimeTableReferenceInfo] = []
         self.table_metadata = table_metadata or {}
 
@@ -106,21 +107,22 @@ class RuntimeTableRegistry:
                 "Runtime integrals do not support FFCx sum-factorized tables yet."
             )
 
-        if tabledata.name in self._name_to_slot:
-            return self.references[self._name_to_slot[tabledata.name]]
+        if tabledata.name in self._name_to_reference_index:
+            return self.references[self._name_to_reference_index[tabledata.name]]
 
-        slot = len(self.references)
-        c_symbol = f"rt_{tabledata.name}"
+        reference_index = len(self.references)
         metadata = self.table_metadata.get(tabledata.name, {})
         element_key = metadata.get("element_hash")
         if element_key is None:
             element_key = f"table:{tabledata.name}"
-        if element_key not in self._element_to_index:
-            self._element_to_index[element_key] = len(self._element_to_index)
-        element_index = self._element_to_index[element_key]
+        if element_key not in self._element_to_slot:
+            self._element_to_slot[element_key] = len(self._element_to_slot)
+        element_slot = self._element_to_slot[element_key]
+        c_symbol = f"rt_element_{element_slot}"
         derivative_counts = tuple(metadata.get("derivative_counts", ()))
         info = RuntimeTableReferenceInfo(
-            slot=slot,
+            reference_index=reference_index,
+            slot=element_slot,
             name=tabledata.name,
             c_symbol=c_symbol,
             shape=tuple(int(i) for i in tabledata.values.shape),
@@ -129,7 +131,7 @@ class RuntimeTableRegistry:
             ttype=tabledata.ttype,
             is_uniform=tabledata.is_uniform,
             is_permuted=tabledata.is_permuted,
-            element_index=element_index,
+            element_index=element_slot,
             element_hash=metadata.get("element_hash"),
             averaged=metadata.get("averaged"),
             derivative_counts=derivative_counts,
@@ -138,9 +140,60 @@ class RuntimeTableRegistry:
             role=metadata.get("role"),
             terminal_index=metadata.get("terminal_index"),
         )
-        self._name_to_slot[tabledata.name] = slot
+        self._name_to_reference_index[tabledata.name] = reference_index
         self.references.append(info)
         return info
+
+
+def _uses_runtime_table(tabledata: UniqueTableReferenceT, integral_type: str) -> bool:
+    """Return whether a FFCx table should be read from a Basix runtime view."""
+    if tabledata.ttype in {"ones", "zeros"}:
+        return False
+    if tabledata.ttype in {"piecewise", "fixed"} and integral_type != "cell":
+        return False
+    return True
+
+
+def _force_runtime_tables_varying(integral_ir: IntegralIR) -> None:
+    """Move runtime-backed terminal dependencies into quadrature scope.
+
+    FFCx classifies tables using the placeholder quadrature rule present during
+    IR construction. Runtime rules can contain arbitrary points, so a table that
+    looks fixed for the placeholder rule can still vary at runtime, for example
+    derivatives of a higher-order coordinate element. Match ffcx-runtime's
+    conservative model by treating all runtime-backed table terminals and their
+    dependent factorization nodes as varying.
+    """
+    integral_type = integral_ir.expression.integral_type
+
+    for integrand_data in integral_ir.expression.integrand.values():
+        factorization = integrand_data.get("factorization")
+        if factorization is None:
+            continue
+
+        pending: list[int] = []
+        seen: set[int] = set()
+        for node_id, node_data in factorization.nodes.items():
+            tabledata = node_data.get("tr")
+            if tabledata is None:
+                continue
+            if not _uses_runtime_table(tabledata, integral_type):
+                continue
+            if node_data.get("status") == "inactive":
+                continue
+            pending.append(node_id)
+            seen.add(node_id)
+
+        while pending:
+            node_id = pending.pop()
+            factorization.nodes[node_id]["status"] = "varying"
+            for dependent in factorization.in_edges.get(node_id, []):
+                if dependent in seen:
+                    continue
+                if factorization.nodes[dependent].get("status") == "inactive":
+                    continue
+                seen.add(dependent)
+                pending.append(dependent)
 
 
 class RuntimeBackendSymbols(FFCXBackendSymbols):
@@ -180,11 +233,12 @@ class RuntimeBackendAccess(FFCXBackendAccess):
     ) -> tuple[L.LExpr, list[L.Symbol]]:
         """Access an FE table from the runtime view.
 
-        Piecewise/fixed/ones/zeros tables stay static exactly as in FFCx. All
-        other table references are exposed as raw Basix tabulations flattened as
-        ``[derivative][point][dof][component]``.
+        Ones/zeros tables stay static exactly as in FFCx. Other supported table
+        references are exposed as raw Basix tabulations flattened as
+        ``[derivative][point][dof][component]``. Multiple FFCx table references
+        that come from the same Basix element share one runtime pointer.
         """
-        if tabledata.ttype in piecewise_ttypes:
+        if not _uses_runtime_table(tabledata, self.integral_type):
             return super().table_access(
                 tabledata, entity_type, restriction, quadrature_index, dof_index
             )
@@ -196,9 +250,7 @@ class RuntimeBackendAccess(FFCXBackendAccess):
         iq = quadrature_index.global_index
         ic = dof_index.global_index
         derivative = L.LiteralInt(table_ref.derivative_index)
-        component = L.LiteralInt(
-            0 if table_ref.flat_component is None else table_ref.flat_component
-        )
+        component = L.LiteralInt(0)
         rt_nq = L.Symbol("rt_nq", dtype=L.DataType.INT)
         raw_num_dofs = L.Symbol(
             f"{table_ref.c_symbol}_num_dofs", dtype=L.DataType.INT
@@ -208,12 +260,6 @@ class RuntimeBackendAccess(FFCXBackendAccess):
         )
 
         raw_dof: L.LExpr = ic
-        if table_ref.offset is not None:
-            offset = L.LiteralInt(table_ref.offset)
-            if table_ref.block_size is not None and table_ref.block_size > 0:
-                raw_dof = offset + L.LiteralInt(table_ref.block_size) * ic
-            else:
-                raw_dof = offset + ic
 
         flat_index = ((derivative * rt_nq + iq) * raw_num_dofs + raw_dof)
         flat_index = flat_index * num_components + component
@@ -259,14 +305,22 @@ class RuntimeFFCXIntegralGenerator(IntegralGenerator):
         return []
 
     def generate_element_tables(self, domain: basix.CellType) -> list[L.LNode]:
-        """Emit only static piecewise tables; runtime tables come from ABI slots."""
+        """Emit only static tables that cannot be backed by Basix runtime views."""
         parts: list[L.LNode] = []
         tables = self.ir.expression.unique_tables[domain]
         table_types = self.ir.expression.unique_table_types[domain]
         table_names = [
             name
             for name in sorted(tables)
-            if table_types[name] in piecewise_ttypes
+            if not _uses_runtime_table(
+                UniqueTableReferenceT(
+                    name,
+                    tables[name],
+                    False,
+                    table_types[name],
+                ),
+                self.ir.expression.integral_type,
+            )
         ]
 
         for name in table_names:
@@ -275,8 +329,8 @@ class RuntimeFFCXIntegralGenerator(IntegralGenerator):
         return L.commented_code_list(
             parts,
             [
-                "Static piecewise basis tables",
-                "Runtime-varying FE tables are supplied through custom_data",
+                "Static FE tables",
+                "Runtime FE tables are supplied through custom_data per Basix element",
             ],
         )
 
@@ -407,6 +461,7 @@ class RuntimeIntegralGenerator:
         domain: basix.CellType,
     ) -> RuntimeGeneratedKernel:
         """Generate a runtime kernel body for one FFCx integral/domain pair."""
+        _force_runtime_tables_varying(integral_ir)
         table_registry = RuntimeTableRegistry(self._table_metadata(integral_ir))
         backend = RuntimeFFCXBackend(integral_ir, self.options, table_registry)
         generator = RuntimeFFCXIntegralGenerator(integral_ir, backend)

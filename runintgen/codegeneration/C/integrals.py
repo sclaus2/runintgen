@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -87,88 +87,108 @@ def _local_index_expr(integral_type: str) -> str:
     return f"(entity_local_index == 0 ? 0 : entity_local_index[{position}])"
 
 
-def _padded_derivative_counts(counts: tuple[int, ...]) -> tuple[int, int, int, int]:
-    """Pad derivative counts to the fixed ABI size."""
-    padded = list(counts[:4])
-    padded.extend([0] * (4 - len(padded)))
-    return tuple(padded)  # type: ignore[return-value]
-
-
 def _max_source_dof(table: Any) -> int:
     """Return the largest raw Basix dof index a table access can request."""
     num_dofs = int(table.shape[3])
     if num_dofs <= 0:
         return -1
-
-    offset = -1 if table.offset is None else int(table.offset)
-    block_size = -1 if table.block_size is None else int(table.block_size)
-    last = num_dofs - 1
-    if offset >= 0 and block_size > 0:
-        return offset + block_size * last
-    if offset >= 0:
-        return offset + last
-    return last
+    return num_dofs - 1
 
 
-def _table_requests(runtime_tables: list[Any]) -> str:
-    """Generate static C table requests for runtime FE table slots."""
-    lines = []
+@dataclass(frozen=True)
+class _ElementTableRequest:
+    """One Basix tabulation request shared by multiple FFCx table references."""
+
+    slot: int
+    element_index: int
+    max_derivative_order: int
+    max_derivative_index: int
+    max_source_dof: int
+    max_component: int
+    is_permuted: bool
+    c_symbol: str
+
+
+def _element_table_requests(runtime_tables: list[Any]) -> list[_ElementTableRequest]:
+    """Group FFCx table references into one request per Basix element slot."""
+    by_slot: dict[int, list[Any]] = {}
     for table in runtime_tables:
-        counts = _padded_derivative_counts(table.derivative_counts)
-        derivative_order = sum(table.derivative_counts)
-        flat_component = -1 if table.flat_component is None else table.flat_component
-        offset = -1 if table.offset is None else table.offset
-        block_size = -1 if table.block_size is None else table.block_size
+        by_slot.setdefault(int(table.slot), []).append(table)
+
+    requests: list[_ElementTableRequest] = []
+    for slot, tables in sorted(by_slot.items()):
+        element_indices = {int(table.element_index) for table in tables}
+        if len(element_indices) != 1:
+            raise ValueError(
+                "Runtime table references sharing a Basix tabulation slot "
+                f"resolved to multiple form element indices: {sorted(element_indices)}."
+            )
+
+        requests.append(
+            _ElementTableRequest(
+                slot=slot,
+                element_index=next(iter(element_indices)),
+                max_derivative_order=max(
+                    int(sum(table.derivative_counts)) for table in tables
+                ),
+                max_derivative_index=max(
+                    int(table.derivative_index) for table in tables
+                ),
+                max_source_dof=max(_max_source_dof(table) for table in tables),
+                max_component=0,
+                is_permuted=any(bool(table.is_permuted) for table in tables),
+                c_symbol=tables[0].c_symbol,
+            )
+        )
+
+    return requests
+
+
+def _table_requests(element_requests: list[_ElementTableRequest]) -> str:
+    """Generate static C requests for per-element runtime FE tabulations."""
+    lines = []
+    for request in element_requests:
         lines.append(
             f"static const runintgen_table_request "
-            f"rt_request_{table.name} = {{\n"
-            f"  .slot = {table.slot},\n"
-            f"  .element_index = {table.element_index},\n"
-            f"  .derivative_order = {derivative_order},\n"
-            f"  .derivative_counts = "
-            f"{{{counts[0]}, {counts[1]}, {counts[2]}, {counts[3]}}},\n"
-            f"  .flat_component = {flat_component},\n"
-            f"  .num_permutations = {table.shape[0]},\n"
-            f"  .num_entities = {table.shape[1]},\n"
-            f"  .num_dofs = {table.shape[3]},\n"
-            f"  .block_size = {block_size},\n"
-            f"  .offset = {offset},\n"
-            f"  .is_uniform = {int(table.is_uniform)},\n"
-            f"  .is_permuted = {int(table.is_permuted)},\n"
+            f"rt_element_request_{request.slot} = {{\n"
+            f"  .slot = {request.slot},\n"
+            f"  .derivative_order = {request.max_derivative_order},\n"
+            f"  .is_permuted = {int(request.is_permuted)},\n"
             f"}};"
         )
     return "\n".join(lines)
 
 
-def _table_preparation(runtime_tables: list[Any]) -> str:
-    """Generate in-kernel Basix wrapper calls for runtime FE table slots."""
+def _table_preparation(element_requests: list[_ElementTableRequest]) -> str:
+    """Generate in-kernel Basix wrapper calls for runtime FE element slots."""
     lines = []
-    for table in runtime_tables:
-        component = 0 if table.flat_component is None else int(table.flat_component)
-        max_source_dof = _max_source_dof(table)
+    for request in element_requests:
         lines.extend(
             [
                 f"  if (form == 0 || elements == 0 || "
-                f"form->num_elements <= {table.element_index})",
+                f"form->num_elements <= {request.element_index})",
                 "    return;",
-                f"  if (elements[{table.element_index}].tabulate == 0)",
+                f"  if (elements[{request.element_index}].tabulate == 0)",
                 "    return;",
-                f"  runintgen_table_view rt_view_{table.slot};",
-                f"  if (elements[{table.element_index}].tabulate(",
-                f"          &elements[{table.element_index}], rule,",
-                f"          &rt_request_{table.name}, &rt_view_{table.slot}) != 0)",
+                f"  runintgen_table_view rt_element_view_{request.slot};",
+                f"  if (elements[{request.element_index}].tabulate(",
+                f"          &elements[{request.element_index}], rule,",
+                f"          &rt_element_request_{request.slot}, "
+                f"&rt_element_view_{request.slot}) != 0)",
                 "    return;",
-                f"  const double* {table.c_symbol} = rt_view_{table.slot}.values;",
-                f"  if ({table.c_symbol} == 0)",
+                f"  const double* {request.c_symbol} = "
+                f"rt_element_view_{request.slot}.values;",
+                f"  if ({request.c_symbol} == 0)",
                 "    return;",
-                f"  const int {table.c_symbol}_num_dofs = "
-                f"rt_view_{table.slot}.num_dofs;",
-                f"  const int {table.c_symbol}_num_components = "
-                f"rt_view_{table.slot}.num_components;",
-                f"  if (rt_view_{table.slot}.num_points != rt_nq || "
-                f"rt_view_{table.slot}.num_derivatives <= {table.derivative_index} "
-                f"|| {table.c_symbol}_num_dofs <= {max_source_dof} "
-                f"|| {table.c_symbol}_num_components <= {component})",
+                f"  const int {request.c_symbol}_num_dofs = "
+                f"rt_element_view_{request.slot}.num_dofs;",
+                f"  const int {request.c_symbol}_num_components = "
+                f"rt_element_view_{request.slot}.num_components;",
+                f"  if (rt_element_view_{request.slot}.num_points != rt_nq || "
+                f"rt_element_view_{request.slot}.num_derivatives "
+                f"<= {request.max_derivative_index} "
+                f"|| {request.c_symbol}_num_dofs <= {request.max_source_dof} "
+                f"|| {request.c_symbol}_num_components <= {request.max_component})",
                 "    return;",
                 "",
             ]
@@ -219,6 +239,18 @@ def _tabulate_tensor_functions(
         "scalar": scalar,
         "geom": geom,
         "local_index_expr": local_index_expr,
+        "form_context": (
+            "  const runintgen_form_context* form = data->form;\n"
+            "  const runintgen_basix_element* elements = "
+            "(form == 0 ? 0 : form->elements);"
+            if table_preparation
+            else ""
+        ),
+        "runtime_points": (
+            "  const double* rt_points = rule->points;\n"
+            if "rt_points" in body
+            else ""
+        ),
         "table_preparation": table_preparation,
         "body": body,
     }
@@ -373,6 +405,7 @@ def generate_C_runtime_kernels(
             runtime_tables = _apply_form_element_indices(
                 generated.runtime_tables, element_indices_by_hash
             )
+            element_requests = _element_table_requests(runtime_tables)
             func_name = _kernel_name(integral_ir, domain)
             kernel_id = ir_index * 1024 + domain_id
             enabled_coefficients_init, enabled_coefficients = _enabled_coefficients(
@@ -381,7 +414,7 @@ def generate_C_runtime_kernels(
             tabulate_tensor = _tabulate_tensor_initializers(scalar_type, func_name)
             standard_integral_ir = standard_integrals.get(key, integral_ir)
             local_index_expr = _local_index_expr(integral_type)
-            table_preparation = _table_preparation(runtime_tables)
+            table_preparation = _table_preparation(element_requests)
             standard_body = (
                 _standard_body(standard_integral_ir, domain, ffcx_options)
                 if mode is RuntimeIntegralMode.MIXED
@@ -394,7 +427,7 @@ def generate_C_runtime_kernels(
                 geom=geom_c,
                 enabled_coefficients_init=enabled_coefficients_init,
                 enabled_coefficients=enabled_coefficients,
-                table_requests=_table_requests(runtime_tables),
+                table_requests=_table_requests(element_requests),
                 tabulate_tensor_functions=_tabulate_tensor_functions(
                     mode=mode,
                     factory_name=func_name,
@@ -428,7 +461,19 @@ def generate_C_runtime_kernels(
                 factory_name=func_name,
             )
 
-            table_info = [table.to_dict() for table in runtime_tables]
+            max_derivative_by_slot = {
+                request.slot: request.max_derivative_order
+                for request in element_requests
+            }
+            table_info = [
+                {
+                    **table.to_dict(),
+                    "element_max_derivative_order": max_derivative_by_slot[
+                        table.slot
+                    ],
+                }
+                for table in runtime_tables
+            ]
             table_slots = {table.name: table.slot for table in runtime_tables}
 
             kernels.append(

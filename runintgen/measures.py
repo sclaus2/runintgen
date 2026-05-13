@@ -46,6 +46,8 @@ def _iter_subdomain_data_values(subdomain_data: Any) -> list[Any]:
         for item in subdomain_data:
             if isinstance(item, tuple) and len(item) == 2:
                 values.append(item[1])
+            else:
+                values.append(item)
         return values
 
     return []
@@ -63,7 +65,9 @@ def has_runtime_quadrature(subdomain_data: Any) -> bool:
 
 def has_standard_subdomain_data(subdomain_data: Any) -> bool:
     """Return whether subdomain data contains non-runtime entity payloads."""
-    if subdomain_data is None or is_runtime_quadrature_rule(subdomain_data):
+    if subdomain_data is None:
+        return False
+    if is_runtime_quadrature_rule(subdomain_data):
         return False
 
     values = _iter_subdomain_data_values(subdomain_data)

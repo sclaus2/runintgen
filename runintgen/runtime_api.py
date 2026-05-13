@@ -26,8 +26,9 @@ class RuntimeKernelInfo:
         c_declaration: The C function declaration (header).
         c_definition: The C function definition (implementation).
         tensor_shape: The shape of the output tensor, if known.
-        table_info: List of dicts describing required FFCx table requests.
-        table_slots: Map from FFCx table name to table slot index.
+        table_info: List of dicts mapping FFCx table references to runtime
+            Basix element tabulation slots.
+        table_slots: Map from FFCx table name to runtime element table slot.
         scalar_type: NumPy scalar type used for A, w, and c.
         geometry_type: Real NumPy type used for coordinate_dofs, following FFCx.
     """
@@ -54,22 +55,29 @@ class RunintModule:
     Attributes:
         kernels: List of RuntimeKernelInfo objects for each runtime integral.
         meta: Additional metadata (e.g. form name, function spaces, etc.).
-        form_metadata: Form-level runtime metadata (Plan v2).
+    form_metadata: Form-level runtime metadata (Plan v2).
+        quadrature_provider: Runtime quadrature provider carried by the UFL
+            measure when all generated kernels share one provider.
     """
 
     kernels: list[RuntimeKernelInfo] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
     form_metadata: FormRuntimeMetadata | None = None
+    quadrature_provider: Any | None = None
 
     def create_custom_data(
         self,
-        quadrature: Any,
+        quadrature: Any | None = None,
         *,
         is_cut: Any | None = None,
     ) -> Any:
         """Build a Basix-only runtime ``custom_data`` owner for this module."""
         from .basix_runtime import CustomData
 
+        if quadrature is None:
+            quadrature = self.quadrature_provider
+        if quadrature is None:
+            raise ValueError("No runtime quadrature provider was supplied.")
         return CustomData(self.form_metadata, quadrature=quadrature, is_cut=is_cut)
 
 
@@ -115,6 +123,17 @@ def compile_runtime_integrals(
     # Generate kernels with metadata
     kernels = generate_C_runtime_kernels(runtime_info, options, form_metadata)
 
+    providers = [
+        group.quadrature_provider
+        for group in runtime_info.groups
+        if group.quadrature_provider is not None
+    ]
+    unique_provider_ids = {id(provider) for provider in providers}
+    quadrature_provider = providers[0] if len(unique_provider_ids) == 1 else None
+
     return RunintModule(
-        kernels=kernels, meta=runtime_info.meta, form_metadata=form_metadata
+        kernels=kernels,
+        meta=runtime_info.meta,
+        form_metadata=form_metadata,
+        quadrature_provider=quadrature_provider,
     )

@@ -41,27 +41,35 @@ factory_runtime_tabulate_tensor = r"""
 {{
   const runintgen_context* data = (const runintgen_context*)custom_data;
   const int local_index = {local_index_expr};
-  if (data == 0 || data->rules == 0)
+  if (data == 0 || data->quadrature == 0 || data->entities == 0)
     return;
-  if (local_index < 0 || local_index >= data->num_rules)
+  const runintgen_quadrature_rules* quadrature = data->quadrature;
+  const runintgen_entity_map* entities = data->entities;
+  if (local_index < 0 || local_index >= entities->num_entities)
     return;
-  const runintgen_quadrature_rule* rule = &data->rules[local_index];
-  const runintgen_form_context* form = data->form;
-  const runintgen_basix_element* elements = (form == 0 ? 0 : form->elements);
+  if (entities->rule_indices == 0 || quadrature->offsets == 0
+      || quadrature->points == 0 || quadrature->weights == 0)
+    return;
+  const int rule_index = entities->rule_indices[local_index];
+  if (rule_index < 0 || rule_index >= quadrature->num_rules)
+    return;
+  const int64_t q0 = quadrature->offsets[rule_index];
+  const int64_t q1 = quadrature->offsets[rule_index + 1];
+  if (q0 < 0 || q1 < q0)
+    return;
+  const runintgen_quadrature_rule rule_storage = {{
+      .nq = (int)(q1 - q0),
+      .tdim = quadrature->tdim,
+      .points = quadrature->points + q0 * quadrature->tdim,
+      .weights = quadrature->weights + q0,
+  }};
+  const runintgen_quadrature_rule* rule = &rule_storage;
+{form_context}
 
   const int rt_nq = rule->nq;
   const double* rt_weights = rule->weights;
-  const double* rt_points = rule->points;
-
+{runtime_points}
 {table_preparation}
-
-  (void)w;
-  (void)c;
-  (void)entity_local_index;
-  (void)quadrature_permutation;
-  (void)form;
-  (void)elements;
-  (void)rt_points;
 
 {body}
 }}
@@ -91,8 +99,10 @@ void tabulate_tensor_{factory_name}({scalar}* restrict A,
 {{
   const runintgen_context* data = (const runintgen_context*)custom_data;
   const int local_index = {local_index_expr};
-  if (data != 0 && data->is_cut != 0 && local_index >= 0
-      && local_index < data->num_rules && data->is_cut[local_index] != 0)
+  const runintgen_entity_map* entities = (data == 0 ? 0 : data->entities);
+  if (entities != 0 && entities->is_cut != 0 && local_index >= 0
+      && local_index < entities->num_entities
+      && entities->is_cut[local_index] != 0)
   {{
     tabulate_tensor_{factory_name}_runtime(
         A, w, c, coordinate_dofs, entity_local_index, quadrature_permutation,

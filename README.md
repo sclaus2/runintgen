@@ -180,6 +180,13 @@ typedef struct
   int num_components;
 } runintgen_table_view;
 
+typedef struct
+{
+  int slot;
+  int derivative_order;
+  int is_permuted;
+} runintgen_table_request;
+
 typedef int (*runintgen_element_tabulate_fn)(
     const runintgen_basix_element* element,
     const runintgen_quadrature_rule* rule,
@@ -204,8 +211,10 @@ FFCx branch, which uses the normal compile-time quadrature and measure scaling.
 
 ## Runtime Table Calls
 
-For non-piecewise FE tables, generated C emits one `runintgen_table_request` per
-FFCx table reference and calls the element's `tabulate` function pointer. The
+For FE tables backed by runtime quadrature, generated C emits one
+`runintgen_table_request` per Basix element used by the integral. The request
+uses the maximum derivative order required by all FFCx table references mapped
+to that element, and calls the element's `tabulate` function pointer once. The
 returned `runintgen_table_view` is treated as raw Basix tabulation storage with
 layout:
 
@@ -213,9 +222,11 @@ layout:
 [derivative][point][dof][component]
 ```
 
-`RuntimeKernelInfo.table_info` mirrors these requests. It includes the runtime
-slot, FFCx table name, derivative counts, Basix derivative index, form element
-index, flat component, block offset/stride metadata, role, and terminal index.
+`RuntimeKernelInfo.table_info` records the mapping from each FFCx table
+reference to its runtime Basix element slot. It includes the slot, FFCx table
+name, derivative counts, Basix derivative index, form element index, flat
+component, block offset/stride metadata, role, terminal index, and the maximum
+derivative order used for the shared element tabulation.
 
 ## Basix-Only Custom Data
 

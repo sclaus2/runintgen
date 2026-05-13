@@ -2,19 +2,17 @@
 
 This module provides the Python-facing API for building the ``void*`` context
 used by generated runtime kernels without depending on DOLFINx. The compiled
-``_basix_runtime`` extension owns the C++ Basix elements, quadrature storage,
-and table scratch used by the generated C kernels.
+``_basix_runtime`` extension owns the C++ Basix elements and table scratch used
+by generated C kernels. Quadrature buffers are borrowed from Python/provider
+objects and must outlive kernel calls.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-import numpy.typing as npt
-
 from .form_metadata import FormRuntimeMetadata, export_metadata_for_cpp
-from .runtime_data import RuntimeQuadratureRule
+from .runtime_data import RuntimeQuadraturePayload, as_runtime_quadrature_payload
 
 
 def _load_extension() -> Any:
@@ -50,53 +48,6 @@ def element_specs_from_metadata(metadata_or_module: Any) -> list[dict[str, Any]]
     return [dict(item["element_spec"]) for item in exported["unique_elements"]]
 
 
-def _normalise_rule(rule: Any) -> dict[str, npt.NDArray[np.float64]]:
-    """Return contiguous quadrature arrays in the shape expected by C++."""
-    if isinstance(rule, RuntimeQuadratureRule):
-        points = rule.points
-        weights = rule.weights
-    elif isinstance(rule, dict):
-        points = rule["points"]
-        weights = rule["weights"]
-    else:
-        points = getattr(rule, "points")
-        weights = getattr(rule, "weights")
-
-    points_array = np.ascontiguousarray(points, dtype=np.float64)
-    weights_array = np.ascontiguousarray(weights, dtype=np.float64)
-    if points_array.ndim != 2:
-        raise ValueError("Runtime quadrature points must have shape (nq, tdim).")
-    if weights_array.ndim != 1:
-        weights_array = np.ravel(weights_array)
-    if points_array.shape[0] != weights_array.shape[0]:
-        raise ValueError("Runtime quadrature points and weights disagree on nq.")
-    return {"points": points_array, "weights": weights_array}
-
-
-def _normalise_rules(quadrature: Any) -> list[dict[str, npt.NDArray[np.float64]]]:
-    """Normalise one or more quadrature rules."""
-    if isinstance(quadrature, RuntimeQuadratureRule):
-        return [_normalise_rule(quadrature)]
-    if isinstance(quadrature, (list, tuple)):
-        return [_normalise_rule(rule) for rule in quadrature]
-    return [_normalise_rule(quadrature)]
-
-
-def _normalise_is_cut(
-    is_cut: Any | None,
-    num_rules: int,
-) -> npt.NDArray[np.uint8] | None:
-    """Normalise optional runtime/standard branch flags."""
-    if is_cut is None:
-        return None
-    flags = np.ascontiguousarray(is_cut, dtype=np.uint8)
-    if flags.ndim != 1:
-        flags = np.ravel(flags)
-    if flags.size != num_rules:
-        raise ValueError("is_cut must have one entry per quadrature rule.")
-    return flags
-
-
 class CustomData:
     """Basix-only owner for generated-kernel ``custom_data``.
 
@@ -115,18 +66,21 @@ class CustomData:
 
         Args:
             metadata_or_module: ``FormRuntimeMetadata`` or a ``RunintModule``.
-            quadrature: One ``RuntimeQuadratureRule``-like object, or a list of
-                them. Weights must already include measure scaling.
-            is_cut: Optional mixed-integral branch flags, one per rule.
+            quadrature: A ``RuntimeQuadratureRules`` flat-buffer object, one
+                ``RuntimeQuadratureRule``-like object, a list of such rules, or
+                mixed form subdomain data such as
+                ``[standard_entities, runtime_rules]``. Weights must already
+                include measure scaling. Flat runtime rules are borrowed.
+            is_cut: Optional legacy branch flags, one per packed rule.
         """
         extension = _load_extension()
         self._element_specs = element_specs_from_metadata(metadata_or_module)
-        self._rules = _normalise_rules(quadrature)
-        self._is_cut = _normalise_is_cut(is_cut, len(self._rules))
+        self._payload: RuntimeQuadraturePayload = as_runtime_quadrature_payload(
+            quadrature, is_cut=is_cut
+        )
         self._owner = extension.CustomData(
             self._element_specs,
-            self._rules,
-            self._is_cut,
+            self._payload,
         )
 
     @property
@@ -143,6 +97,11 @@ class CustomData:
     def num_rules(self) -> int:
         """Number of runtime quadrature rules."""
         return int(self._owner.num_rules)
+
+    @property
+    def num_entities(self) -> int:
+        """Number of runtime integration-loop entities."""
+        return int(self._owner.num_entities)
 
     def __int__(self) -> int:
         """Return :attr:`ptr` for APIs that accept integer pointers."""

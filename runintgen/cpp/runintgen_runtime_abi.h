@@ -46,6 +46,24 @@ typedef struct
 
 typedef struct
 {
+  int tdim;
+  int num_rules;
+  const int64_t* offsets;
+  const double* points;
+  const double* weights;
+  const int32_t* parent_map;
+} runintgen_quadrature_rules;
+
+typedef struct
+{
+  int num_entities;
+  const int32_t* entity_indices;
+  const uint8_t* is_cut;
+  const int32_t* rule_indices;
+} runintgen_entity_map;
+
+typedef struct
+{
   const double* values;
   int num_derivatives;
   int num_points;
@@ -56,16 +74,7 @@ typedef struct
 typedef struct
 {
   int slot;
-  int element_index;
   int derivative_order;
-  int derivative_counts[4];
-  int flat_component;
-  int num_permutations;
-  int num_entities;
-  int num_dofs;
-  int block_size;
-  int offset;
-  int is_uniform;
   int is_permuted;
 } runintgen_table_request;
 
@@ -95,9 +104,8 @@ struct runintgen_form_context
 
 struct runintgen_context
 {
-  int num_rules;
-  const runintgen_quadrature_rule* rules;
-  const uint8_t* is_cut;
+  const runintgen_quadrature_rules* quadrature;
+  const runintgen_entity_map* entities;
   const runintgen_form_context* form;
 };
 

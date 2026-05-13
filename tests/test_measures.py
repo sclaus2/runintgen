@@ -144,6 +144,22 @@ class TestIsRuntimeIntegral:
         assert runtime_integral_mode(integral) is RuntimeIntegralMode.MIXED
         assert get_quadrature_provider(integral) == [(0, entities), (0, quadrature)]
 
+    def test_direct_mixed_subdomain_data_list_marks_runtime(self, mesh):
+        """Test [standard_entities, runtime_rule] marks mixed mode."""
+
+        class Quadrature:
+            points = [(0.25, 0.25)]
+            weights = [0.5]
+
+        quadrature = Quadrature()
+        entities = [1, 4, 5, 6]
+        dx = ufl.Measure("dx", domain=mesh, subdomain_data=[entities, quadrature])
+        x = ufl.SpatialCoordinate(mesh)
+        integral = (x[0] * dx).integrals()[0]
+
+        assert is_runtime_integral(integral) is True
+        assert runtime_integral_mode(integral) is RuntimeIntegralMode.MIXED
+
     def test_entity_only_subdomain_data_is_not_runtime(self, mesh):
         """Test ordinary entity lists do not request runtime codegen."""
         dx = ufl.Measure("dx", domain=mesh, subdomain_data=[(0, [0, 2, 4])])
