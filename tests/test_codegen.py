@@ -8,18 +8,9 @@ from basix.ufl import element
 
 from runintgen import (
     compile_runtime_integrals,
+    dxq,
     get_runintgen_data_struct,
 )
-
-
-def runtime_dx(subdomain_id: int, domain: ufl.Mesh) -> ufl.Measure:
-    """Create a runtime measure using the new API."""
-    return ufl.Measure(
-        "dx",
-        domain=domain,
-        subdomain_id=subdomain_id,
-        metadata={"quadrature_rule": "runtime"},
-    )
 
 
 class TestCodeGeneration:
@@ -33,7 +24,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = runtime_dx(subdomain_id=1, domain=mesh)
+        dx_rt = dxq(subdomain_id=1, domain=mesh)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -55,6 +46,9 @@ class TestCodeGeneration:
         assert "runintgen_context" in get_runintgen_data_struct()
         assert "const int local_index = " in kernel.c_definition
         assert "&data->rules[local_index]" in kernel.c_definition
+        assert "data->is_cut[local_index]" not in kernel.c_definition
+        assert f"tabulate_tensor_{kernel.name}_runtime" not in kernel.c_definition
+        assert f"tabulate_tensor_{kernel.name}_standard" not in kernel.c_definition
         assert "for (int iq = 0; iq < rt_nq; ++iq)" in kernel.c_definition
         assert "rt_weights" in kernel.c_definition
         assert ".tabulate(" not in kernel.c_definition
@@ -68,7 +62,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = runtime_dx(subdomain_id=2, domain=mesh)
+        dx_rt = dxq(subdomain_id=2, domain=mesh)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -121,6 +115,7 @@ class TestCodeGeneration:
         assert "const runintgen_basix_element* elements;" in struct_def
         assert "int num_rules;" in struct_def
         assert "const runintgen_quadrature_rule* rules;" in struct_def
+        assert "const uint8_t* is_cut;" in struct_def
         assert "const runintgen_form_context* form;" in struct_def
         assert "void* scratch;" in struct_def
         assert "runintgen_prepare_fn" not in struct_def
@@ -172,6 +167,72 @@ class TestCodeGeneration:
         assert f"tabulate_tensor_{kernel.name}" in kernel.c_definition
         assert "tabulate_tensor_runint_cell_-1_0" not in kernel.c_definition
 
+    def test_quadrature_subdomain_data_generates_runtime_only_kernel(self):
+        """Test quadrature-only subdomain data generates only runtime code."""
+
+        class Quadrature:
+            points = [(1.0 / 3.0, 1.0 / 3.0)]
+            weights = [0.5]
+
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=Quadrature())
+        module = compile_runtime_integrals(ufl.inner(u, v) * dx_rt)
+
+        assert len(module.kernels) == 1
+        kernel = module.kernels[0]
+        assert "&data->rules[local_index]" in kernel.c_definition
+        assert "data->is_cut[local_index]" not in kernel.c_definition
+        assert f"tabulate_tensor_{kernel.name}_runtime" not in kernel.c_definition
+        assert f"tabulate_tensor_{kernel.name}_standard" not in kernel.c_definition
+
+    def test_mixed_subdomain_data_generates_mixed_kernel(self):
+        """Test entity plus quadrature subdomain data generates mixed code."""
+
+        class Quadrature:
+            points = [(1.0 / 3.0, 1.0 / 3.0)]
+            weights = [0.5]
+
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+
+        dx_rt = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=[(0, [0, 2, 4]), (0, Quadrature())],
+        )
+        module = compile_runtime_integrals(ufl.inner(u, v) * dx_rt)
+
+        assert len(module.kernels) == 1
+        kernel = module.kernels[0]
+        assert "data->is_cut[local_index]" in kernel.c_definition
+        assert f"tabulate_tensor_{kernel.name}_runtime" in kernel.c_definition
+        assert f"tabulate_tensor_{kernel.name}_standard" in kernel.c_definition
+
+    def test_standard_entity_subdomain_data_generates_no_runintgen_kernel(self):
+        """Test standard-only entity data stays outside runintgen codegen."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+
+        dx_standard = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=[(0, [0, 2, 4])],
+        )
+        module = compile_runtime_integrals(ufl.inner(u, v) * dx_standard)
+
+        assert module.kernels == []
+
     def test_static_and_runtime_integrals_same_type_coexist(self):
         """Test codegen skips standard integrals before runtime integrals."""
         mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
@@ -180,7 +241,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
         dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=0)
-        dx_runtime = runtime_dx(subdomain_id=2, domain=mesh)
+        dx_runtime = dxq(subdomain_id=2, domain=mesh)
         a = ufl.inner(u, v) * dx_standard
         a += ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_runtime
 
@@ -202,7 +263,7 @@ class TestCodeGeneration:
         V = ufl.FunctionSpace(mesh, V_el)
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = runtime_dx(subdomain_id=2, domain=mesh)
+        dx_rt = dxq(subdomain_id=2, domain=mesh)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -318,7 +379,7 @@ class TestCodeGeneration:
         v = ufl.TestFunction(V)
         kappa = ufl.Coefficient(W)
 
-        dx_rt = runtime_dx(subdomain_id=4, domain=mesh)
+        dx_rt = dxq(subdomain_id=4, domain=mesh)
         module = compile_runtime_integrals(kappa * ufl.inner(u, v) * dx_rt)
         kernel = module.kernels[0]
 
@@ -343,7 +404,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = runtime_dx(subdomain_id=5, domain=mesh)
+        dx_rt = dxq(subdomain_id=5, domain=mesh)
         module = compile_runtime_integrals(ufl.inner(u, v) * dx_rt)
         kernel = module.kernels[0]
 

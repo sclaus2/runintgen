@@ -97,6 +97,7 @@ struct runintgen_context
 {
   int num_rules;
   const runintgen_quadrature_rule* rules;
+  const uint8_t* is_cut;
   const runintgen_form_context* form;
 };
 

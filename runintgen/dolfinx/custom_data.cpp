@@ -220,19 +220,23 @@ class CustomData::Impl
 public:
   Impl(const ::dolfinx::fem::Form<double, double>& form,
        const runintgen_form_descriptor& descriptor,
-       std::vector<QuadratureRule> rules)
+       std::vector<QuadratureRule> rules,
+       std::vector<std::uint8_t> is_cut)
       : _spaces(form.function_spaces()), _coefficients(form.coefficients()),
         _mesh(form.mesh()), _rules_owned(std::move(rules)),
+        _is_cut_owned(std::move(is_cut)),
         _form_owner(runintgen_form_context_create(&descriptor))
   {
     if (_form_owner == nullptr)
       throw std::runtime_error("Failed to create runintgen form context.");
 
     initialise_rules();
+    initialise_cut_flags();
     initialise_form_elements(form, descriptor);
 
     _context.num_rules = static_cast<int>(_rules.size());
     _context.rules = _rules.data();
+    _context.is_cut = _is_cut_owned.empty() ? nullptr : _is_cut_owned.data();
     _context.form = runintgen_form_context_get(_form_owner.get());
   }
 
@@ -258,6 +262,17 @@ private:
       _rules.push_back(
           {static_cast<int>(rule.weights.size()), rule.tdim, rule.points.data(),
            rule.weights.data()});
+    }
+  }
+
+  void initialise_cut_flags()
+  {
+    if (_is_cut_owned.empty())
+      _is_cut_owned.assign(_rules_owned.size(), std::uint8_t{1});
+    if (_is_cut_owned.size() != _rules_owned.size())
+    {
+      throw std::runtime_error(
+          "Runintgen cut-flag array must have one entry per quadrature rule.");
     }
   }
 
@@ -319,6 +334,7 @@ private:
       _coefficients;
   std::shared_ptr<const ::dolfinx::mesh::Mesh<double>> _mesh;
   std::vector<QuadratureRule> _rules_owned;
+  std::vector<std::uint8_t> _is_cut_owned;
   std::vector<runintgen_quadrature_rule> _rules;
   std::vector<CoordinateElementHandle> _coordinate_handles;
   FormContextOwner _form_owner;
@@ -327,8 +343,10 @@ private:
 
 CustomData::CustomData(const ::dolfinx::fem::Form<double, double>& form,
                        const runintgen_form_descriptor& descriptor,
-                       std::vector<QuadratureRule> rules)
-    : _impl(std::make_unique<Impl>(form, descriptor, std::move(rules)))
+                       std::vector<QuadratureRule> rules,
+                       std::vector<std::uint8_t> is_cut)
+    : _impl(std::make_unique<Impl>(form, descriptor, std::move(rules),
+                                   std::move(is_cut)))
 {
 }
 
@@ -351,8 +369,10 @@ void* CustomData::custom_data() noexcept
 std::unique_ptr<CustomData>
 create_custom_data(const ::dolfinx::fem::Form<double, double>& form,
                    const runintgen_form_descriptor& descriptor,
-                   std::vector<QuadratureRule> rules)
+                   std::vector<QuadratureRule> rules,
+                   std::vector<std::uint8_t> is_cut)
 {
-  return std::make_unique<CustomData>(form, descriptor, std::move(rules));
+  return std::make_unique<CustomData>(form, descriptor, std::move(rules),
+                                      std::move(is_cut));
 }
 } // namespace runintgen::dolfinx

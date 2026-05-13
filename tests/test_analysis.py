@@ -3,6 +3,7 @@
 import pytest
 import ufl
 from basix.ufl import element as basix_element
+from ffcx.options import get_options
 
 from runintgen.analysis import (
     ArgumentInfo,
@@ -12,7 +13,7 @@ from runintgen.analysis import (
     RuntimeIntegralInfo,
     build_runtime_analysis,
 )
-from ffcx.options import get_options
+from runintgen.measures import RUNTIME_QUADRATURE_RULE, RuntimeIntegralMode, dxq
 
 
 @pytest.fixture
@@ -189,6 +190,58 @@ class TestBuildRuntimeAnalysis:
         assert group.integral_type == "cell"
         assert 1 in group.subdomain_ids
         assert group.quadrature_provider is provider
+        assert group.mode is RuntimeIntegralMode.RUNTIME
+
+    def test_runtime_measure_degree_update_preserves_group(self, mesh, V, options):
+        """Test runtime analysis after UFL degree metadata updates."""
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        provider = MockQuadratureProvider()
+        dx = dxq(domain=mesh, subdomain_id=3, subdomain_data=provider)
+        a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx(degree=5)
+
+        analysis = build_runtime_analysis(a, options)
+
+        assert len(analysis.groups) == 1
+        assert len(analysis.integral_infos) == 1
+        assert analysis.groups[0].quadrature_provider is provider
+        assert analysis.groups[0].mode is RuntimeIntegralMode.RUNTIME
+        integral = analysis.form_data.integral_data[0].integrals[0]
+        assert integral.metadata()["quadrature_rule"] != RUNTIME_QUADRATURE_RULE
+        assert integral.metadata()["quadrature_degree"] == 5
+
+    def test_mixed_subdomain_data_group_mode(self, mesh, V, options):
+        """Test mixed entity/quadrature data is tracked as mixed mode."""
+
+        class Quadrature:
+            points = [(1.0 / 3.0, 1.0 / 3.0)]
+            weights = [0.5]
+
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_data=[(0, [0, 2, 4]), (0, Quadrature())],
+        )
+        analysis = build_runtime_analysis(ufl.inner(u, v) * dx, options)
+
+        assert len(analysis.groups) == 1
+        assert analysis.groups[0].mode is RuntimeIntegralMode.MIXED
+        info = list(analysis.integral_infos.values())[0]
+        assert info.mode is RuntimeIntegralMode.MIXED
+
+    def test_standard_entity_subdomain_data_has_no_runtime_group(
+        self, mesh, V, options
+    ):
+        """Test ordinary entity data is standard-only for runintgen."""
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx = ufl.Measure("dx", domain=mesh, subdomain_data=[(0, [0, 2, 4])])
+        analysis = build_runtime_analysis(ufl.inner(u, v) * dx, options)
+
+        assert analysis.groups == []
+        assert analysis.integral_infos == {}
 
     def test_standard_and_runtime_same_integral_type_coexist(self, mesh, V, options):
         """Test only runtime-marked integral-data groups are selected."""

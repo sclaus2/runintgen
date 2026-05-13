@@ -126,6 +126,7 @@ class RuntimeContextBuilder:
         quadrature: RuntimeQuadratureRule | list[RuntimeQuadratureRule],
         basix_elements: list[RuntimeBasixElement] | None = None,
         form_context: "cffi.CData | None" = None,
+        is_cut: npt.ArrayLike | None = None,
         scratch: "cffi.CData | None" = None,
     ) -> "cffi.CData":
         """Build a ``runintgen_context*``."""
@@ -152,6 +153,14 @@ class RuntimeContextBuilder:
         self._refs.append(ctx)
         ctx.num_rules = len(rules)
         ctx.rules = c_rules
+        if is_cut is None:
+            is_cut_array = np.ones(len(rules), dtype=np.uint8)
+        else:
+            is_cut_array = np.ascontiguousarray(is_cut, dtype=np.uint8)
+            if is_cut_array.size != len(rules):
+                raise ValueError("is_cut must have one entry per quadrature rule.")
+        self._refs.append(is_cut_array)
+        ctx.is_cut = ffi.cast("const uint8_t*", is_cut_array.ctypes.data)
         ctx.form = form_context
         return ctx
 

@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
+import numpy as np
+
 # -----------------------------------------------------------------------------
 # ElementKey - Efficient element identification using basix properties
 # -----------------------------------------------------------------------------
@@ -114,6 +116,119 @@ class ElementKey:
             "Cannot reconstruct value_shape from hash. "
             "Use from_dict() for full reconstruction."
         )
+
+
+@dataclass(frozen=True)
+class BasixElementSpec:
+    """Constructor metadata for a Basix finite element.
+
+    This is intentionally independent of DOLFINx. A Basix-only runtime can
+    reconstruct the C++ element from these fields and validate the result with
+    ``basix_hash`` before exposing it through ``custom_data``.
+    """
+
+    family: int
+    cell_type: int
+    degree: int
+    lagrange_variant: int = 0
+    dpc_variant: int = 0
+    discontinuous: bool = False
+    dof_ordering: tuple[int, ...] = ()
+    dtype: str = "float64"
+    value_shape: tuple[int, ...] = ()
+    block_size: int = 1
+    basix_hash: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to a JSON-serialisable dictionary."""
+        return {
+            "family": self.family,
+            "cell_type": self.cell_type,
+            "degree": self.degree,
+            "lagrange_variant": self.lagrange_variant,
+            "dpc_variant": self.dpc_variant,
+            "discontinuous": self.discontinuous,
+            "dof_ordering": list(self.dof_ordering),
+            "dtype": self.dtype,
+            "value_shape": list(self.value_shape),
+            "block_size": self.block_size,
+            "basix_hash": self.basix_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BasixElementSpec":
+        """Create a spec from a dictionary."""
+        return cls(
+            family=int(data["family"]),
+            cell_type=int(data["cell_type"]),
+            degree=int(data["degree"]),
+            lagrange_variant=int(data.get("lagrange_variant", 0)),
+            dpc_variant=int(data.get("dpc_variant", 0)),
+            discontinuous=bool(data.get("discontinuous", False)),
+            dof_ordering=tuple(int(i) for i in data.get("dof_ordering", ())),
+            dtype=str(data.get("dtype", "float64")),
+            value_shape=tuple(int(i) for i in data.get("value_shape", ())),
+            block_size=int(data.get("block_size", 1)),
+            basix_hash=int(data.get("basix_hash", 0)),
+        )
+
+
+def _unwrap_basix_element(element: Any) -> Any:
+    """Return the underlying Basix element from common wrappers."""
+    if hasattr(element, "basix_element"):
+        return element.basix_element
+    if hasattr(element, "_element"):
+        return element._element
+    return element
+
+
+def _as_tuple_of_ints(value: Any) -> tuple[int, ...]:
+    """Return ``value`` as a tuple of integers."""
+    if value is None:
+        return ()
+    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+        return tuple(int(item) for item in value)
+    return ()
+
+
+def basix_element_spec_from_basix(
+    element: Any,
+    *,
+    block_size: int | None = None,
+) -> BasixElementSpec:
+    """Create C++ reconstruction metadata from a Basix/UFL element.
+
+    Args:
+        element: A Basix finite element or a Basix/UFL wrapper.
+        block_size: Optional block size override. When omitted, the value is
+            read from the wrapper and defaults to one.
+
+    Returns:
+        Metadata sufficient for the Basix-only runtime to reconstruct the
+        scalar Basix element and, when needed, synthesize blocked table views.
+    """
+    basix_elem = _unwrap_basix_element(element)
+    value_shape = _as_tuple_of_ints(getattr(basix_elem, "value_shape", ()))
+    dof_ordering = _as_tuple_of_ints(getattr(basix_elem, "dof_ordering", ()))
+    dtype = getattr(basix_elem, "dtype", np.float64)
+    dtype_name = np.dtype(dtype).name
+
+    if block_size is None:
+        block_size = int(getattr(element, "block_size", 1) or 1)
+
+    return BasixElementSpec(
+        family=int(basix_elem.family),
+        cell_type=int(basix_elem.cell_type),
+        degree=int(basix_elem.degree),
+        lagrange_variant=int(getattr(basix_elem, "lagrange_variant", 0)),
+        dpc_variant=int(getattr(basix_elem, "dpc_variant", 0)),
+        discontinuous=bool(getattr(basix_elem, "discontinuous", False)),
+        dof_ordering=dof_ordering,
+        dtype=dtype_name,
+        value_shape=value_shape,
+        block_size=int(block_size),
+        basix_hash=_basix_hash(element),
+    )
 
 
 def element_key_from_basix(element: Any) -> ElementKey:
@@ -236,6 +351,7 @@ class FormElementInfo:
     index: int
     ndofs: int = 1
     ncomps: int = 1
+    element_spec: BasixElementSpec | None = None
 
 
 @dataclass
@@ -357,6 +473,21 @@ class FormRuntimeMetadata:
             return self.unique_elements[self.key_to_form_index[element_key]]
 
         form_idx = len(self.unique_elements)
+        element_spec = (
+            BasixElementSpec(
+                family=element_key.family,
+                cell_type=element_key.cell_type,
+                degree=element_key.degree,
+                value_shape=element_key.value_shape,
+                block_size=ncomps,
+                discontinuous=element_key.discontinuous,
+            )
+            if element is None
+            else basix_element_spec_from_basix(
+                element,
+                block_size=ncomps,
+            )
+        )
         info = FormElementInfo(
             form_elem_index=form_idx,
             element_key=element_key,
@@ -365,6 +496,7 @@ class FormRuntimeMetadata:
             index=index,
             ndofs=ndofs,
             ncomps=ncomps,
+            element_spec=element_spec,
         )
         self.unique_elements.append(info)
         self.key_to_form_index[element_key] = form_idx
@@ -571,11 +703,16 @@ def export_metadata_for_cpp(metadata: FormRuntimeMetadata) -> dict[str, Any]:
     """
     unique_elems = []
     for fe in metadata.unique_elements:
+        element_spec = fe.element_spec or basix_element_spec_from_basix(
+            fe.element,
+            block_size=fe.ncomps,
+        )
         unique_elems.append(
             {
                 "form_elem_index": fe.form_elem_index,
                 "element_key": fe.element_key.to_dict(),
                 "basix_hash": _basix_hash(fe.element),
+                "element_spec": element_spec.to_dict(),
                 "role": fe.role.name.lower(),
                 "index": fe.index,
                 "ndofs": fe.ndofs,

@@ -13,6 +13,11 @@ from .analysis import (
     build_runtime_analysis,
     build_runtime_info,
 )
+from .basix_runtime import (
+    CustomData,
+    create_custom_data,
+    element_specs_from_metadata,
+)
 from .codegen_files import (
     RuntimeCodeFiles,
     format_runtime_abi_header,
@@ -23,12 +28,14 @@ from .codegen_files import (
 )
 from .codegeneration.C.integrals import get_runintgen_data_struct
 from .form_metadata import (
+    BasixElementSpec,
     ElementKey,
     FormElementInfo,
     FormRuntimeMetadata,
     IntegralElementUsage,
     IntegralRuntimeLayout,
     Role,
+    basix_element_spec_from_basix,
     build_form_runtime_metadata,
     element_key_from_basix,
     element_key_from_ufl,
@@ -42,8 +49,18 @@ from .geometry import (
 )
 from .measures import (
     RUNTIME_QUADRATURE_RULE,
+    RuntimeIntegralMode,
+    RuntimeMeasure,
+    dSq,
+    dsq,
+    dxq,
     get_quadrature_provider,
+    has_runtime_quadrature,
+    has_standard_subdomain_data,
     is_runtime_integral,
+    is_runtime_quadrature_rule,
+    runtime_integral_mode,
+    runtime_measure,
 )
 from .runtime_api import RunintModule, RuntimeKernelInfo, compile_runtime_integrals
 from .runtime_data import (
@@ -75,6 +92,10 @@ __all__ = [
     "RuntimeIntegralInfo",
     "build_runtime_analysis",
     "build_runtime_info",
+    # Basix runtime
+    "CustomData",
+    "create_custom_data",
+    "element_specs_from_metadata",
     # Code generation
     "get_runintgen_data_struct",
     "RuntimeCodeFiles",
@@ -84,12 +105,14 @@ __all__ = [
     "runtime_abi_header_path",
     "write_runtime_code",
     # Form metadata (Plan v2)
+    "BasixElementSpec",
     "ElementKey",
     "FormElementInfo",
     "FormRuntimeMetadata",
     "IntegralElementUsage",
     "IntegralRuntimeLayout",
     "Role",
+    "basix_element_spec_from_basix",
     "build_form_runtime_metadata",
     "element_key_from_basix",
     "element_key_from_ufl",
@@ -101,8 +124,18 @@ __all__ = [
     "scale_weights_by_jacobian",
     # Measures
     "RUNTIME_QUADRATURE_RULE",
+    "RuntimeIntegralMode",
+    "RuntimeMeasure",
+    "dSq",
+    "dsq",
+    "dxq",
     "get_quadrature_provider",
+    "has_standard_subdomain_data",
+    "has_runtime_quadrature",
+    "is_runtime_quadrature_rule",
     "is_runtime_integral",
+    "runtime_integral_mode",
+    "runtime_measure",
     # Runtime API
     "RunintModule",
     "RuntimeKernelInfo",

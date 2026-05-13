@@ -1,6 +1,11 @@
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+requires = [
+    "scikit-build-core>=0.10",
+    "nanobind>=2.0",
+    "fenics-basix>=0.10.0",
+    "numpy",
+]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "runintgen"
@@ -14,6 +19,7 @@ authors = [
 ]
 dependencies = [
     "numpy",
+    "fenics-basix>=0.10.0",
     "fenics-ufl>=2025.0.0",
     "fenics-ffcx>=0.10.0",
 ]
@@ -24,16 +30,16 @@ dev = [
     "pytest-cov",
     "ruff",
 ]
-cpp = [
-    "nanobind>=2.0",
+
+[tool.scikit-build]
+wheel.packages = ["runintgen"]
+sdist.include = [
+    "CMakeLists.txt",
+    "runintgen/cpp/*.h",
+    "runintgen/cpp/*.cpp",
+    "runintgen/dolfinx/*.h",
+    "runintgen/dolfinx/*.cpp",
 ]
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["runintgen*"]
-
-[tool.setuptools.package-data]
-runintgen = ["cpp/*.h", "cpp/*.cpp", "dolfinx/*.h", "dolfinx/*.cpp"]
 
 [tool.ruff]
 line-length = 88

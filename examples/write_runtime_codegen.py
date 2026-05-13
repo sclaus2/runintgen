@@ -6,7 +6,8 @@ Run from any directory:
     python /path/to/runintgen/examples/write_runtime_codegen.py
 
 The generated ``.h`` and ``.c`` files are written to the current working
-directory by default, plus one shared runtime ABI header.
+tree's ``generated/runtime_codegen`` directory by default, plus one shared
+runtime ABI header.
 """
 
 from __future__ import annotations
@@ -19,9 +20,16 @@ import numpy as np
 import ufl
 from basix.ufl import element
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "generated" / "runtime_codegen"
 
-from runintgen import compile_runtime_integrals, write_runtime_code
+sys.path.insert(0, str(REPO_ROOT))
+
+from runintgen import (  # noqa: E402
+    RuntimeQuadratureRule,
+    compile_runtime_integrals,
+    write_runtime_code,
+)
 
 SCALAR_TYPES = {
     "float32": np.float32,
@@ -44,23 +52,18 @@ def create_forms() -> dict[str, ufl.Form]:
     test2 = ufl.TestFunction(v2)
     kappa = ufl.Coefficient(v1)
 
+    runtime_rule = RuntimeQuadratureRule(
+        points=np.array([[1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64),
+        weights=np.array([0.5], dtype=np.float64),
+    )
     dx_mass = ufl.Measure(
-        "dx",
-        domain=mesh,
-        subdomain_id=1,
-        metadata={"quadrature_rule": "runtime"},
+        "dx", domain=mesh, subdomain_id=1, subdomain_data=runtime_rule
     )
     dx_laplace = ufl.Measure(
-        "dx",
-        domain=mesh,
-        subdomain_id=2,
-        metadata={"quadrature_rule": "runtime"},
+        "dx", domain=mesh, subdomain_id=2, subdomain_data=runtime_rule
     )
     dx_coefficient = ufl.Measure(
-        "dx",
-        domain=mesh,
-        subdomain_id=3,
-        metadata={"quadrature_rule": "runtime"},
+        "dx", domain=mesh, subdomain_id=3, subdomain_data=runtime_rule
     )
 
     return {
@@ -76,8 +79,11 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("."),
-        help="Directory for generated files. Defaults to the current directory.",
+        default=DEFAULT_OUTPUT_DIR,
+        help=(
+            "Directory for generated files. Defaults to "
+            f"{DEFAULT_OUTPUT_DIR}."
+        ),
     )
     parser.add_argument(
         "--scalar-type",

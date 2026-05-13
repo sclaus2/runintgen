@@ -5,6 +5,7 @@
 
 #include <dolfinx/fem/Form.h>
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -34,7 +35,8 @@ class CustomData
 public:
   CustomData(const ::dolfinx::fem::Form<double, double>& form,
              const runintgen_form_descriptor& descriptor,
-             std::vector<QuadratureRule> rules);
+             std::vector<QuadratureRule> rules,
+             std::vector<std::uint8_t> is_cut = {});
 
   ~CustomData();
 
@@ -58,7 +60,8 @@ private:
 std::unique_ptr<CustomData>
 create_custom_data(const ::dolfinx::fem::Form<double, double>& form,
                    const runintgen_form_descriptor& descriptor,
-                   std::vector<QuadratureRule> rules);
+                   std::vector<QuadratureRule> rules,
+                   std::vector<std::uint8_t> is_cut = {});
 } // namespace runintgen::dolfinx
 
 #endif // RUNINTGEN_DOLFINX_CUSTOM_DATA_H

@@ -7,16 +7,25 @@ from dataclasses import replace
 from typing import Any
 
 import numpy as np
+from ffcx.codegeneration.backend import FFCXBackend
+from ffcx.codegeneration.C.formatter import Formatter
+from ffcx.codegeneration.integral_generator import (
+    IntegralGenerator as StandardIntegralGenerator,
+)
 from ffcx.codegeneration.utils import dtype_to_c_type, dtype_to_scalar_dtype
 from ffcx.options import get_options
 
 from ...analysis import RuntimeAnalysisInfo
 from ...form_metadata import FormRuntimeMetadata
+from ...measures import RuntimeIntegralMode
 from ...runtime_api import RuntimeKernelInfo
 from ..runtime_integrals import RuntimeIntegralGenerator
 from .integrals_template import (
+    factory_mixed_tabulate_tensor,
     factory_runtime_kernel,
     factory_runtime_kernel_decl,
+    factory_runtime_tabulate_tensor,
+    factory_standard_tabulate_tensor,
     runintgen_data_struct,
 )
 
@@ -41,6 +50,18 @@ def _domains_for_integral(integral_ir: Any) -> list[Any]:
     """Return sorted domains present in an FFCx integral IR."""
     domains = {cell for cell, _ in integral_ir.expression.integrand.keys()}
     return sorted(domains, key=lambda cell: cell.name)
+
+
+def _integrals_by_key(ir: Any) -> dict[tuple[str, int], Any]:
+    """Return FFCx integral IR objects keyed by type-local index."""
+    integrals: dict[tuple[str, int], Any] = {}
+    ir_type_counts: dict[str, int] = {}
+    for integral_ir in ir.integrals:
+        integral_type = integral_ir.expression.integral_type
+        index = ir_type_counts.get(integral_type, 0)
+        ir_type_counts[integral_type] = index + 1
+        integrals[(integral_type, index)] = integral_ir
+    return integrals
 
 
 def _kernel_name(
@@ -168,6 +189,72 @@ def _enabled_coefficients(integral_ir: Any, factory_name: str) -> tuple[str, str
     return init, f"enabled_coefficients_{factory_name}"
 
 
+def _standard_body(
+    integral_ir: Any,
+    domain: Any,
+    options: dict[str, Any],
+) -> str:
+    """Generate a standard FFCx tabulate_tensor body for one integral."""
+    backend = FFCXBackend(integral_ir, options)
+    generator = StandardIntegralGenerator(integral_ir, backend)
+    parts = generator.generate(domain)
+    formatter = Formatter(options["scalar_type"])
+    return formatter(parts)
+
+
+def _tabulate_tensor_functions(
+    *,
+    mode: RuntimeIntegralMode,
+    factory_name: str,
+    scalar: str,
+    geom: str,
+    local_index_expr: str,
+    table_preparation: str,
+    body: str,
+    standard_body: str,
+) -> str:
+    """Return tabulate_tensor functions for one generated integral."""
+    runtime_kwargs = {
+        "factory_name": factory_name,
+        "scalar": scalar,
+        "geom": geom,
+        "local_index_expr": local_index_expr,
+        "table_preparation": table_preparation,
+        "body": body,
+    }
+    if mode is RuntimeIntegralMode.RUNTIME:
+        return factory_runtime_tabulate_tensor.format(
+            static_prefix="",
+            suffix="",
+            **runtime_kwargs,
+        )
+
+    if mode is RuntimeIntegralMode.MIXED:
+        return "\n".join(
+            [
+                factory_runtime_tabulate_tensor.format(
+                    static_prefix="static ",
+                    suffix="_runtime",
+                    **runtime_kwargs,
+                ),
+                factory_standard_tabulate_tensor.format(
+                    factory_name=factory_name,
+                    scalar=scalar,
+                    geom=geom,
+                    standard_body=standard_body,
+                ),
+                factory_mixed_tabulate_tensor.format(
+                    factory_name=factory_name,
+                    scalar=scalar,
+                    geom=geom,
+                    local_index_expr=local_index_expr,
+                ),
+            ]
+        )
+
+    raise ValueError(f"Unsupported runtime integral mode: {mode!r}.")
+
+
 def _tabulate_tensor_initializers(
     scalar_type: str, factory_name: str
 ) -> dict[str, str]:
@@ -258,6 +345,11 @@ def generate_C_runtime_kernels(
     geom_c = dtype_to_c_type(geometry_type)
 
     subdomain_by_key = _subdomain_ids_by_integral(analysis)
+    standard_integrals = (
+        _integrals_by_key(analysis.standard_ir)
+        if analysis.standard_ir is not None
+        else {}
+    )
     element_indices_by_hash = _form_element_indices_by_hash(form_metadata)
     generator = RuntimeIntegralGenerator(ffcx_options)
 
@@ -274,6 +366,7 @@ def generate_C_runtime_kernels(
             continue
 
         subdomain_id = subdomain_by_key.get(key, 0)
+        mode = analysis.integral_infos[key].mode
         domains = _domains_for_integral(integral_ir)
         for domain_id, domain in enumerate(domains):
             generated = generator.generate_runtime(integral_ir, domain)
@@ -286,6 +379,14 @@ def generate_C_runtime_kernels(
                 integral_ir, func_name
             )
             tabulate_tensor = _tabulate_tensor_initializers(scalar_type, func_name)
+            standard_integral_ir = standard_integrals.get(key, integral_ir)
+            local_index_expr = _local_index_expr(integral_type)
+            table_preparation = _table_preparation(runtime_tables)
+            standard_body = (
+                _standard_body(standard_integral_ir, domain, ffcx_options)
+                if mode is RuntimeIntegralMode.MIXED
+                else ""
+            )
 
             c_def = factory_runtime_kernel.format(
                 factory_name=func_name,
@@ -293,9 +394,17 @@ def generate_C_runtime_kernels(
                 geom=geom_c,
                 enabled_coefficients_init=enabled_coefficients_init,
                 enabled_coefficients=enabled_coefficients,
-                local_index_expr=_local_index_expr(integral_type),
                 table_requests=_table_requests(runtime_tables),
-                table_preparation=_table_preparation(runtime_tables),
+                tabulate_tensor_functions=_tabulate_tensor_functions(
+                    mode=mode,
+                    factory_name=func_name,
+                    scalar=scalar_c,
+                    geom=geom_c,
+                    local_index_expr=local_index_expr,
+                    table_preparation=table_preparation,
+                    body=generated.body,
+                    standard_body=standard_body,
+                ),
                 tabulate_tensor_float32=tabulate_tensor["tabulate_tensor_float32"],
                 tabulate_tensor_float64=tabulate_tensor["tabulate_tensor_float64"],
                 tabulate_tensor_complex64=tabulate_tensor[
@@ -313,7 +422,6 @@ def generate_C_runtime_kernels(
                     f"UINT64_C({integral_ir.expression.coordinate_element_hash})"
                 ),
                 domain=int(domain),
-                body=generated.body,
             )
 
             c_decl = factory_runtime_kernel_decl.format(

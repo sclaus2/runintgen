@@ -61,6 +61,17 @@ class RunintModule:
     meta: dict[str, Any] = field(default_factory=dict)
     form_metadata: FormRuntimeMetadata | None = None
 
+    def create_custom_data(
+        self,
+        quadrature: Any,
+        *,
+        is_cut: Any | None = None,
+    ) -> Any:
+        """Build a Basix-only runtime ``custom_data`` owner for this module."""
+        from .basix_runtime import CustomData
+
+        return CustomData(self.form_metadata, quadrature=quadrature, is_cut=is_cut)
+
 
 def compile_runtime_integrals(
     form: ufl.Form,

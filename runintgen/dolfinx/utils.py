@@ -8,6 +8,7 @@ this module in ``custom_data.h`` and ``custom_data.cpp``.
 from __future__ import annotations
 
 import importlib.util
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,8 @@ import numpy.typing as npt
 
 if TYPE_CHECKING:
     from dolfinx.fem import Form, FunctionSpace
+
+    from runintgen.form_metadata import FormRuntimeMetadata
 
 fem: Any | None = None
 IntegralType: Any | None = None
@@ -84,6 +87,7 @@ class RuntimeFormInfo:
 
     kernels: list[CompiledKernel] = field(default_factory=list)
     ffi: cffi.FFI | None = None
+    form_metadata: "FormRuntimeMetadata | None" = None
 
 
 def compile_runtime_kernels(
@@ -108,12 +112,14 @@ def compile_runtime_kernels(
     module = compile_runtime_integrals(form, options)
 
     if not module.kernels:
-        return RuntimeFormInfo()
+        return RuntimeFormInfo(form_metadata=module.form_metadata)
 
     struct_def = get_runintgen_data_struct()
 
     c_parts = [
+        "#include <complex.h>",
         "#include <math.h>",
+        "#include <stdbool.h>",
         "#include <stdint.h>",
         "",
         struct_def,
@@ -122,8 +128,8 @@ def compile_runtime_kernels(
     header_parts = []
 
     for kernel in module.kernels:
-        c_parts.append(kernel.c_definition)
-        header_parts.append(kernel.c_declaration.strip().rstrip(";") + ";")
+        c_parts.append(_strip_ufcx_integral_object(kernel.c_definition, kernel.name))
+        header_parts.append(_tabulate_tensor_declaration(kernel))
 
     full_c_code = "\n".join(c_parts)
     full_header = "\n".join(header_parts)
@@ -181,7 +187,46 @@ def compile_runtime_kernels(
             )
         )
 
-    return RuntimeFormInfo(kernels=compiled_kernels, ffi=ffi)
+    return RuntimeFormInfo(
+        kernels=compiled_kernels,
+        ffi=ffi,
+        form_metadata=module.form_metadata,
+    )
+
+
+def _c_scalar_type(dtype_name: str | None) -> str:
+    """Return the C scalar type used in a generated kernel signature."""
+    mapping = {
+        "float32": "float",
+        "float64": "double",
+        "complex64": "float _Complex",
+        "complex128": "double _Complex",
+    }
+    return mapping.get(dtype_name or "float64", "double")
+
+
+def _tabulate_tensor_declaration(kernel: Any) -> str:
+    """Return the CFFI declaration for one generated tabulate function."""
+    scalar = _c_scalar_type(kernel.scalar_type)
+    geom = _c_scalar_type(kernel.geometry_type)
+    return f"""
+void tabulate_tensor_{kernel.name}({scalar}* restrict A,
+                                   const {scalar}* restrict w,
+                                   const {scalar}* restrict c,
+                                   const {geom}* restrict coordinate_dofs,
+                                   const int* restrict entity_local_index,
+                                   const uint8_t* restrict quadrature_permutation,
+                                   void* custom_data);
+"""
+
+
+def _strip_ufcx_integral_object(c_definition: str, kernel_name: str) -> str:
+    """Remove the UFCx integral object from CFFI/JIT source code."""
+    pattern = (
+        rf"\nufcx_integral\s+{re.escape(kernel_name)}\s*=\s*"
+        rf"\{{.*?\n\}};\n"
+    )
+    return re.sub(pattern, "\n", c_definition, flags=re.DOTALL)
 
 
 def create_dolfinx_form_with_runtime(
@@ -257,7 +302,13 @@ def create_dolfinx_form_with_runtime(
         mesh=mesh._cpp_object,
     )
 
-    return dolfinx_fem.Form(cpp_form)
+    form = dolfinx_fem.Form(cpp_form)
+    try:
+        form._runintgen_custom_data = custom_data
+        form._runintgen_runtime_info = runtime_info
+    except Exception:
+        pass
+    return form
 
 
 def _ufl_to_dolfinx_integral_type(ufl_type: str) -> "IntegralType":

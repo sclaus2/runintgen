@@ -4,7 +4,7 @@ Runtime quadrature kernel generator for FEniCSx/FFCx.
 
 ## Overview
 
-`runintgen` compiles UFL integrals marked with runtime quadrature metadata into
+`runintgen` compiles UFL integrals marked for runtime quadrature into
 UFCx-compatible C kernels. The generated kernels keep the standard UFCx
 `tabulate_tensor` signature and receive runtime context through
 `void* custom_data`.
@@ -28,11 +28,11 @@ Basix tabulation callbacks supplied by the runtime context.
 pip install -e .
 ```
 
-For optional C++/nanobind experiments:
-
-```bash
-pip install -e ".[cpp]"
-```
+The default install builds the Basix-only runtime extension used to construct
+``custom_data`` without depending on DOLFINx. It requires a C++20 compiler and a
+Basix installation discoverable by CMake. In conda environments, the build
+prefers the compiler from the Python environment so it matches the Basix
+library ABI.
 
 ## Requirements
 
@@ -40,8 +40,7 @@ pip install -e ".[cpp]"
 - NumPy.
 - FEniCSx Python packages: UFL, FFCx, and Basix.
 - UFCx headers and a C/C++ compiler when compiling generated kernels.
-- DOLFINx is optional, but needed for the C++ `runintgen/dolfinx` custom-data
-  bridge.
+- DOLFINx is optional and only needed when constructing DOLFINx forms.
 - `cffi` is optional and mainly useful for Python-side ABI tests/prototypes.
 
 ## Quick Start
@@ -54,7 +53,7 @@ import ufl
 from basix.ufl import element
 
 from runintgen import (
-    RUNTIME_QUADRATURE_RULE,
+    RuntimeQuadratureRule,
     compile_runtime_integrals,
     write_runtime_code,
 )
@@ -66,12 +65,11 @@ V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 2))
 u = ufl.TrialFunction(V)
 v = ufl.TestFunction(V)
 
-dx_rt = ufl.Measure(
-    "dx",
-    domain=mesh,
-    subdomain_id=1,
-    metadata={"quadrature_rule": RUNTIME_QUADRATURE_RULE},
+quadrature = RuntimeQuadratureRule(
+    points=np.array([[1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64),
+    weights=np.array([0.5], dtype=np.float64),
 )
+dx_rt = ufl.Measure("dx", domain=mesh, subdomain_id=1, subdomain_data=quadrature)
 
 a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
@@ -95,6 +93,9 @@ for kernel in module.kernels:
             table["element_index"],
             table["derivative_counts"],
         )
+
+runtime_data = module.create_custom_data(quadrature)
+print(runtime_data.ptr)  # Pointer passed as UFCx custom_data.
 ```
 
 `write_runtime_code` writes:
@@ -110,23 +111,33 @@ include directories to the downstream C/C++ build.
 
 ## Runtime Measures
 
-Runtime integrals are ordinary UFL integrals with
-`metadata={"quadrature_rule": "runtime"}`:
+Runtime integrals are selected by the contents of UFL `subdomain_data`.
+There are three cases:
+
+- Quadrature rule only: runintgen generates a runtime-only UFCx integral.
+- Entity data plus quadrature rule: runintgen generates a mixed UFCx integral
+  that uses `custom_data->is_cut[entity_index]` to choose the runtime or
+  standard branch.
+- Entity data only: the integral is standard-only and is left to FFCx/DOLFINx.
 
 ```python
-dx_rt = ufl.Measure(
+from runintgen import RuntimeQuadratureRule
+
+inside_entities = [0, 1, 4]
+inside_quadrature = RuntimeQuadratureRule(points=points, weights=weights)
+
+dx = ufl.Measure(
     "dx",
     domain=mesh,
-    subdomain_data=provider,
-    metadata={"quadrature_rule": "runtime"},
+    subdomain_data=[(0, inside_entities), (0, inside_quadrature)],
 )
-
-ds_rt = ufl.Measure("ds", domain=mesh, metadata={"quadrature_rule": "runtime"})
-dS_rt = ufl.Measure("dS", domain=mesh, metadata={"quadrature_rule": "runtime"})
 ```
 
-`subdomain_data` is preserved for analysis via `get_quadrature_provider`, but
-the generated C kernel receives runtime quadrature through `custom_data`.
+Ordinary entity data without quadrature-rule payloads remains a standard UFL
+measure for FFCx/DOLFINx. The legacy
+`metadata={"quadrature_rule": "runtime"}` marker is still accepted, but new code
+should prefer `subdomain_data` because measure metadata is easy to lose when UFL
+reconfigures measures.
 
 ## Runtime ABI
 
@@ -164,6 +175,7 @@ struct runintgen_context
 {
   int num_rules;
   const runintgen_quadrature_rule* rules;
+  const uint8_t* is_cut;
   const runintgen_form_context* form;
 };
 ```
@@ -172,7 +184,8 @@ Runtime weights must already include the relevant measure scaling, such as
 `|detJ|`, facet scaling, or cut-cell scaling. Generated C does not create
 quadrature rules and does not multiply weights by `detJ`. Reference-to-physical
 mapping, such as `J^-T grad_ref`, remains in generated C when required by the
-FFCx IR.
+FFCx IR. For non-cut entities, the generated mixed wrapper calls the standard
+FFCx branch, which uses the normal compile-time quadrature and measure scaling.
 
 ## Runtime Table Calls
 
@@ -188,6 +201,24 @@ layout:
 `RuntimeKernelInfo.table_info` mirrors these requests. It includes the runtime
 slot, FFCx table name, derivative counts, Basix derivative index, form element
 index, flat component, block offset/stride metadata, role, and terminal index.
+
+## Basix-Only Custom Data
+
+`runintgen.basix_runtime.CustomData` builds the runtime context from
+`module.form_metadata` and one or more `RuntimeQuadratureRule` objects:
+
+```python
+runtime_data = module.create_custom_data(
+    RuntimeQuadratureRule(points=points, weights=weights)
+)
+
+kernel(..., runtime_data.ptr)
+```
+
+The generated C kernels do not link to Basix. They call the `tabulate` function
+pointer stored in `custom_data`; the installed `_basix_runtime` extension owns
+the C++ Basix elements and performs tabulation. Keep the `CustomData` object
+alive until assembly or kernel calls are complete.
 
 ## Form Metadata
 
@@ -209,33 +240,6 @@ wrapper uses it to resolve active elements from DOLFINx argument spaces,
 coefficient function spaces, and mesh coordinate elements. This keeps generated
 C free of Basix and DOLFINx C++ casts.
 
-## DOLFINx Bridge
-
-The C++ helper in `runintgen/dolfinx/custom_data.{h,cpp}` owns a
-`runintgen_context`, resolves Basix/coordinate elements from a DOLFINx form, and
-registers tabulation callbacks.
-
-Sketch:
-
-```cpp
-#include "laplace_p2.h"
-#include "runintgen/dolfinx/custom_data.h"
-
-std::vector<runintgen::dolfinx::QuadratureRule> rules = /* per-entity rules */;
-
-auto data = runintgen::dolfinx::create_custom_data(
-    form, runintgen_form_descriptor_laplace_p2, std::move(rules));
-
-void* custom_data = data->custom_data();
-```
-
-Keep the returned owner alive for the whole assembly. The generated kernels
-select the active quadrature rule from `entity_local_index` using the current
-DOLFINx runtime-data convention:
-
-- Cell integrals: `entity_local_index[0]`.
-- Exterior facet integrals: `entity_local_index[1]`.
-- Interior facet integrals: `entity_local_index[2]`.
 
 ## Geometry Helpers
 
@@ -254,17 +258,17 @@ leave final runtime-rule ownership to the caller or C++ bridge.
 ## Architecture
 
 ```text
-UFL form with metadata={"quadrature_rule": "runtime"}
+UFL form with quadrature-rule payloads in subdomain_data
   |
   v
 runintgen.analysis.build_runtime_info
-  |  selects runtime integrals and preserves FFCx IR context
+  |  selects runtime/mixed integrals and preserves FFCx IR context
   v
-FFCx analysis and IR computation
+FFCx analysis and IR computation for runtime and standard branches
   |
   v
 runintgen.codegeneration.runtime_integrals
-  |  adapts FFCx IntegralGenerator for runtime weights, points, and FE tables
+  |  emits runtime-only or mixed runtime/standard branch wrappers
   v
 RunintModule
   |  kernels, table requests, scalar/geometry types, form metadata
@@ -273,7 +277,7 @@ write_runtime_code
   |  generated .h/.c plus shared runtime ABI header
   v
 DOLFINx/C++ or CFFI runtime context
-  |  per-entity quadrature rules and Basix tabulate callbacks
+  |  per-entity is_cut flags, quadrature rules, and Basix callbacks
   v
 UFCx kernel called with void* custom_data
 ```
@@ -283,6 +287,16 @@ UFCx kernel called with void* custom_data
 ### Measures
 
 - `RUNTIME_QUADRATURE_RULE`: Constant `"runtime"` for UFL metadata.
+- `RuntimeIntegralMode`: Classification enum with `STANDARD`, `RUNTIME`, and
+  `MIXED`.
+- `is_runtime_quadrature_rule(value)`: Check the structural quadrature-rule
+  protocol, currently `points` plus `weights`.
+- `has_runtime_quadrature(subdomain_data)`: Check whether UFL subdomain data
+  contains a quadrature-rule payload.
+- `has_standard_subdomain_data(subdomain_data)`: Check whether UFL subdomain
+  data contains ordinary entity payloads.
+- `runtime_integral_mode(integral)`: Classify an integral as standard-only,
+  runtime-only, or mixed.
 - `is_runtime_integral(integral)`: Check whether an integral uses runtime
   quadrature.
 - `get_quadrature_provider(integral)`: Return the integral's

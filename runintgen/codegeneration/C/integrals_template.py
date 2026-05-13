@@ -13,7 +13,25 @@ factory_runtime_kernel = r"""
 
 {table_requests}
 
-void tabulate_tensor_{factory_name}({scalar}* restrict A,
+{tabulate_tensor_functions}
+
+ufcx_integral {factory_name} =
+{{
+  .enabled_coefficients = {enabled_coefficients},
+  {tabulate_tensor_float32}
+  {tabulate_tensor_float64}
+  {tabulate_tensor_complex64}
+  {tabulate_tensor_complex128}
+  .needs_facet_permutations = {needs_facet_permutations},
+  .coordinate_element_hash = {coordinate_element_hash},
+  .domain = {domain},
+}};
+
+// End of code for runtime integral {factory_name}
+"""
+
+factory_runtime_tabulate_tensor = r"""
+{static_prefix}void tabulate_tensor_{factory_name}{suffix}({scalar}* restrict A,
                                     const {scalar}* restrict w,
                                     const {scalar}* restrict c,
                                     const {geom}* restrict coordinate_dofs,
@@ -47,20 +65,45 @@ void tabulate_tensor_{factory_name}({scalar}* restrict A,
 
 {body}
 }}
+"""
 
-ufcx_integral {factory_name} =
+factory_standard_tabulate_tensor = r"""
+static void tabulate_tensor_{factory_name}_standard({scalar}* restrict A,
+                                    const {scalar}* restrict w,
+                                    const {scalar}* restrict c,
+                                    const {geom}* restrict coordinate_dofs,
+                                    const int* restrict entity_local_index,
+                                    const uint8_t* restrict quadrature_permutation,
+                                    void* custom_data)
 {{
-  .enabled_coefficients = {enabled_coefficients},
-  {tabulate_tensor_float32}
-  {tabulate_tensor_float64}
-  {tabulate_tensor_complex64}
-  {tabulate_tensor_complex128}
-  .needs_facet_permutations = {needs_facet_permutations},
-  .coordinate_element_hash = {coordinate_element_hash},
-  .domain = {domain},
-}};
+{standard_body}
+}}
+"""
 
-// End of code for runtime integral {factory_name}
+factory_mixed_tabulate_tensor = r"""
+void tabulate_tensor_{factory_name}({scalar}* restrict A,
+                                    const {scalar}* restrict w,
+                                    const {scalar}* restrict c,
+                                    const {geom}* restrict coordinate_dofs,
+                                    const int* restrict entity_local_index,
+                                    const uint8_t* restrict quadrature_permutation,
+                                    void* custom_data)
+{{
+  const runintgen_context* data = (const runintgen_context*)custom_data;
+  const int local_index = {local_index_expr};
+  if (data != 0 && data->is_cut != 0 && local_index >= 0
+      && local_index < data->num_rules && data->is_cut[local_index] != 0)
+  {{
+    tabulate_tensor_{factory_name}_runtime(
+        A, w, c, coordinate_dofs, entity_local_index, quadrature_permutation,
+        custom_data);
+    return;
+  }}
+
+  tabulate_tensor_{factory_name}_standard(
+      A, w, c, coordinate_dofs, entity_local_index, quadrature_permutation,
+      custom_data);
+}}
 """
 
 factory_runtime_kernel_decl = "extern ufcx_integral {factory_name};\n"
