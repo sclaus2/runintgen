@@ -353,9 +353,7 @@ UFCx kernel called with void* custom_data
   and runtime integrals.
 - `generated/runtime_codegen/`: Checked-in examples of the current generated
   headers and sources.
-- `docs/cell_based_custom_data.md`: Design note for passing entity loop indices
-  to UFCx kernels.
-- `docs/ffcx_ir_migration.md`: Notes on the FFCx IR-backed migration.
+
 
 ## License
 
