@@ -266,6 +266,36 @@ wrapper uses it to resolve active elements from DOLFINx argument spaces,
 coefficient function spaces, and mesh coordinate elements. This keeps generated
 C free of Basix and DOLFINx C++ casts.
 
+## DOLFINx JIT Integration
+
+For DOLFINx users, the preferred entry point is `runintgen.dolfinx.form`.
+It mirrors `dolfinx.fem.form` and returns a normal DOLFINx `Form`:
+
+```python
+from runintgen.dolfinx import form as runintgen_form
+
+num_cells = mesh.topology.index_map(mesh.topology.dim).size_local
+runtime_rules = RuntimeQuadratureRules(
+    tdim=2,
+    points=points,
+    weights=weights,
+    offsets=offsets,
+    parent_map=np.arange(num_cells, dtype=np.int32),
+)
+dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=runtime_rules)
+a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+
+A = dolfinx.fem.assemble_matrix(runintgen_form(a))
+```
+
+The DOLFINx integration currently targets the patched DOLFINx branch with
+per-integral `custom_data` support. Runtime quadrature support is intentionally
+limited to `float64` cell integrals for the first implementation. Standard-only
+forms passed to `runintgen.dolfinx.form` delegate to `dolfinx.fem.form`.
+
+Lower-level APIs such as `compile_runtime_integrals`, `create_custom_data`, and
+`runintgen.jit.compile_forms` remain available for diagnostics, generated-code
+inspection, and non-DOLFINx integration experiments.
 
 ## Geometry Helpers
 
@@ -332,10 +362,24 @@ UFCx kernel called with void* custom_data
 
 - `compile_runtime_integrals(form, options=None)`: Compile runtime-marked
   integrals and return a `RunintModule`.
+- `runintgen.jit.compile_forms(forms, options=None, ...)`: Compile combined
+  standard/runtime forms into full UFCx form objects with CFFI.
 - `RunintModule`: Holds generated kernels, module metadata, and
   `form_metadata`.
 - `RuntimeKernelInfo`: Holds one kernel's C declaration/definition, UFCx
   integral name, table requests, tensor shape, scalar type, and geometry type.
+
+### DOLFINx
+
+- `runintgen.dolfinx.form(form, ...)`: Preferred DOLFINx entry point. Returns a
+  normal `dolfinx.fem.Form`, delegating standard-only forms to DOLFINx and using
+  runintgen JIT when runtime integrals are present.
+- `runintgen.dolfinx.compile_form(comm, form, ...)`: Compile a UFL form into a
+  public `CompiledRunintForm` without binding runtime DOLFINx data.
+- `runintgen.dolfinx.create_form(compiled, V, mesh, ...)`: Build a DOLFINx form
+  from a compiled runintgen form.
+- `runintgen.dolfinx.has_runtime_custom_data_support()`: Check whether the
+  loaded DOLFINx build exposes the required custom-data support.
 
 ### Generated Files
 

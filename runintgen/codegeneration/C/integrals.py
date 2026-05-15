@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 from ffcx.codegeneration.backend import FFCXBackend
 from ffcx.codegeneration.C.formatter import Formatter
+from ffcx.codegeneration.C.integral import generator as standard_integral_generator
 from ffcx.codegeneration.integral_generator import (
     IntegralGenerator as StandardIntegralGenerator,
 )
@@ -46,6 +47,28 @@ def _subdomain_ids_by_integral(
     }
 
 
+def _all_subdomain_ids_by_integral(ir: Any) -> dict[tuple[str, int], int]:
+    """Build an integral key to first subdomain id map for all form integrals."""
+    if not getattr(ir, "forms", None):
+        return {}
+
+    form_ir = ir.forms[0]
+    ids_by_key: dict[tuple[str, int], int] = {}
+    for integral_type, ids in form_ir.subdomain_ids.items():
+        names = form_ir.integral_names[integral_type]
+        pos = 0
+        group_index = 0
+        while pos < len(names):
+            name = names[pos]
+            sid = ids[pos]
+            ids_by_key[(integral_type, group_index)] = int(sid)
+            pos += 1
+            while pos < len(names) and names[pos] == name:
+                pos += 1
+            group_index += 1
+    return ids_by_key
+
+
 def _domains_for_integral(integral_ir: Any) -> list[Any]:
     """Return sorted domains present in an FFCx integral IR."""
     domains = {cell for cell, _ in integral_ir.expression.integrand.keys()}
@@ -70,6 +93,39 @@ def _kernel_name(
 ) -> str:
     """Return FFCx's UFCx integral object name."""
     return f"{integral_ir.expression.name}_{domain.name}"
+
+
+def _standard_kernel_info(
+    integral_ir: Any,
+    domain: Any,
+    *,
+    integral_type: str,
+    ir_index: int,
+    subdomain_id: int,
+    options: dict[str, Any],
+    kernel_id: int,
+) -> RuntimeKernelInfo:
+    """Generate one standard FFCx kernel and return runintgen metadata."""
+    c_decl, c_def = standard_integral_generator(integral_ir, domain, options)
+    scalar_type = np.dtype(options.get("scalar_type", np.float64)).name
+    geometry_type = np.dtype(dtype_to_scalar_dtype(scalar_type)).name
+    return RuntimeKernelInfo(
+        name=_kernel_name(integral_ir, domain),
+        integral_type=integral_type,
+        subdomain_id=subdomain_id,
+        ir_index=ir_index,
+        c_declaration=c_decl,
+        c_definition=c_def,
+        tensor_shape=tuple(integral_ir.expression.tensor_shape),
+        table_info=[],
+        table_slots={},
+        domain=domain.name,
+        kernel_id=kernel_id,
+        scalar_type=scalar_type,
+        geometry_type=geometry_type,
+        base_name=integral_ir.expression.name,
+        mode="standard",
+    )
 
 
 def _local_index_position(integral_type: str) -> int:
@@ -491,8 +547,54 @@ def generate_C_runtime_kernels(
                     kernel_id=kernel_id,
                     scalar_type=scalar_type,
                     geometry_type=geometry_type,
+                    base_name=integral_ir.expression.name,
+                    mode=mode.value,
                 )
             )
+
+    return kernels
+
+
+def generate_C_combined_kernels(
+    analysis: RuntimeAnalysisInfo,
+    options: dict[str, Any],
+    form_metadata: FormRuntimeMetadata | None = None,
+) -> list[RuntimeKernelInfo]:
+    """Generate C kernels for standard, runtime, and mixed integrals."""
+    ffcx_options = _runtime_options(options)
+    runtime_keys = set(analysis.integral_infos)
+    runtime_kernels = {
+        (kernel.integral_type, kernel.ir_index, kernel.domain): kernel
+        for kernel in generate_C_runtime_kernels(analysis, options, form_metadata)
+    }
+
+    runtime_integrals = _integrals_by_key(analysis.ir)
+    subdomain_by_key = _all_subdomain_ids_by_integral(analysis.standard_ir)
+
+    kernels: list[RuntimeKernelInfo] = []
+    ir_type_counts: dict[str, int] = {}
+    for integral_ir in analysis.standard_ir.integrals:
+        integral_type = integral_ir.expression.integral_type
+        ir_index = ir_type_counts.get(integral_type, 0)
+        ir_type_counts[integral_type] = ir_index + 1
+        key = (integral_type, ir_index)
+
+        source_ir = runtime_integrals[key] if key in runtime_keys else integral_ir
+        domains = _domains_for_integral(source_ir)
+        for domain_id, domain in enumerate(domains):
+            if key in runtime_keys:
+                kernel = runtime_kernels[(integral_type, ir_index, domain.name)]
+            else:
+                kernel = _standard_kernel_info(
+                    integral_ir,
+                    domain,
+                    integral_type=integral_type,
+                    ir_index=ir_index,
+                    subdomain_id=subdomain_by_key.get(key, -1),
+                    options=ffcx_options,
+                    kernel_id=ir_index * 1024 + domain_id,
+                )
+            kernels.append(kernel)
 
     return kernels
 

@@ -30,7 +30,7 @@ class RuntimeKernelInfo:
             Basix element tabulation slots.
         table_slots: Map from FFCx table name to runtime element table slot.
         scalar_type: NumPy scalar type used for A, w, and c.
-        geometry_type: Real NumPy type used for coordinate_dofs, following FFCx.
+    geometry_type: Real NumPy type used for coordinate_dofs, following FFCx.
     """
 
     name: str
@@ -46,6 +46,8 @@ class RuntimeKernelInfo:
     kernel_id: int = 0
     scalar_type: str | None = None
     geometry_type: str | None = None
+    base_name: str | None = None
+    mode: str = "runtime"
 
 
 @dataclass

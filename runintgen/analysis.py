@@ -503,6 +503,8 @@ def _process_modified_terminal(
 def build_runtime_analysis(
     form: ufl.Form,
     options: dict[str, Any] | None = None,
+    *,
+    prefix: str = "runint",
 ) -> RuntimeAnalysisInfo:
     """Analyse a UFL form and collect info for runtime integrals.
 
@@ -532,9 +534,9 @@ def build_runtime_analysis(
 
     ffcx_options = get_options(options)
     ffcx_options["sum_factorization"] = False
-    ir = compute_ir(analysis, {}, "runint", ffcx_options, visualise=False)
+    ir = compute_ir(analysis, {}, prefix, ffcx_options, visualise=False)
     standard_ir = compute_ir(
-        standard_analysis, {}, "runint_standard", ffcx_options, visualise=False
+        standard_analysis, {}, f"{prefix}_standard", ffcx_options, visualise=False
     )
 
     # 3. Build runtime groups and IR mapping
@@ -586,6 +588,11 @@ def build_runtime_analysis(
 RuntimeInfo = RuntimeAnalysisInfo
 
 
-def build_runtime_info(form: ufl.Form, options: dict[str, Any]) -> RuntimeAnalysisInfo:
+def build_runtime_info(
+    form: ufl.Form,
+    options: dict[str, Any],
+    *,
+    prefix: str = "runint",
+) -> RuntimeAnalysisInfo:
     """Backward-compatible wrapper for build_runtime_analysis."""
-    return build_runtime_analysis(form, options)
+    return build_runtime_analysis(form, options, prefix=prefix)
