@@ -7,8 +7,8 @@ import ufl
 from basix.ufl import element
 
 from runintgen import (
+    QuadratureRules,
     RuntimeQuadratureRule,
-    RuntimeQuadratureRules,
     compile_runtime_integrals,
     dxq,
     get_runintgen_data_struct,
@@ -246,7 +246,7 @@ class TestCodeGeneration:
         V = ufl.FunctionSpace(mesh, V_el)
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        quadrature = RuntimeQuadratureRules(
+        quadrature = QuadratureRules(
             tdim=2,
             points=np.array([1.0 / 3.0, 1.0 / 3.0], dtype=np.float64),
             weights=np.array([0.5], dtype=np.float64),

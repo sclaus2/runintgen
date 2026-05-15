@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import numpy as np
 import numpy.typing as npt
@@ -67,8 +68,8 @@ class RuntimeQuadratureRule:
 
 
 @dataclass
-class RuntimeQuadratureRules:
-    """Borrowed flat runtime quadrature arrays.
+class QuadratureRules:
+    """Borrowed flat quadrature-rule arrays.
 
     The constructor validates and stores references to caller-owned NumPy
     arrays. It does not coerce dtype or contiguity, so compatible arrays from
@@ -79,14 +80,22 @@ class RuntimeQuadratureRules:
     tdim: int
     points: npt.NDArray[np.float64]
     weights: npt.NDArray[np.float64]
-    offsets: npt.NDArray[np.int64]
+    offsets: npt.NDArray[np.int64] | None = None
     parent_map: npt.NDArray[np.int32] | None = None
+    rule_id: str | None = None
+    kind: str = "per_entity"
+    gdim: int | None = None
+    physical_points: npt.NDArray[np.float64] | None = None
 
     def __post_init__(self) -> None:
         """Validate borrowed quadrature buffers."""
         self.tdim = int(self.tdim)
         if self.tdim <= 0:
             raise ValueError("tdim must be positive.")
+        if self.kind not in {"per_entity", "shared"}:
+            raise ValueError("kind must be 'per_entity' or 'shared'.")
+        if self.rule_id is None:
+            self.rule_id = str(uuid4())
 
         self.points = _borrow_array(
             self.points, dtype=np.dtype(np.float64), name="points"
@@ -94,15 +103,17 @@ class RuntimeQuadratureRules:
         self.weights = _borrow_array(
             self.weights, dtype=np.dtype(np.float64), name="weights"
         )
-        self.offsets = _borrow_array(
-            self.offsets, dtype=np.dtype(np.int64), name="offsets"
-        )
 
         if self.points.ndim == 2:
             if self.points.shape[1] != self.tdim:
                 raise ValueError("points second dimension must equal tdim.")
-            if self.points.shape[0] != self.weights.size:
+            if (
+                self.kind == "per_entity"
+                and self.points.shape[0] != self.weights.size
+            ):
                 raise ValueError("points and weights disagree on total nq.")
+            if self.kind == "shared" and self.points.shape[0] != self.weights.size:
+                raise ValueError("shared points and weights disagree on nq.")
         elif self.points.ndim == 1:
             if self.points.size != self.weights.size * self.tdim:
                 raise ValueError("flat points size must equal weights.size * tdim.")
@@ -111,14 +122,23 @@ class RuntimeQuadratureRules:
 
         if self.weights.ndim != 1:
             raise ValueError("weights must have shape (total_nq,).")
-        if self.offsets.ndim != 1 or self.offsets.size == 0:
-            raise ValueError("offsets must be a non-empty 1D array.")
-        if self.offsets[0] != 0:
-            raise ValueError("offsets[0] must be zero.")
-        if np.any(np.diff(self.offsets) < 0):
-            raise ValueError("offsets must be nondecreasing.")
-        if self.offsets[-1] != self.weights.size:
-            raise ValueError("offsets[-1] must equal weights.size.")
+
+        if self.kind == "per_entity":
+            if self.offsets is None:
+                raise ValueError("per-entity quadrature rules require offsets.")
+            self.offsets = _borrow_array(
+                self.offsets, dtype=np.dtype(np.int64), name="offsets"
+            )
+            if self.offsets.ndim != 1 or self.offsets.size == 0:
+                raise ValueError("offsets must be a non-empty 1D array.")
+            if self.offsets[0] != 0:
+                raise ValueError("offsets[0] must be zero.")
+            if np.any(np.diff(self.offsets) < 0):
+                raise ValueError("offsets must be nondecreasing.")
+            if self.offsets[-1] != self.weights.size:
+                raise ValueError("offsets[-1] must equal weights.size.")
+        elif self.offsets is not None:
+            raise ValueError("shared quadrature rules do not use offsets.")
 
         if self.parent_map is not None:
             self.parent_map = _borrow_array(
@@ -126,18 +146,57 @@ class RuntimeQuadratureRules:
             )
             if self.parent_map.ndim != 1:
                 raise ValueError("parent_map must be 1D.")
-            if self.parent_map.size != self.num_rules:
-                raise ValueError("parent_map must have one entry per rule.")
+            expected = (
+                self.num_rules if self.kind == "per_entity" else self.num_entities
+            )
+            if self.parent_map.size != expected:
+                raise ValueError("parent_map has the wrong number of entries.")
+
+        if self.gdim is not None:
+            self.gdim = int(self.gdim)
+            if self.gdim <= 0:
+                raise ValueError("gdim must be positive when supplied.")
+        if self.physical_points is not None:
+            if self.gdim is None:
+                raise ValueError("gdim is required when physical_points are supplied.")
+            self.physical_points = _borrow_array(
+                self.physical_points,
+                dtype=np.dtype(np.float64),
+                name="physical_points",
+            )
+            if self.physical_points.ndim != 2:
+                raise ValueError("physical_points must have shape (gdim, total_nq).")
+            if self.physical_points.shape[0] != self.gdim:
+                raise ValueError("physical_points first dimension must equal gdim.")
+            if self.physical_points.shape[1] != self.total_points:
+                raise ValueError(
+                    "physical_points second dimension must equal total_nq."
+                )
 
     @property
     def num_rules(self) -> int:
         """Number of flat quadrature-rule slices."""
+        if self.kind != "per_entity" or self.offsets is None:
+            return 1
         return int(self.offsets.size - 1)
 
     @property
     def total_points(self) -> int:
         """Total number of quadrature points across all rule slices."""
+        if self.kind == "shared":
+            if self.parent_map is None:
+                return int(self.weights.size)
+            return int(self.weights.size * self.parent_map.size)
         return int(self.weights.size)
+
+    @property
+    def num_entities(self) -> int:
+        """Number of supplied entities represented by the rule set."""
+        if self.kind == "per_entity":
+            return self.num_rules
+        if self.parent_map is None:
+            return 1
+        return int(self.parent_map.size)
 
     @classmethod
     def from_rules(
@@ -145,7 +204,7 @@ class RuntimeQuadratureRules:
         rules: Any,
         *,
         parent_map: npt.ArrayLike | None = None,
-    ) -> "RuntimeQuadratureRules":
+    ) -> "QuadratureRules":
         """Pack one or more rule-like objects into flat quadrature arrays.
 
         This convenience constructor may copy quadrature values. Use the main
@@ -248,7 +307,7 @@ class RuntimeEntityMap:
         return int(self.entity_indices.size)
 
     @classmethod
-    def runtime_only(cls, rules: RuntimeQuadratureRules) -> "RuntimeEntityMap":
+    def runtime_only(cls, rules: QuadratureRules) -> "RuntimeEntityMap":
         """Build a runtime-only entity map from quadrature parent ids."""
         entity_indices = (
             rules.parent_map
@@ -266,9 +325,9 @@ class RuntimeEntityMap:
         cls,
         *,
         standard_entities: npt.ArrayLike,
-        rules: RuntimeQuadratureRules,
+        rules: QuadratureRules,
     ) -> "RuntimeEntityMap":
-        """Build an entity map from form standard entities and runtime rules."""
+        """Build an entity map from standard entities and per-entity rules."""
         standard = np.ascontiguousarray(standard_entities, dtype=np.int32)
         if standard.ndim != 1:
             standard = np.ravel(standard)
@@ -303,11 +362,12 @@ class RuntimeEntityMap:
 class RuntimeQuadraturePayload:
     """Borrowed quadrature plus derived integration-loop entity map."""
 
-    rules: RuntimeQuadratureRules
+    rules: QuadratureRules
     entities: RuntimeEntityMap
+    quadrature_functions: "QuadratureFunctionValueSet | None" = None
 
     def __post_init__(self) -> None:
-        """Validate entity rule references against runtime rule storage."""
+        """Validate entity rule references against per-entity rule storage."""
         cut_entries = self.entities.is_cut != 0
         if np.any(self.entities.rule_indices[cut_entries] < 0):
             raise ValueError("cut entities must reference a quadrature rule.")
@@ -367,17 +427,151 @@ class RuntimeQuadraturePayload:
         return self.entities.num_entities
 
 
+@dataclass
+class QuadratureFunctionValue:
+    """Provider-owned packed values for one quadrature function slot."""
+
+    values: npt.NDArray[np.float64]
+    value_size: int
+
+    def __post_init__(self) -> None:
+        """Validate a kernel-facing quadrature-function value array."""
+        self.values = _borrow_array(
+            self.values, dtype=np.dtype(np.float64), name="quadrature function values"
+        )
+        self.value_size = int(self.value_size)
+        if self.value_size <= 0:
+            raise ValueError("value_size must be positive.")
+        if self.values.ndim == 1:
+            if self.value_size != 1:
+                raise ValueError("vector/tensor quadrature values must be 2D.")
+        elif self.values.ndim == 2:
+            if self.values.shape[1] != self.value_size:
+                raise ValueError("values second dimension must equal value_size.")
+        else:
+            raise ValueError(
+                "values must have shape (total_nq,) or (total_nq, value_size)."
+            )
+
+    @property
+    def num_points(self) -> int:
+        """Number of quadrature points represented by the value array."""
+        return int(self.values.shape[0])
+
+
+@dataclass
+class QuadratureFunctionValueSet:
+    """Packed quadrature-function values ordered by generated slot."""
+
+    functions: list[QuadratureFunctionValue]
+
+    @property
+    def num_functions(self) -> int:
+        """Number of quadrature-function value slots."""
+        return len(self.functions)
+
+
+def _normalise_quadrature_function_values(
+    values: npt.ArrayLike,
+    *,
+    value_size: int,
+    total_points: int,
+    borrowed: bool,
+) -> npt.NDArray[np.float64]:
+    """Return values in point-major kernel-facing layout."""
+    if borrowed:
+        array = _borrow_array(
+            values, dtype=np.dtype(np.float64), name="quadrature function values"
+        )
+    else:
+        array = np.ascontiguousarray(values, dtype=np.float64)
+
+    if value_size == 1:
+        if array.ndim == 2 and array.shape[1] == 1:
+            array = np.ascontiguousarray(array[:, 0], dtype=np.float64)
+        if array.ndim != 1:
+            raise ValueError("scalar quadrature-function values must be 1D.")
+        if array.shape[0] != total_points:
+            raise ValueError("scalar quadrature-function values have wrong length.")
+        return array
+
+    if array.ndim != 2:
+        raise ValueError("vector/tensor quadrature-function values must be 2D.")
+    if array.shape != (total_points, value_size):
+        raise ValueError(
+            "vector/tensor quadrature-function values must have shape "
+            f"({total_points}, {value_size})."
+        )
+    return array
+
+
+def build_quadrature_function_value_set(
+    infos: list[Any],
+    rules: QuadratureRules,
+    *,
+    fallback_evaluator: Any | None = None,
+) -> QuadratureFunctionValueSet | None:
+    """Resolve callable or explicit values for generated quadrature functions."""
+    if not infos:
+        return None
+
+    from .quadrature_function import (
+        quadrature_function_source,
+        quadrature_function_values,
+    )
+
+    packed: list[QuadratureFunctionValue] = []
+    for info in infos:
+        explicit_values = quadrature_function_values(info.terminal)
+        rule_values = explicit_values.get(str(rules.rule_id))
+        if rule_values is not None:
+            values = _normalise_quadrature_function_values(
+                rule_values,
+                value_size=info.value_size,
+                total_points=rules.total_points,
+                borrowed=True,
+            )
+        else:
+            source = quadrature_function_source(info.terminal)
+            if source is not None:
+                if rules.physical_points is None:
+                    raise ValueError(
+                        f"QuadratureFunction {info.label!r} uses a callable source, "
+                        "but the quadrature rules do not carry physical_points."
+                    )
+                raw_values = source(rules.physical_points)
+            elif fallback_evaluator is not None:
+                raw_values = fallback_evaluator(info, rules)
+            else:
+                raise ValueError(
+                    f"QuadratureFunction {info.label!r} has no values for "
+                    f"quadrature rule {rules.rule_id!r}."
+                )
+            values = _normalise_quadrature_function_values(
+                raw_values,
+                value_size=info.value_size,
+                total_points=rules.total_points,
+                borrowed=False,
+            )
+
+        packed.append(
+            QuadratureFunctionValue(values=values, value_size=info.value_size)
+        )
+
+    return QuadratureFunctionValueSet(functions=packed)
+
+
 def as_runtime_quadrature_rules(
     quadrature: Any,
     *,
     parent_map: npt.ArrayLike | None = None,
-) -> RuntimeQuadratureRules:
+) -> QuadratureRules:
     """Return flat runtime quadrature rules from supported inputs."""
-    if isinstance(quadrature, RuntimeQuadratureRules):
+    if isinstance(quadrature, QuadratureRules):
         if parent_map is not None:
-            raise ValueError("parent_map is part of RuntimeQuadratureRules.")
+            raise ValueError("parent_map is part of QuadratureRules.")
         return quadrature
-    return RuntimeQuadratureRules.from_rules(quadrature, parent_map=parent_map)
+    return QuadratureRules.from_rules(quadrature, parent_map=parent_map)
 
 
 def _is_form_subdomain_data(value: Any) -> bool:
@@ -430,6 +624,11 @@ def as_runtime_quadrature_payload(
         if len(runtime_items) != 1:
             raise ValueError("Mixed runtime subdomain data must contain one rule set.")
         rules = as_runtime_quadrature_rules(runtime_items[0])
+        if rules.kind != "per_entity":
+            raise ValueError(
+                "Runtime quadrature payloads require "
+                "QuadratureRules(kind='per_entity')."
+            )
         standard_entities = (
             np.concatenate(standard_blocks)
             if standard_blocks
@@ -444,6 +643,11 @@ def as_runtime_quadrature_payload(
         )
 
     rules = as_runtime_quadrature_rules(quadrature)
+    if rules.kind != "per_entity":
+        raise ValueError(
+            "Runtime quadrature payloads require "
+            "QuadratureRules(kind='per_entity')."
+        )
     if is_cut is None:
         entities = RuntimeEntityMap.runtime_only(rules)
     else:
@@ -531,17 +735,24 @@ class RuntimeContextBuilder:
     def build_context(
         self,
         quadrature: RuntimeQuadratureRule
-        | RuntimeQuadratureRules
+        | QuadratureRules
         | RuntimeQuadraturePayload
         | list[Any],
         basix_elements: list[RuntimeBasixElement] | None = None,
         form_context: "cffi.CData | None" = None,
         is_cut: npt.ArrayLike | None = None,
         scratch: "cffi.CData | None" = None,
+        quadrature_functions: QuadratureFunctionValueSet | None = None,
     ) -> "cffi.CData":
         """Build a ``runintgen_context*``."""
         ffi = self.ffi
         payload = as_runtime_quadrature_payload(quadrature, is_cut=is_cut)
+        if quadrature_functions is not None:
+            payload = RuntimeQuadraturePayload(
+                rules=payload.rules,
+                entities=payload.entities,
+                quadrature_functions=quadrature_functions,
+            )
         rules = payload.rules
         entities = payload.entities
         self._refs.append(payload)
@@ -570,6 +781,23 @@ class RuntimeContextBuilder:
             "const int32_t*", entities.rule_indices.ctypes.data
         )
 
+        c_q_functions = ffi.NULL
+        if payload.quadrature_functions is not None:
+            q_values = payload.quadrature_functions.functions
+            c_q_array = ffi.new(f"runintgen_quadrature_function[{len(q_values)}]")
+            self._refs.append(c_q_array)
+            for i, values in enumerate(q_values):
+                c_q_array[i].values = ffi.cast(
+                    "const double*", values.values.ctypes.data
+                )
+                c_q_array[i].value_size = values.value_size
+                c_q_array[i].num_points = values.num_points
+
+            c_q_functions = ffi.new("runintgen_quadrature_functions*")
+            self._refs.append(c_q_functions)
+            c_q_functions.num_functions = len(q_values)
+            c_q_functions.functions = c_q_array
+
         if form_context is None:
             form_context = self.build_form_context(
                 basix_elements=basix_elements,
@@ -580,6 +808,7 @@ class RuntimeContextBuilder:
         self._refs.append(ctx)
         ctx.quadrature = c_quadrature
         ctx.entities = c_entities
+        ctx.quadrature_functions = c_q_functions
         ctx.form = form_context
         return ctx
 

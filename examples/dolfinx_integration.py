@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - example fallback
     create_unit_square = None
 
 from runintgen.dolfinx import form as runtime_form
-from runintgen.runtime_data import RuntimeQuadratureRules
+from runintgen.runtime_data import QuadratureRules
 
 
 def _cell_jacobian_determinants(mesh) -> np.ndarray:
@@ -56,7 +56,7 @@ def _local_cells(mesh) -> np.ndarray:
 def _runtime_rules_for_cells(
     mesh,
     cells: np.ndarray | None = None,
-) -> RuntimeQuadratureRules:
+) -> QuadratureRules:
     """Create one runtime quadrature rule per selected cell."""
     if cells is None:
         cells = _local_cells(mesh)
@@ -64,7 +64,8 @@ def _runtime_rules_for_cells(
     points, weights = basix.make_quadrature(basix.CellType.triangle, 2)
     detJ = _cell_jacobian_determinants(mesh)[cells]
     nq = len(weights)
-    return RuntimeQuadratureRules(
+    return QuadratureRules(
+        kind="per_entity",
         tdim=2,
         points=np.ascontiguousarray(np.tile(points, (len(cells), 1))),
         weights=np.ascontiguousarray((detJ[:, None] * weights[None, :]).ravel()),

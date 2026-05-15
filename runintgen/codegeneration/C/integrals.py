@@ -19,6 +19,7 @@ from ffcx.options import get_options
 from ...analysis import RuntimeAnalysisInfo
 from ...form_metadata import FormRuntimeMetadata
 from ...measures import RuntimeIntegralMode
+from ...quadrature_function import collect_quadrature_function_infos
 from ...runtime_api import RuntimeKernelInfo
 from ..runtime_integrals import RuntimeIntegralGenerator
 from .integrals_template import (
@@ -252,13 +253,55 @@ def _table_preparation(element_requests: list[_ElementTableRequest]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _enabled_coefficients(integral_ir: Any, factory_name: str) -> tuple[str, str]:
+def _quadrature_function_preparation(
+    quadrature_function_slots: list[int],
+    q_infos: list[Any],
+) -> str:
+    """Generate in-kernel aliases for quadrature-function value arrays."""
+    if not quadrature_function_slots:
+        return ""
+
+    lines = [
+        "  const runintgen_quadrature_functions* q_functions = "
+        "data->quadrature_functions;",
+        "  if (q_functions == 0 || q_functions->functions == 0)",
+        "    return;",
+    ]
+    info_by_slot = {int(info.slot): info for info in q_infos}
+    for slot in quadrature_function_slots:
+        info = info_by_slot[int(slot)]
+        lines.extend(
+            [
+                f"  if (q_functions->num_functions <= {slot})",
+                "    return;",
+                f"  const runintgen_quadrature_function* "
+                f"q_function_{slot}_meta = &q_functions->functions[{slot}];",
+                f"  if (q_function_{slot}_meta->values == 0 "
+                f"|| q_function_{slot}_meta->value_size < {info.value_size} "
+                "|| q_function_"
+                f"{slot}_meta->num_points < q1)",
+                "    return;",
+                f"  const double* q_function_{slot} = "
+                f"q_function_{slot}_meta->values;",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def _enabled_coefficients(
+    integral_ir: Any,
+    factory_name: str,
+    q_infos: list[Any],
+) -> tuple[str, str]:
     """Return C code for FFCx enabled coefficient metadata."""
     if len(integral_ir.enabled_coefficients) == 0:
         return "", "NULL"
 
+    q_numbers = {int(info.coefficient_number) for info in q_infos}
     values = ", ".join(
-        "1" if item else "0" for item in integral_ir.enabled_coefficients
+        "1" if item and i not in q_numbers else "0"
+        for i, item in enumerate(integral_ir.enabled_coefficients)
     )
     size = len(integral_ir.enabled_coefficients)
     init = f"bool enabled_coefficients_{factory_name}[{size}] = {{{values}}};"
@@ -286,6 +329,7 @@ def _tabulate_tensor_functions(
     geom: str,
     local_index_expr: str,
     table_preparation: str,
+    quadrature_function_preparation: str,
     body: str,
     standard_body: str,
 ) -> str:
@@ -307,6 +351,7 @@ def _tabulate_tensor_functions(
             if "rt_points" in body
             else ""
         ),
+        "quadrature_function_preparation": quadrature_function_preparation,
         "table_preparation": table_preparation,
         "body": body,
     }
@@ -439,7 +484,8 @@ def generate_C_runtime_kernels(
         else {}
     )
     element_indices_by_hash = _form_element_indices_by_hash(form_metadata)
-    generator = RuntimeIntegralGenerator(ffcx_options)
+    q_infos = collect_quadrature_function_infos(ir)
+    generator = RuntimeIntegralGenerator(ffcx_options, q_infos)
 
     kernels: list[RuntimeKernelInfo] = []
     ir_type_counts: dict[str, int] = {}
@@ -465,12 +511,15 @@ def generate_C_runtime_kernels(
             func_name = _kernel_name(integral_ir, domain)
             kernel_id = ir_index * 1024 + domain_id
             enabled_coefficients_init, enabled_coefficients = _enabled_coefficients(
-                integral_ir, func_name
+                integral_ir, func_name, q_infos
             )
             tabulate_tensor = _tabulate_tensor_initializers(scalar_type, func_name)
             standard_integral_ir = standard_integrals.get(key, integral_ir)
             local_index_expr = _local_index_expr(integral_type)
             table_preparation = _table_preparation(element_requests)
+            q_preparation = _quadrature_function_preparation(
+                generated.quadrature_function_slots, q_infos
+            )
             standard_body = (
                 _standard_body(standard_integral_ir, domain, ffcx_options)
                 if mode is RuntimeIntegralMode.MIXED
@@ -491,6 +540,7 @@ def generate_C_runtime_kernels(
                     geom=geom_c,
                     local_index_expr=local_index_expr,
                     table_preparation=table_preparation,
+                    quadrature_function_preparation=q_preparation,
                     body=generated.body,
                     standard_body=standard_body,
                 ),
@@ -543,6 +593,7 @@ def generate_C_runtime_kernels(
                     tensor_shape=tuple(integral_ir.expression.tensor_shape),
                     table_info=table_info,
                     table_slots=table_slots,
+                    quadrature_function_slots=generated.quadrature_function_slots,
                     domain=domain.name,
                     kernel_id=kernel_id,
                     scalar_type=scalar_type,

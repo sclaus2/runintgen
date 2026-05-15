@@ -69,6 +69,7 @@ factory_runtime_tabulate_tensor = r"""
   const int rt_nq = rule->nq;
   const double* rt_weights = rule->weights;
 {runtime_points}
+{quadrature_function_preparation}
 {table_preparation}
 
 {body}

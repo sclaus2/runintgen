@@ -40,6 +40,12 @@ from .codegeneration.C.integrals import (
 )
 from .cpp_headers import runtime_abi_header_text
 from .form_metadata import FormRuntimeMetadata, build_form_runtime_metadata
+from .measures import is_runtime_integral
+from .quadrature_function import (
+    collect_quadrature_function_infos,
+    integral_quadrature_functions,
+    validate_quadrature_function_form,
+)
 from .runtime_api import RunintModule, RuntimeKernelInfo
 from .runtime_data import CFFI_DEF
 
@@ -254,6 +260,7 @@ def _compile_form_source(
     analysis = build_runtime_info(form, options, prefix=module_name)
     form_metadata = build_form_runtime_metadata(analysis)
     kernels = generate_C_combined_kernels(analysis, options, form_metadata)
+    quadrature_functions = collect_quadrature_function_infos(analysis.ir)
     combined_form_ir = _combined_form_ir(analysis, kernels)
     combined_form_ir = combined_form_ir._replace(
         name=form_name,
@@ -273,6 +280,7 @@ def _compile_form_source(
         meta=analysis.meta,
         form_metadata=form_metadata,
         quadrature_provider=quadrature_provider,
+        quadrature_functions=quadrature_functions,
     )
     form_info = JITFormInfo(
         ufl_form=form,
@@ -294,6 +302,25 @@ def _compile_form_source(
         "\n\n".join([implementations, form_impl]),
         form_info,
     )
+
+
+def _validate_quadrature_function_integrals(form: ufl.Form) -> None:
+    """Reject quadrature-function standard integrals until that path exists."""
+    for integral in form.integrals():
+        if is_runtime_integral(integral):
+            continue
+        functions = integral_quadrature_functions(integral)
+        if not functions:
+            continue
+        labels = []
+        for function in functions:
+            spec = getattr(function, "_runintgen_quadrature_function")
+            labels.append(spec.name or "<unnamed>")
+        raise NotImplementedError(
+            "QuadratureFunction in standard integrals is not implemented yet. "
+            "Use a runtime measure with QuadratureRules for now. Affected "
+            f"quadrature functions: {', '.join(labels)}."
+        )
 
 
 def _generate_code(
@@ -416,6 +443,10 @@ def compile_forms(
     """Compile UFL forms into runintgen/FFCx UFCx form objects."""
     if visualise:
         raise NotImplementedError("runintgen JIT visualisation is not implemented.")
+
+    for form in forms:
+        validate_quadrature_function_form(form)
+        _validate_quadrature_function_integrals(form)
 
     cffi_extra_compile_args = list(cffi_extra_compile_args or [])
     p = ffcx.options.get_options(options or {})

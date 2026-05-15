@@ -9,6 +9,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -23,8 +24,11 @@ namespace
 {
 using FloatArray = nb::ndarray<nb::numpy, const double, nb::c_contig>;
 using Array1D = nb::ndarray<nb::numpy, const double, nb::ndim<1>, nb::c_contig>;
+using Array2D = nb::ndarray<nb::numpy, const double, nb::ndim<2>, nb::c_contig>;
 using Int32Array
     = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>, nb::c_contig>;
+using Int32Array2D
+    = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>, nb::c_contig>;
 using Int64Array
     = nb::ndarray<nb::numpy, const std::int64_t, nb::ndim<1>, nb::c_contig>;
 using UInt8Array
@@ -163,6 +167,301 @@ basix::FiniteElement<double> create_element(const ElementSpec& spec)
   return element;
 }
 
+nb::object vector_to_numpy(std::vector<double> values,
+                           std::initializer_list<std::size_t> shape)
+{
+  auto* owner = new std::vector<double>(std::move(values));
+  nb::capsule capsule(owner, [](void* data) noexcept {
+    delete static_cast<std::vector<double>*>(data);
+  });
+  return nb::ndarray<nb::numpy, double>(owner->data(), shape, capsule).cast();
+}
+
+basix::FiniteElement<double>
+create_coordinate_element(int cell_type, int degree, int lagrange_variant)
+{
+  if (degree <= 0)
+    throw std::runtime_error("Coordinate element degree must be positive.");
+
+  return basix::create_element<double>(
+      basix::element::family::P, static_cast<basix::cell::type>(cell_type),
+      degree,
+      static_cast<basix::element::lagrange_variant>(lagrange_variant),
+      basix::element::dpc_variant::unset, false, {});
+}
+
+void validate_geometry_inputs(int tdim, int gdim, const FloatArray& points,
+                              const Array1D& weights,
+                              const Int32Array& parent_map,
+                              const Array2D& geometry_x,
+                              const Int32Array2D& geometry_dofmap)
+{
+  if (tdim <= 0)
+    throw std::runtime_error("tdim must be positive.");
+  if (gdim <= 0)
+    throw std::runtime_error("gdim must be positive.");
+  if (points.ndim() == 2)
+  {
+    if (points.shape(1) != static_cast<std::size_t>(tdim))
+      throw std::runtime_error("points second dimension must equal tdim.");
+    if (points.shape(0) != weights.shape(0)
+        && parent_map.shape(0) == 0)
+    {
+      throw std::runtime_error(
+          "points and weights disagree for empty parent_map.");
+    }
+  }
+  else if (points.ndim() == 1)
+  {
+    if (points.size() != static_cast<std::size_t>(weights.shape(0) * tdim))
+      throw std::runtime_error("flat points size disagrees with weights/tdim.");
+  }
+  else
+  {
+    throw std::runtime_error("points must be flat or two-dimensional.");
+  }
+  if (geometry_x.ndim() != 2 || geometry_x.shape(1) < static_cast<std::size_t>(gdim))
+    throw std::runtime_error("geometry_x shape disagrees with gdim.");
+  if (geometry_dofmap.ndim() != 2)
+    throw std::runtime_error("geometry_dofmap must be two-dimensional.");
+}
+
+std::pair<const double*, std::size_t>
+point_data_and_count(const FloatArray& points, int tdim)
+{
+  if (points.ndim() == 2)
+    return {points.data(), points.shape(0)};
+  return {points.data(), points.size() / static_cast<std::size_t>(tdim)};
+}
+
+double jacobian_measure(const std::vector<double>& j, int gdim, int tdim)
+{
+  if (tdim == 1)
+  {
+    double norm2 = 0.0;
+    for (int g = 0; g < gdim; ++g)
+      norm2 += j[g] * j[g];
+    return std::sqrt(norm2);
+  }
+  if (tdim == 2)
+  {
+    double g00 = 0.0;
+    double g01 = 0.0;
+    double g11 = 0.0;
+    for (int g = 0; g < gdim; ++g)
+    {
+      const double j0 = j[g * tdim];
+      const double j1 = j[g * tdim + 1];
+      g00 += j0 * j0;
+      g01 += j0 * j1;
+      g11 += j1 * j1;
+    }
+    return std::sqrt(std::max(0.0, g00 * g11 - g01 * g01));
+  }
+  if (tdim == 3)
+  {
+    double g00 = 0.0;
+    double g01 = 0.0;
+    double g02 = 0.0;
+    double g11 = 0.0;
+    double g12 = 0.0;
+    double g22 = 0.0;
+    for (int g = 0; g < gdim; ++g)
+    {
+      const double j0 = j[g * tdim];
+      const double j1 = j[g * tdim + 1];
+      const double j2 = j[g * tdim + 2];
+      g00 += j0 * j0;
+      g01 += j0 * j1;
+      g02 += j0 * j2;
+      g11 += j1 * j1;
+      g12 += j1 * j2;
+      g22 += j2 * j2;
+    }
+    const double det = g00 * (g11 * g22 - g12 * g12)
+                       - g01 * (g01 * g22 - g12 * g02)
+                       + g02 * (g01 * g12 - g11 * g02);
+    return std::sqrt(std::max(0.0, det));
+  }
+  throw std::runtime_error("Only tdim 1, 2, and 3 are supported.");
+}
+
+void map_entity_points(const std::vector<double>& basis,
+                       const std::array<std::size_t, 4>& shape,
+                       const double* weights, const std::int32_t* dofs,
+                       const double* geometry_x, std::size_t geometry_stride,
+                       int tdim, int gdim, std::size_t local_q0,
+                       std::size_t local_q1, std::size_t global_q0,
+                       std::vector<double>& physical_points,
+                       std::vector<double>* scaled_weights)
+{
+  const std::size_t nq = shape[1];
+  const std::size_t ndofs = shape[2];
+  const std::size_t value_size = shape[3];
+  if (value_size != 1)
+    throw std::runtime_error("Coordinate basis value_size must be one.");
+
+  std::vector<double> jacobian(
+      static_cast<std::size_t>(std::max(1, gdim * tdim)));
+  for (std::size_t q = local_q0; q < local_q1; ++q)
+  {
+    const std::size_t global_q = global_q0 + (q - local_q0);
+    for (int g = 0; g < gdim; ++g)
+    {
+      double value = 0.0;
+      for (std::size_t dof = 0; dof < ndofs; ++dof)
+      {
+        const double phi = basis[((0 * nq + q) * ndofs + dof) * value_size];
+        value += phi * geometry_x[static_cast<std::size_t>(dofs[dof])
+                                  * geometry_stride
+                                  + static_cast<std::size_t>(g)];
+      }
+      physical_points[static_cast<std::size_t>(g) * physical_points.size()
+                      / static_cast<std::size_t>(gdim)
+                      + global_q]
+          = value;
+    }
+
+    if (scaled_weights != nullptr)
+    {
+      std::fill(jacobian.begin(), jacobian.end(), 0.0);
+      for (int d = 0; d < tdim; ++d)
+      {
+        for (int g = 0; g < gdim; ++g)
+        {
+          double value = 0.0;
+          for (std::size_t dof = 0; dof < ndofs; ++dof)
+          {
+            const double dphi
+                = basis[(((1 + d) * nq + q) * ndofs + dof) * value_size];
+            value += dphi * geometry_x[static_cast<std::size_t>(dofs[dof])
+                                        * geometry_stride
+                                        + static_cast<std::size_t>(g)];
+          }
+          jacobian[static_cast<std::size_t>(g * tdim + d)] = value;
+        }
+      }
+      (*scaled_weights)[global_q] = weights[q] * jacobian_measure(jacobian, gdim, tdim);
+    }
+  }
+}
+
+nb::tuple map_per_entity_geometry(int cell_type, int degree, int lagrange_variant,
+                                  int tdim, int gdim,
+                                  const FloatArray& points,
+                                  const Array1D& weights,
+                                  const Int64Array& offsets,
+                                  const Int32Array& parent_map,
+                                  const Array2D& geometry_x,
+                                  const Int32Array2D& geometry_dofmap,
+                                  bool scale_weights)
+{
+  validate_geometry_inputs(tdim, gdim, points, weights, parent_map, geometry_x,
+                           geometry_dofmap);
+  if (offsets.shape(0) != parent_map.shape(0) + 1)
+    throw std::runtime_error("offsets must have one more entry than parent_map.");
+  if (offsets.shape(0) == 0 || offsets.data()[0] != 0)
+    throw std::runtime_error("offsets must start at zero.");
+  for (std::size_t i = 1; i < offsets.shape(0); ++i)
+  {
+    if (offsets.data()[i] < offsets.data()[i - 1])
+      throw std::runtime_error("offsets must be nondecreasing.");
+  }
+  if (offsets.data()[offsets.shape(0) - 1] != weights.shape(0))
+    throw std::runtime_error("offsets[-1] must equal weights.size.");
+
+  const auto [point_data, total_points] = point_data_and_count(points, tdim);
+  if (total_points != weights.shape(0))
+    throw std::runtime_error("points and weights disagree on total nq.");
+  auto element = create_coordinate_element(cell_type, degree, lagrange_variant);
+  const int nd = scale_weights ? 1 : 0;
+  auto [basis, shape] = element.tabulate(
+      nd, std::span<const double>(point_data, total_points * tdim),
+      {total_points, static_cast<std::size_t>(tdim)});
+  if (shape[2] != geometry_dofmap.shape(1))
+    throw std::runtime_error(
+        "Coordinate element dimension disagrees with geometry_dofmap.");
+
+  std::vector<double> physical_points(
+      static_cast<std::size_t>(gdim) * total_points);
+  std::vector<double> scaled_weights(scale_weights ? total_points : 0);
+  std::vector<double>* scaled_ptr = scale_weights ? &scaled_weights : nullptr;
+  const double* raw_weights = weights.data();
+
+  for (std::size_t rule = 0; rule < parent_map.shape(0); ++rule)
+  {
+    const std::int32_t cell = parent_map.data()[rule];
+    if (cell < 0 || static_cast<std::size_t>(cell) >= geometry_dofmap.shape(0))
+      throw std::runtime_error("parent_map contains invalid local cells.");
+    const std::int64_t q0 = offsets.data()[rule];
+    const std::int64_t q1 = offsets.data()[rule + 1];
+    map_entity_points(basis, shape, raw_weights, &geometry_dofmap(cell, 0),
+                      geometry_x.data(), geometry_x.shape(1), tdim, gdim,
+                      static_cast<std::size_t>(q0), static_cast<std::size_t>(q1),
+                      static_cast<std::size_t>(q0), physical_points, scaled_ptr);
+  }
+
+  nb::object py_points = vector_to_numpy(
+      std::move(physical_points), {static_cast<std::size_t>(gdim), total_points});
+  nb::object py_weights = nb::none();
+  if (scale_weights)
+  {
+    py_weights
+        = vector_to_numpy(std::move(scaled_weights), {total_points});
+  }
+  return nb::make_tuple(py_points, py_weights);
+}
+
+nb::tuple map_shared_geometry(int cell_type, int degree, int lagrange_variant,
+                              int tdim, int gdim, const FloatArray& points,
+                              const Array1D& weights,
+                              const Int32Array& parent_map,
+                              const Array2D& geometry_x,
+                              const Int32Array2D& geometry_dofmap,
+                              bool scale_weights)
+{
+  validate_geometry_inputs(tdim, gdim, points, weights, parent_map, geometry_x,
+                           geometry_dofmap);
+  const auto [point_data, nq] = point_data_and_count(points, tdim);
+  if (nq != weights.shape(0))
+    throw std::runtime_error("shared points and weights disagree on nq.");
+
+  auto element = create_coordinate_element(cell_type, degree, lagrange_variant);
+  const int nd = scale_weights ? 1 : 0;
+  auto [basis, shape] = element.tabulate(
+      nd, std::span<const double>(point_data, nq * tdim),
+      {nq, static_cast<std::size_t>(tdim)});
+  if (shape[2] != geometry_dofmap.shape(1))
+    throw std::runtime_error(
+        "Coordinate element dimension disagrees with geometry_dofmap.");
+
+  const std::size_t total_points = nq * parent_map.shape(0);
+  std::vector<double> physical_points(
+      static_cast<std::size_t>(gdim) * total_points);
+  std::vector<double> scaled_weights(scale_weights ? total_points : 0);
+  std::vector<double>* scaled_ptr = scale_weights ? &scaled_weights : nullptr;
+
+  for (std::size_t entity = 0; entity < parent_map.shape(0); ++entity)
+  {
+    const std::int32_t cell = parent_map.data()[entity];
+    if (cell < 0 || static_cast<std::size_t>(cell) >= geometry_dofmap.shape(0))
+      throw std::runtime_error("parent_map contains invalid local cells.");
+    map_entity_points(basis, shape, weights.data(), &geometry_dofmap(cell, 0),
+                      geometry_x.data(), geometry_x.shape(1), tdim, gdim, 0, nq,
+                      entity * nq, physical_points, scaled_ptr);
+  }
+
+  nb::object py_points = vector_to_numpy(
+      std::move(physical_points), {static_cast<std::size_t>(gdim), total_points});
+  nb::object py_weights = nb::none();
+  if (scale_weights)
+  {
+    py_weights
+        = vector_to_numpy(std::move(scaled_weights), {total_points});
+  }
+  return nb::make_tuple(py_points, py_weights);
+}
+
 int basix_runtime_tabulate(const runintgen_basix_element* element,
                            const runintgen_quadrature_rule* rule,
                            const runintgen_table_request* request,
@@ -192,6 +491,7 @@ public:
   {
     initialise_elements(element_specs);
     initialise_rules(quadrature);
+    initialise_quadrature_functions();
 
     _form.num_elements = static_cast<int>(_abi_elements.size());
     _form.elements = _abi_elements.empty() ? nullptr : _abi_elements.data();
@@ -200,6 +500,10 @@ public:
 
     _context.quadrature = &_abi_quadrature;
     _context.entities = &_abi_entities;
+    _context.quadrature_functions
+        = _abi_quadrature_functions.num_functions == 0
+              ? nullptr
+              : &_abi_quadrature_functions;
     _context.form = &_form;
   }
 
@@ -326,9 +630,73 @@ private:
     _abi_entities.rule_indices = rule_indices.data();
   }
 
+  void initialise_quadrature_functions()
+  {
+    _abi_quadrature_functions.num_functions = 0;
+    _abi_quadrature_functions.functions = nullptr;
+
+    if (!object_has_non_none(_quadrature_owner, "quadrature_functions"))
+      return;
+
+    nb::object q_owner = nb::getattr(_quadrature_owner, "quadrature_functions");
+    if (q_owner.is_none())
+      return;
+
+    nb::list functions = nb::cast<nb::list>(nb::getattr(q_owner, "functions"));
+    const std::size_t n = nb::len(functions);
+    _abi_quadrature_function_values.clear();
+    _abi_quadrature_function_values.reserve(n);
+    _abi_quadrature_functions_storage.resize(n);
+
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      nb::handle item = functions[i];
+      FloatArray values = object_cast<FloatArray>(item, "values");
+      const int value_size = object_cast<int>(item, "value_size");
+      if (value_size <= 0)
+        throw std::runtime_error(
+            "QuadratureFunction value_size must be positive.");
+      if (values.ndim() == 1)
+      {
+        if (value_size != 1)
+          throw std::runtime_error(
+              "Vector/tensor QuadratureFunction values must be 2D.");
+      }
+      else if (values.ndim() == 2)
+      {
+        if (values.shape(1) != static_cast<std::size_t>(value_size))
+          throw std::runtime_error(
+              "QuadratureFunction values shape disagrees with value_size.");
+      }
+      else
+      {
+        throw std::runtime_error(
+            "QuadratureFunction values must be one- or two-dimensional.");
+      }
+
+      _abi_quadrature_function_values.push_back(values);
+      _abi_quadrature_functions_storage[i].values = values.data();
+      _abi_quadrature_functions_storage[i].value_size = value_size;
+      _abi_quadrature_functions_storage[i].num_points
+          = static_cast<int>(values.shape(0));
+    }
+
+    _quadrature_functions_owner = std::move(q_owner);
+    _abi_quadrature_functions.num_functions = static_cast<int>(n);
+    _abi_quadrature_functions.functions
+        = _abi_quadrature_functions_storage.empty()
+              ? nullptr
+              : _abi_quadrature_functions_storage.data();
+  }
+
   std::vector<BasixElementHandle> _handles;
   std::vector<runintgen_basix_element> _abi_elements;
   nb::object _quadrature_owner;
+  nb::object _quadrature_functions_owner;
+  std::vector<FloatArray> _abi_quadrature_function_values;
+  std::vector<runintgen_quadrature_function>
+      _abi_quadrature_functions_storage;
+  runintgen_quadrature_functions _abi_quadrature_functions{};
   runintgen_quadrature_rules _abi_quadrature{};
   runintgen_entity_map _abi_entities{};
   runintgen_form_context _form{};
@@ -346,4 +714,14 @@ NB_MODULE(_basix_runtime, m)
       .def_prop_ro("num_rules", &CustomData::num_rules)
       .def_prop_ro("num_entities", &CustomData::num_entities)
       .def("__int__", &CustomData::ptr);
+  m.def("map_per_entity_geometry", &map_per_entity_geometry, nb::arg("cell_type"),
+        nb::arg("degree"), nb::arg("lagrange_variant"), nb::arg("tdim"),
+        nb::arg("gdim"), nb::arg("points"), nb::arg("weights"),
+        nb::arg("offsets"), nb::arg("parent_map"), nb::arg("geometry_x"),
+        nb::arg("geometry_dofmap"), nb::arg("scale_weights") = false);
+  m.def("map_shared_geometry", &map_shared_geometry, nb::arg("cell_type"),
+        nb::arg("degree"), nb::arg("lagrange_variant"), nb::arg("tdim"),
+        nb::arg("gdim"), nb::arg("points"), nb::arg("weights"),
+        nb::arg("parent_map"), nb::arg("geometry_x"),
+        nb::arg("geometry_dofmap"), nb::arg("scale_weights") = false);
 }

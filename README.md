@@ -272,10 +272,12 @@ For DOLFINx users, the preferred entry point is `runintgen.dolfinx.form`.
 It mirrors `dolfinx.fem.form` and returns a normal DOLFINx `Form`:
 
 ```python
+from runintgen import QuadratureRules
 from runintgen.dolfinx import form as runintgen_form
 
 num_cells = mesh.topology.index_map(mesh.topology.dim).size_local
-runtime_rules = RuntimeQuadratureRules(
+runtime_rules = QuadratureRules(
+    kind="per_entity",
     tdim=2,
     points=points,
     weights=weights,

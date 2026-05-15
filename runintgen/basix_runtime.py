@@ -12,7 +12,11 @@ from __future__ import annotations
 from typing import Any
 
 from .form_metadata import FormRuntimeMetadata, export_metadata_for_cpp
-from .runtime_data import RuntimeQuadraturePayload, as_runtime_quadrature_payload
+from .runtime_data import (
+    RuntimeQuadraturePayload,
+    as_runtime_quadrature_payload,
+    build_quadrature_function_value_set,
+)
 
 
 def _load_extension() -> Any:
@@ -48,6 +52,11 @@ def element_specs_from_metadata(metadata_or_module: Any) -> list[dict[str, Any]]
     return [dict(item["element_spec"]) for item in exported["unique_elements"]]
 
 
+def _quadrature_function_infos(metadata_or_module: Any) -> list[Any]:
+    """Return generated quadrature-function infos from a module-like object."""
+    return list(getattr(metadata_or_module, "quadrature_functions", []) or [])
+
+
 class CustomData:
     """Basix-only owner for generated-kernel ``custom_data``.
 
@@ -61,23 +70,38 @@ class CustomData:
         quadrature: Any,
         *,
         is_cut: Any | None = None,
+        quadrature_function_evaluator: Any | None = None,
     ) -> None:
         """Build a Basix-backed runtime context.
 
         Args:
             metadata_or_module: ``FormRuntimeMetadata`` or a ``RunintModule``.
-            quadrature: A ``RuntimeQuadratureRules`` flat-buffer object, one
+            quadrature: A ``QuadratureRules`` flat-buffer object, one
                 ``RuntimeQuadratureRule``-like object, a list of such rules, or
                 mixed form subdomain data such as
-                ``[standard_entities, runtime_rules]``. Weights must already
-                include measure scaling. Flat runtime rules are borrowed.
+                ``[standard_entities, per_entity_rules]``. Weights must already
+                include measure scaling. Flat per-entity rules are borrowed.
             is_cut: Optional legacy branch flags, one per packed rule.
+            quadrature_function_evaluator: Optional backend callback used when
+                a quadrature function has neither explicit values nor a
+                callable source. The core runtime never imports backend modules.
         """
         extension = _load_extension()
         self._element_specs = element_specs_from_metadata(metadata_or_module)
         self._payload: RuntimeQuadraturePayload = as_runtime_quadrature_payload(
             quadrature, is_cut=is_cut
         )
+        q_values = build_quadrature_function_value_set(
+            _quadrature_function_infos(metadata_or_module),
+            self._payload.rules,
+            fallback_evaluator=quadrature_function_evaluator,
+        )
+        if q_values is not None:
+            self._payload = RuntimeQuadraturePayload(
+                rules=self._payload.rules,
+                entities=self._payload.entities,
+                quadrature_functions=q_values,
+            )
         self._owner = extension.CustomData(
             self._element_specs,
             self._payload,
@@ -113,9 +137,15 @@ def create_custom_data(
     quadrature: Any,
     *,
     is_cut: Any | None = None,
+    quadrature_function_evaluator: Any | None = None,
 ) -> CustomData:
     """Build a :class:`CustomData` owner."""
-    return CustomData(metadata_or_module, quadrature=quadrature, is_cut=is_cut)
+    return CustomData(
+        metadata_or_module,
+        quadrature=quadrature,
+        is_cut=is_cut,
+        quadrature_function_evaluator=quadrature_function_evaluator,
+    )
 
 
 __all__ = [

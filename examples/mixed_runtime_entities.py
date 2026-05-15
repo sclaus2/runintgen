@@ -2,7 +2,7 @@
 
 This demonstrates the intended separation:
 
-- ``RuntimeQuadratureRules`` stores only runtime quadrature for cut entities.
+- ``QuadratureRules`` stores only runtime quadrature for cut entities.
 - The UFL measure carries the mix as ``subdomain_data``.
 - runintgen derives the full loop entity map with ``is_cut`` flags.
 """
@@ -21,7 +21,7 @@ from basix.ufl import element
 
 from runintgen import (
     CFFI_DEF,
-    RuntimeQuadratureRules,
+    QuadratureRules,
     compile_runtime_integrals,
     get_runintgen_data_struct,
 )
@@ -119,7 +119,7 @@ def main() -> None:
     # These entities should use the standard FFCx integral branch.
     standard_entities = np.array([1, 4, 5, 6], dtype=np.int32)
 
-    # These entities have runtime quadrature. The i-th parent_map entry
+    # These entities have per-entity quadrature. The i-th parent_map entry
     # corresponds to the i-th rule slice in offsets.
     parent_map = np.array([8, 10, 11], dtype=np.int32)
     points = np.array(
@@ -134,7 +134,8 @@ def main() -> None:
     )
     weights = np.array([0.5, 0.2, 0.2, 0.2, 0.15], dtype=np.float64)
     offsets = np.array([0, 1, 3, 5], dtype=np.int64)
-    runtime_rules = RuntimeQuadratureRules(
+    runtime_rules = QuadratureRules(
+        kind="per_entity",
         tdim=2,
         points=points,
         weights=weights,
@@ -142,8 +143,8 @@ def main() -> None:
         parent_map=parent_map,
     )
 
-    # This is the form-level mix: the rule object is runtime-only, while the
-    # measure payload carries both standard entities and runtime rules.
+    # This is the form-level mix: the rule object is per-entity, while the
+    # measure payload carries both standard entities and per-entity rules.
     dx_mixed = ufl.Measure(
         "dx",
         domain=mesh,

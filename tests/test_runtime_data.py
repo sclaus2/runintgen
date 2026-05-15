@@ -8,8 +8,8 @@ import pytest
 
 from runintgen.runtime_data import (
     CFFI_DEF,
+    QuadratureRules,
     RuntimeContextBuilder,
-    RuntimeQuadratureRules,
     as_runtime_quadrature_payload,
 )
 
@@ -19,14 +19,14 @@ def _ptr(ffi: cffi.FFI, value) -> int:
     return int(ffi.cast("intptr_t", value))
 
 
-def test_runtime_quadrature_rules_borrows_flat_arrays() -> None:
-    """RuntimeQuadratureRules should not copy flat quadrature storage."""
+def test_quadrature_rules_borrows_flat_arrays() -> None:
+    """QuadratureRules should not copy flat quadrature storage."""
     points = np.arange(10, dtype=np.float64)
     weights = np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float64)
     offsets = np.array([0, 2, 3, 5], dtype=np.int64)
     parent_map = np.array([8, 10, 11], dtype=np.int32)
 
-    rules = RuntimeQuadratureRules(
+    rules = QuadratureRules(
         tdim=2,
         points=points,
         weights=weights,
@@ -47,7 +47,7 @@ def test_runtime_payload_collects_mixed_form_entities() -> None:
     offsets = np.array([0, 2, 3, 5], dtype=np.int64)
     parent_map = np.array([8, 10, 11], dtype=np.int32)
     standard_entities = np.array([1, 4, 5, 6], dtype=np.int32)
-    rules = RuntimeQuadratureRules(
+    rules = QuadratureRules(
         tdim=2,
         points=points,
         weights=weights,
@@ -64,13 +64,13 @@ def test_runtime_payload_collects_mixed_form_entities() -> None:
     np.testing.assert_array_equal(payload.rule_indices, [-1, -1, -1, -1, 0, 1, 2])
 
 
-def test_runtime_quadrature_rules_rejects_implicit_quadrature_copy() -> None:
+def test_quadrature_rules_rejects_implicit_quadrature_copy() -> None:
     """The zero-copy constructor should reject list-backed storage."""
     weights = np.array([0.5], dtype=np.float64)
     offsets = np.array([0, 1], dtype=np.int64)
 
     with pytest.raises(TypeError, match="points must be a NumPy ndarray"):
-        RuntimeQuadratureRules(
+        QuadratureRules(
             tdim=2,
             points=[[1.0 / 3.0, 1.0 / 3.0]],
             weights=weights,
@@ -85,7 +85,7 @@ def test_runtime_context_builder_borrows_quadrature_pointers() -> None:
     offsets = np.array([0, 2], dtype=np.int64)
     parent_map = np.array([8], dtype=np.int32)
     standard_entities = np.array([1, 4], dtype=np.int32)
-    rules = RuntimeQuadratureRules(
+    rules = QuadratureRules(
         tdim=2,
         points=points,
         weights=weights,

@@ -26,6 +26,11 @@ from ffcx.ir.elementtables import (
 from ffcx.ir.representation import IntegralIR
 from ffcx.ir.representationutils import QuadratureRule
 
+from ..quadrature_function import (
+    QuadratureFunctionInfo,
+    is_quadrature_function,
+)
+
 
 @dataclass(frozen=True)
 class RuntimeTableReferenceInfo:
@@ -175,6 +180,14 @@ def _force_runtime_tables_varying(integral_ir: IntegralIR) -> None:
         seen: set[int] = set()
         for node_id, node_data in factorization.nodes.items():
             tabledata = node_data.get("tr")
+            mt = node_data.get("mt")
+            if mt is not None and is_quadrature_function(
+                getattr(mt, "terminal", None)
+            ):
+                if node_data.get("status") != "inactive":
+                    pending.append(node_id)
+                    seen.add(node_id)
+                continue
             if tabledata is None:
                 continue
             if not _uses_runtime_table(tabledata, integral_type):
@@ -218,10 +231,54 @@ class RuntimeBackendAccess(FFCXBackendAccess):
         symbols: RuntimeBackendSymbols,
         options: dict[str, Any],
         table_registry: RuntimeTableRegistry,
+        quadrature_functions: dict[Any, QuadratureFunctionInfo],
     ) -> None:
         """Initialise runtime access hooks."""
         super().__init__(entity_type, integral_type, symbols, options)
         self.table_registry = table_registry
+        self.quadrature_functions = quadrature_functions
+
+    def coefficient(
+        self,
+        mt: Any,
+        tabledata: UniqueTableReferenceT,
+        quadrature_rule: QuadratureRule,
+    ) -> L.LExpr:
+        """Access a coefficient, redirecting QuadratureFunction terminals."""
+        if is_quadrature_function(mt.terminal):
+            info = self.quadrature_functions[mt.terminal]
+            mte = get_modified_terminal_element(mt)
+            if mte is None:
+                raise RuntimeError("Could not analyse QuadratureFunction terminal.")
+            _, averaged, local_derivatives, flat_component = mte
+            if averaged:
+                raise NotImplementedError(
+                    "Averaged QuadratureFunction access is not supported."
+                )
+            if any(int(i) != 0 for i in local_derivatives):
+                raise NotImplementedError(
+                    "Derivatives of QuadratureFunction are not supported. "
+                    "Precompute the derivative into another QuadratureFunction."
+                )
+
+            component = int(flat_component or 0)
+            if component >= info.value_size:
+                raise ValueError(
+                    f"QuadratureFunction component {component} is outside "
+                    f"value_size {info.value_size}."
+                )
+
+            iq = L.Symbol(
+                self.symbols.quadrature_loop_index.name, dtype=L.DataType.INT
+            )
+            q0 = L.Symbol("q0", dtype=L.DataType.INT)
+            values = L.Symbol(f"q_function_{info.slot}", dtype=L.DataType.REAL)
+            return values[
+                (q0 + iq) * L.LiteralInt(info.value_size)
+                + L.LiteralInt(component)
+            ]
+
+        return super().coefficient(mt, tabledata, quadrature_rule)
 
     def table_access(
         self,
@@ -266,6 +323,22 @@ class RuntimeBackendAccess(FFCXBackendAccess):
         return table_symbol[flat_index], [table_symbol]
 
 
+class RuntimeBackendDefinitions(FFCXBackendDefinitions):
+    """FFCx definitions with QuadratureFunction interpolation disabled."""
+
+    def coefficient(
+        self,
+        mt: Any,
+        tabledata: UniqueTableReferenceT,
+        quadrature_rule: QuadratureRule,
+        access: L.Symbol,
+    ) -> L.Section | list:
+        """Return definition code for coefficients."""
+        if is_quadrature_function(mt.terminal):
+            return L.Section("QuadratureFunction", [], [], [], [])
+        return super().coefficient(mt, tabledata, quadrature_rule, access)
+
+
 class RuntimeFFCXBackend:
     """FFCx backend assembled from runtime-aware pieces."""
 
@@ -274,6 +347,7 @@ class RuntimeFFCXBackend:
         ir: IntegralIR,
         options: dict[str, Any],
         table_registry: RuntimeTableRegistry,
+        quadrature_functions: dict[Any, QuadratureFunctionInfo],
     ) -> None:
         """Initialise runtime backend."""
         coefficient_numbering = ir.expression.coefficient_numbering
@@ -289,8 +363,9 @@ class RuntimeFFCXBackend:
             self.symbols,
             options,
             table_registry,
+            quadrature_functions,
         )
-        self.definitions = FFCXBackendDefinitions(
+        self.definitions = RuntimeBackendDefinitions(
             ir.expression.entity_type, ir.expression.integral_type, self.access, options
         )
 
@@ -388,14 +463,23 @@ class RuntimeGeneratedKernel:
 
     body: str
     runtime_tables: list[RuntimeTableReferenceInfo]
+    quadrature_function_slots: list[int]
 
 
 class RuntimeIntegralGenerator:
     """Generate runtime C code bodies from FFCx integral IR."""
 
-    def __init__(self, options: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        options: dict[str, Any],
+        quadrature_functions: list[QuadratureFunctionInfo] | None = None,
+    ) -> None:
         """Initialise with FFCx options."""
         self.options = options
+        self.quadrature_functions = quadrature_functions or []
+        self._q_by_terminal = {
+            info.terminal: info for info in self.quadrature_functions
+        }
 
     def _table_metadata(self, integral_ir: IntegralIR) -> dict[str, dict[str, Any]]:
         """Extract FFCx table metadata needed by the runtime wrapper."""
@@ -463,12 +547,21 @@ class RuntimeIntegralGenerator:
         """Generate a runtime kernel body for one FFCx integral/domain pair."""
         _force_runtime_tables_varying(integral_ir)
         table_registry = RuntimeTableRegistry(self._table_metadata(integral_ir))
-        backend = RuntimeFFCXBackend(integral_ir, self.options, table_registry)
+        backend = RuntimeFFCXBackend(
+            integral_ir, self.options, table_registry, self._q_by_terminal
+        )
         generator = RuntimeFFCXIntegralGenerator(integral_ir, backend)
         parts = generator.generate(domain)
         body = Formatter(self.options["scalar_type"])(parts)
 
+        used_slots = []
+        for terminal in integral_ir.expression.coefficient_numbering:
+            info = self._q_by_terminal.get(terminal)
+            if info is not None:
+                used_slots.append(info.slot)
+
         return RuntimeGeneratedKernel(
             body=body,
             runtime_tables=table_registry.references,
+            quadrature_function_slots=sorted(set(used_slots)),
         )

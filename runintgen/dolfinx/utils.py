@@ -11,7 +11,9 @@ import importlib.util
 import re
 import tempfile
 from dataclasses import dataclass, field
+from math import prod
 from pathlib import Path
+from types import MethodType
 from typing import TYPE_CHECKING, Any, Sequence
 
 import cffi
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
 
     from runintgen.form_metadata import FormRuntimeMetadata
     from runintgen.jit import JITFormInfo
+    from runintgen.runtime_data import QuadratureRules
 
 fem: Any | None = None
 IntegralType: Any | None = None
@@ -58,6 +61,103 @@ def _require_dolfinx() -> tuple[Any, Any]:
             _DOLFINX_IMPORT_ERROR
         )
     raise ImportError("DOLFINx could not be loaded") from _DOLFINX_IMPORT_ERROR
+
+
+def _quadrature_function_set_values(
+    self: Any,
+    quadrature: Any,
+    values: npt.ArrayLike,
+) -> None:
+    """Attach explicit provider-owned values to a DOLFINx quadrature function."""
+    rule_id = getattr(quadrature, "rule_id", None)
+    if rule_id is None:
+        raise TypeError("quadrature must carry a stable rule_id.")
+    self._runintgen_values[str(rule_id)] = values
+
+
+def _quadrature_function_is_cellwise_constant(self: Any) -> bool:
+    """Return false so UFL does not erase quadrature-function derivatives."""
+    return False
+
+
+def _is_function_space(value: Any) -> bool:
+    """Return whether ``value`` behaves like a DOLFINx/UFL function space."""
+    return (
+        hasattr(value, "ufl_domain")
+        and hasattr(value, "ufl_element")
+        and hasattr(value, "mesh")
+    )
+
+
+def _as_dolfinx_mesh(value: Any) -> Any:
+    """Return a concrete DOLFINx mesh from a mesh-like object."""
+    if isinstance(value, ufl.Mesh):
+        mesh = value.ufl_cargo()
+        if mesh is None:
+            raise ValueError(
+                "runintgen.dolfinx.QuadratureFunction requires a concrete "
+                "DOLFINx mesh, not a cargo-free UFL mesh."
+            )
+        return mesh
+    return value
+
+
+def QuadratureFunction(
+    space_or_mesh: Any,
+    source: Any | None = None,
+    *,
+    name: str | None = None,
+    space: Any | None = None,
+    shape: tuple[int, ...] = (),
+    dtype: npt.DTypeLike | None = None,
+) -> Any:
+    """Create a DOLFINx Function with runintgen quadrature semantics.
+
+    The returned object is a normal ``dolfinx.fem.Function`` and can therefore
+    be used naturally in UFL forms. runintgen attaches quadrature-function
+    metadata and a ``set_values(rules, values)`` method to that function. If no
+    explicit values or callable source are supplied, the DOLFINx adapter
+    evaluates the background Function at quadrature physical points before
+    assembly.
+    """
+    dolfinx_fem, _ = _require_dolfinx()
+    from runintgen.quadrature_function import QuadratureFunctionSpec
+
+    if space is not None:
+        function_space = space
+    elif _is_function_space(space_or_mesh):
+        function_space = space_or_mesh
+    else:
+        mesh = _as_dolfinx_mesh(space_or_mesh)
+        element = ("DG", 0, shape) if shape else ("DG", 0)
+        function_space = dolfinx_fem.functionspace(mesh, element)
+
+    function = dolfinx_fem.Function(
+        function_space,
+        name=name,
+        dtype=dtype,
+    )
+
+    value_shape = tuple(shape or function.ufl_shape)
+    if shape and value_shape != tuple(function.ufl_shape):
+        raise ValueError(
+            "The supplied shape does not match the DOLFINx FunctionSpace "
+            f"shape {tuple(function.ufl_shape)}."
+        )
+    value_size = int(prod(value_shape)) if value_shape else 1
+    function._runintgen_quadrature_function = QuadratureFunctionSpec(
+        name=name,
+        value_shape=value_shape,
+        value_size=value_size,
+    )
+    function._runintgen_source = source
+    function._runintgen_values = {}
+    function.set_values = MethodType(_quadrature_function_set_values, function)
+    function.is_cellwise_constant = MethodType(
+        _quadrature_function_is_cellwise_constant,
+        function,
+    )
+    return function
 
 
 @dataclass
@@ -235,6 +335,30 @@ def _has_runtime_integrals(form: Any) -> bool:
     return False
 
 
+def _reject_standard_quadrature_functions(form_object: ufl.Form) -> None:
+    """Reject standard-integral quadrature functions until supported."""
+    from runintgen.measures import is_runtime_integral
+    from runintgen.quadrature_function import integral_quadrature_functions
+
+    for integral in form_object.integrals():
+        if is_runtime_integral(integral):
+            continue
+        functions = integral_quadrature_functions(integral)
+        if not functions:
+            continue
+        labels = []
+        for function in functions:
+            spec = getattr(function, "_runintgen_quadrature_function")
+            labels.append(spec.name or "<unnamed>")
+        raise NotImplementedError(
+            "QuadratureFunction in standard DOLFINx integrals is not "
+            "implemented yet. Use a runtime measure with QuadratureRules, or "
+            "provide the quantity as an ordinary DOLFINx Function if standard "
+            "coefficient interpolation is intended. Affected quadrature "
+            f"functions: {', '.join(labels)}."
+        )
+
+
 def _as_cpp_object(obj: Any) -> Any:
     """Return the wrapped C++ object when ``obj`` is a Python DOLFINx wrapper."""
     return getattr(obj, "_cpp_object", obj)
@@ -320,6 +444,318 @@ def _default_cell_entities(mesh: Any) -> npt.NDArray[np.int32]:
     return np.arange(num_cells, dtype=np.int32)
 
 
+def _points_as_2d(
+    points: npt.NDArray[np.float64],
+    tdim: int,
+) -> npt.NDArray[np.float64]:
+    """Return reference points with shape ``(num_points, tdim)``."""
+    if points.ndim == 2:
+        return points
+    return points.reshape((-1, tdim))
+
+
+def _as_contiguous_array(value: Any, dtype: npt.DTypeLike) -> np.ndarray:
+    """Return a C-contiguous array, copying only when the provider requires it."""
+    array = np.asarray(value, dtype=dtype)
+    if array.flags.c_contiguous:
+        return array
+    return np.ascontiguousarray(array)
+
+
+def _basix_cell_type_id(mesh: Any) -> int | None:
+    """Return the Basix cell type id for a DOLFINx mesh if available."""
+    if not hasattr(mesh, "basix_cell"):
+        return None
+    return int(mesh.basix_cell())
+
+
+def _compiled_physical_points(mesh: Any, rules: "QuadratureRules", gdim: int) -> Any:
+    """Use the DOLFINx-free C++ geometry helper when possible."""
+    cell_type = _basix_cell_type_id(mesh)
+    if cell_type is None:
+        return None
+
+    try:
+        from runintgen import _basix_runtime
+    except ImportError:
+        return None
+
+    geometry = mesh.geometry
+    cmap = geometry.cmap()
+    geometry_x = _as_contiguous_array(geometry.x, np.float64)
+    geometry_dofmap = _as_contiguous_array(geometry.dofmap, np.int32)
+    degree = int(cmap.degree)
+    variant = int(cmap.variant)
+
+    if rules.kind == "per_entity":
+        if rules.offsets is None:
+            raise ValueError("per-entity QuadratureRules require offsets.")
+        physical_points, _ = _basix_runtime.map_per_entity_geometry(
+            cell_type,
+            degree,
+            variant,
+            rules.tdim,
+            gdim,
+            rules.points,
+            rules.weights,
+            rules.offsets,
+            rules.parent_map,
+            geometry_x,
+            geometry_dofmap,
+            False,
+        )
+    elif rules.kind == "shared":
+        physical_points, _ = _basix_runtime.map_shared_geometry(
+            cell_type,
+            degree,
+            variant,
+            rules.tdim,
+            gdim,
+            rules.points,
+            rules.weights,
+            rules.parent_map,
+            geometry_x,
+            geometry_dofmap,
+            False,
+        )
+    else:  # pragma: no cover - QuadratureRules validates this.
+        raise ValueError(f"Unsupported QuadratureRules kind {rules.kind!r}.")
+    return np.asarray(physical_points, dtype=np.float64)
+
+
+def compute_physical_points(
+    mesh: Any,
+    rules: "QuadratureRules",
+) -> "QuadratureRules":
+    """Return rules with physical quadrature points attached.
+
+    The input ``rules`` object is not mutated. Its reference points, weights,
+    offsets, parent map, and rule id are reused in the returned
+    ``QuadratureRules`` object; only the component-first physical point array is
+    newly allocated.
+
+    Args:
+        mesh: DOLFINx mesh whose geometry map should be used.
+        rules: ``QuadratureRules`` with ``parent_map`` identifying local cells.
+
+    Returns:
+        A ``QuadratureRules`` object with ``physical_points`` of shape
+        ``(gdim, total_nq)``.
+    """
+    from runintgen.runtime_data import QuadratureRules
+
+    if not isinstance(rules, QuadratureRules):
+        raise TypeError("rules must be a runintgen.QuadratureRules object.")
+    if rules.parent_map is None:
+        raise ValueError(
+            "compute_physical_points requires QuadratureRules.parent_map."
+        )
+
+    geometry = mesh.geometry
+    dofmap = geometry.dofmap
+    x = geometry.x
+    gdim = int(getattr(geometry, "dim", x.shape[1]))
+    if rules.gdim is not None and int(rules.gdim) != gdim:
+        raise ValueError(
+            f"QuadratureRules.gdim={rules.gdim} does not match mesh geometry "
+            f"dimension {gdim}."
+        )
+
+    if np.dtype(x.dtype) != np.dtype(np.float64):
+        raise NotImplementedError(
+            "runintgen.dolfinx.compute_physical_points currently supports "
+            "float64 mesh geometry."
+        )
+
+    parent_map = np.asarray(rules.parent_map, dtype=np.int32)
+    if np.any(parent_map < 0) or np.any(parent_map >= dofmap.shape[0]):
+        raise ValueError("QuadratureRules.parent_map contains invalid local cells.")
+
+    physical_points = _compiled_physical_points(mesh, rules, gdim)
+    if physical_points is None:
+        cmap = geometry.cmap()
+        ref_points = _points_as_2d(rules.points, rules.tdim)
+        physical_points = np.empty((gdim, rules.total_points), dtype=np.float64)
+
+        if rules.kind == "per_entity":
+            if rules.offsets is None:
+                raise ValueError("per-entity QuadratureRules require offsets.")
+            for rule_index, cell in enumerate(parent_map):
+                q0 = int(rules.offsets[rule_index])
+                q1 = int(rules.offsets[rule_index + 1])
+                if q0 == q1:
+                    continue
+                cell_geometry = np.asarray(
+                    x[dofmap[int(cell)], :gdim],
+                    dtype=np.float64,
+                )
+                physical_points[:, q0:q1] = cmap.push_forward(
+                    ref_points[q0:q1],
+                    cell_geometry,
+                ).T
+        elif rules.kind == "shared":
+            nq = int(ref_points.shape[0])
+            for entity_index, cell in enumerate(parent_map):
+                q0 = entity_index * nq
+                q1 = q0 + nq
+                cell_geometry = np.asarray(
+                    x[dofmap[int(cell)], :gdim],
+                    dtype=np.float64,
+                )
+                physical_points[:, q0:q1] = cmap.push_forward(
+                    ref_points,
+                    cell_geometry,
+                ).T
+        else:  # pragma: no cover - QuadratureRules validates this.
+            raise ValueError(f"Unsupported QuadratureRules kind {rules.kind!r}.")
+
+    return QuadratureRules(
+        tdim=rules.tdim,
+        points=rules.points,
+        weights=rules.weights,
+        offsets=rules.offsets,
+        parent_map=rules.parent_map,
+        rule_id=rules.rule_id,
+        kind=rules.kind,
+        gdim=gdim,
+        physical_points=physical_points,
+    )
+
+
+def _cells_for_quadrature_points(rules: "QuadratureRules") -> npt.NDArray[np.int32]:
+    """Return one parent cell index per flattened quadrature point."""
+    if rules.parent_map is None:
+        raise ValueError(
+            "DOLFINx QuadratureFunction evaluation requires "
+            "QuadratureRules.parent_map."
+        )
+    if rules.kind == "per_entity":
+        if rules.offsets is None:
+            raise ValueError("per-entity QuadratureRules require offsets.")
+        counts = np.diff(rules.offsets).astype(np.int64, copy=False)
+        return np.repeat(rules.parent_map, counts).astype(np.int32, copy=False)
+    if rules.kind == "shared":
+        return np.repeat(rules.parent_map, rules.weights.size).astype(
+            np.int32,
+            copy=False,
+        )
+    raise ValueError(f"Unsupported QuadratureRules kind {rules.kind!r}.")
+
+
+def _points_for_dolfinx_eval(rules: "QuadratureRules") -> npt.NDArray[np.float64]:
+    """Return component-major physical points as DOLFINx ``(n, 3)`` input."""
+    if rules.physical_points is None:
+        raise ValueError(
+            "DOLFINx QuadratureFunction evaluation requires physical_points."
+        )
+    points = np.asarray(rules.physical_points, dtype=np.float64).T
+    if points.shape[1] == 3:
+        return np.ascontiguousarray(points, dtype=np.float64)
+    if points.shape[1] > 3:
+        raise ValueError("DOLFINx Function.eval expects at most 3 coordinates.")
+    padded = np.zeros((points.shape[0], 3), dtype=np.float64)
+    padded[:, : points.shape[1]] = points
+    return padded
+
+
+def _evaluate_background_quadrature_function(
+    info: Any,
+    rules: "QuadratureRules",
+) -> npt.NDArray[np.float64]:
+    """Evaluate a DOLFINx Function at quadrature physical points."""
+    function = info.terminal
+    if not hasattr(function, "eval") or not hasattr(function, "function_space"):
+        raise ValueError(
+            f"QuadratureFunction {info.label!r} has no explicit values, no "
+            "callable source, and no DOLFINx background Function evaluator."
+        )
+
+    if rules.physical_points is None:
+        rules = compute_physical_points(function.function_space.mesh, rules)
+
+    points = _points_for_dolfinx_eval(rules)
+    cells = _cells_for_quadrature_points(rules)
+    if points.shape[0] != cells.size:
+        raise ValueError("Quadrature physical points and parent cells disagree.")
+
+    values = np.asarray(function.eval(points, cells), dtype=np.float64)
+    if rules.total_points == 1:
+        values = values.reshape(1, info.value_size)
+    return values
+
+
+def _needs_physical_points_for_q_functions(
+    module: Any,
+    rules: "QuadratureRules",
+) -> bool:
+    """Return whether q-function sources need physical points for these rules."""
+    from runintgen.quadrature_function import (
+        quadrature_function_source,
+        quadrature_function_values,
+    )
+
+    for info in getattr(module, "quadrature_functions", []) or []:
+        explicit = quadrature_function_values(info.terminal)
+        if str(rules.rule_id) in explicit:
+            continue
+        if quadrature_function_source(info.terminal) is not None:
+            return True
+        if hasattr(info.terminal, "eval") and hasattr(info.terminal, "function_space"):
+            return True
+    return False
+
+
+def _quadrature_for_custom_data(
+    mesh: Any,
+    module: Any,
+    provider: Any,
+) -> Any:
+    """Attach physical points when DOLFINx q-function evaluation needs them."""
+    from runintgen.runtime_data import (
+        RuntimeQuadraturePayload,
+        as_runtime_quadrature_payload,
+    )
+
+    payload = as_runtime_quadrature_payload(provider)
+    rules = payload.rules
+    if (
+        rules.physical_points is None
+        and _needs_physical_points_for_q_functions(module, rules)
+    ):
+        rules = compute_physical_points(mesh, rules)
+        return RuntimeQuadraturePayload(
+            rules=rules,
+            entities=payload.entities,
+            quadrature_functions=payload.quadrature_functions,
+        )
+    return provider
+
+
+def create_custom_data(
+    module: Any,
+    mesh: Any,
+    quadrature: Any,
+    *,
+    is_cut: npt.ArrayLike | None = None,
+) -> Any:
+    """Create runtime custom data with DOLFINx q-function evaluation.
+
+    This is the DOLFINx-aware counterpart of ``runintgen.create_custom_data``.
+    It keeps DOLFINx optional by living in ``runintgen.dolfinx`` and only uses
+    DOLFINx-specific behavior for default background Function evaluation and
+    physical-point mapping.
+    """
+    from runintgen.basix_runtime import CustomData
+
+    quadrature = _quadrature_for_custom_data(mesh, module, quadrature)
+    return CustomData(
+        module,
+        quadrature=quadrature,
+        is_cut=is_cut,
+        quadrature_function_evaluator=_evaluate_background_quadrature_function,
+    )
+
+
 def _active_coefficients(
     ffi_obj: cffi.FFI,
     ufcx_form: Any,
@@ -350,6 +786,7 @@ def _runtime_providers(jit_info: "JITFormInfo") -> dict[tuple[str, int], Any]:
 def _runtime_domain_and_custom_data(
     *,
     compiled: CompiledRunintForm,
+    mesh: Any,
     integral_type: str,
     subdomain_id: int,
     kernel_idx: int,
@@ -377,8 +814,8 @@ def _runtime_domain_and_custom_data(
     payload = as_runtime_quadrature_payload(provider)
     if payload.parent_map is None:
         raise RuntimeError(
-            "DOLFINx runtime quadrature requires RuntimeQuadratureRules.parent_map "
-            "so runtime rules can be mapped to mesh entities."
+            "DOLFINx runtime quadrature requires QuadratureRules.parent_map "
+            "so per-entity rules can be mapped to mesh entities."
         )
 
     data_ptr = _resolve_custom_data(
@@ -392,7 +829,18 @@ def _runtime_domain_and_custom_data(
         cache_key = (id(provider), integral_type, subdomain_id)
         owner = cache.get(cache_key)
         if owner is None:
-            owner = CustomData(compiled.jit_info.module, quadrature=provider)
+            quadrature = _quadrature_for_custom_data(
+                mesh,
+                compiled.jit_info.module,
+                provider,
+            )
+            owner = CustomData(
+                compiled.jit_info.module,
+                quadrature=quadrature,
+                quadrature_function_evaluator=(
+                    _evaluate_background_quadrature_function
+                ),
+            )
             cache[cache_key] = owner
         data_ptr = int(owner.ptr)
 
@@ -531,6 +979,7 @@ def create_form(
             if info.needs_custom_data:
                 entities, data_ptr, owner = _runtime_domain_and_custom_data(
                     compiled=compiled,
+                    mesh=msh,
                     integral_type=info.integral_type,
                     subdomain_id=subdomain_id,
                     kernel_idx=0,
@@ -634,6 +1083,7 @@ def form(
             )
         if not isinstance(ufl_form, ufl.Form):
             return ufl_form
+        _reject_standard_quadrature_functions(ufl_form)
         if not _has_runtime_integrals(ufl_form):
             return dolfinx_fem.form(
                 ufl_form,
@@ -884,9 +1334,12 @@ __all__ = [
     "CompiledRunintForm",
     "CompiledKernel",
     "HAS_DOLFINX",
+    "QuadratureFunction",
     "RuntimeFormInfo",
     "compile_runtime_kernels",
     "compile_form",
+    "compute_physical_points",
+    "create_custom_data",
     "create_form",
     "create_dolfinx_form_with_runtime",
     "form",

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import ufl
 from basix.ufl import element
 
+from runintgen import QuadratureFunction
 from runintgen.jit import compile_forms
-from runintgen.runtime_data import RuntimeQuadratureRules
+from runintgen.runtime_data import QuadratureRules
 
 
 def _space():
@@ -16,8 +18,8 @@ def _space():
     return mesh, V
 
 
-def _runtime_rules() -> RuntimeQuadratureRules:
-    return RuntimeQuadratureRules(
+def _runtime_rules() -> QuadratureRules:
+    return QuadratureRules(
         tdim=2,
         points=np.array([[1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64),
         weights=np.array([0.5], dtype=np.float64),
@@ -88,7 +90,7 @@ def test_compile_mixed_entity_runtime_form():
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     standard_entities = np.array([1, 2], dtype=np.int32)
-    runtime_rules = RuntimeQuadratureRules(
+    runtime_rules = QuadratureRules(
         tdim=2,
         points=np.array([[1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64),
         weights=np.array([0.5], dtype=np.float64),
@@ -107,3 +109,15 @@ def test_compile_mixed_entity_runtime_form():
     assert forms[0].form_integral_offsets[1] == 1
     assert module._runintgen_jit.kernels[0].mode == "mixed"
     assert module._runintgen_jit.forms[0].integral_infos[0].needs_custom_data
+
+
+def test_standard_quadrature_function_is_rejected_until_supported():
+    """Standard kernels must not silently interpolate QuadratureFunction."""
+    mesh, V = _space()
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    alpha = QuadratureFunction(mesh, name="alpha")
+    form = alpha * ufl.inner(u, v) * ufl.dx(domain=mesh)
+
+    with pytest.raises(NotImplementedError, match="standard integrals"):
+        compile_forms([form])

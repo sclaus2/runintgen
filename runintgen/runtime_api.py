@@ -12,6 +12,7 @@ from typing import Any
 import ufl
 
 from .form_metadata import FormRuntimeMetadata
+from .quadrature_function import QuadratureFunctionInfo
 
 
 @dataclass
@@ -42,6 +43,7 @@ class RuntimeKernelInfo:
     tensor_shape: tuple[int, ...] | None = None
     table_info: list[dict[str, Any]] | None = None
     table_slots: dict[str, int] | None = None
+    quadrature_function_slots: list[int] | None = None
     domain: str | None = None
     kernel_id: int = 0
     scalar_type: str | None = None
@@ -66,6 +68,7 @@ class RunintModule:
     meta: dict[str, Any] = field(default_factory=dict)
     form_metadata: FormRuntimeMetadata | None = None
     quadrature_provider: Any | None = None
+    quadrature_functions: list[QuadratureFunctionInfo] = field(default_factory=list)
 
     def create_custom_data(
         self,
@@ -80,7 +83,7 @@ class RunintModule:
             quadrature = self.quadrature_provider
         if quadrature is None:
             raise ValueError("No runtime quadrature provider was supplied.")
-        return CustomData(self.form_metadata, quadrature=quadrature, is_cut=is_cut)
+        return CustomData(self, quadrature=quadrature, is_cut=is_cut)
 
 
 def compile_runtime_integrals(
@@ -114,10 +117,16 @@ def compile_runtime_integrals(
     from .analysis import build_runtime_info
     from .codegeneration.C.integrals import generate_C_runtime_kernels
     from .form_metadata import build_form_runtime_metadata
+    from .quadrature_function import (
+        collect_quadrature_function_infos,
+        validate_quadrature_function_form,
+    )
 
     options = dict(options or {})
     options["sum_factorization"] = False
+    validate_quadrature_function_form(form)
     runtime_info = build_runtime_info(form, options)
+    quadrature_functions = collect_quadrature_function_infos(runtime_info.ir)
 
     # Build form-level metadata (Plan v2)
     form_metadata = build_form_runtime_metadata(runtime_info)
@@ -138,4 +147,5 @@ def compile_runtime_integrals(
         meta=runtime_info.meta,
         form_metadata=form_metadata,
         quadrature_provider=quadrature_provider,
+        quadrature_functions=quadrature_functions,
     )

@@ -13,12 +13,12 @@ import numpy.typing as npt
 
 from .runtime_data import (
     CFFI_DEF,
+    QuadratureRules,
     RuntimeBasixElement,
     RuntimeContextBuilder,
     RuntimeEntityMap,
     RuntimeQuadraturePayload,
     RuntimeQuadratureRule,
-    RuntimeQuadratureRules,
     RuntimeTableRequest,
     RuntimeTableView,
     as_runtime_quadrature_payload,
@@ -76,7 +76,7 @@ __all__ = [
     "RuntimeEntityMap",
     "RuntimeQuadraturePayload",
     "RuntimeQuadratureRule",
-    "RuntimeQuadratureRules",
+    "QuadratureRules",
     "RuntimeTableRequest",
     "RuntimeTableView",
     "as_runtime_quadrature_payload",

@@ -65,6 +65,19 @@ typedef struct
 typedef struct
 {
   const double* values;
+  int value_size;
+  int num_points;
+} runintgen_quadrature_function;
+
+typedef struct
+{
+  int num_functions;
+  const runintgen_quadrature_function* functions;
+} runintgen_quadrature_functions;
+
+typedef struct
+{
+  const double* values;
   int num_derivatives;
   int num_points;
   int num_dofs;
@@ -106,6 +119,7 @@ struct runintgen_context
 {
   const runintgen_quadrature_rules* quadrature;
   const runintgen_entity_map* entities;
+  const runintgen_quadrature_functions* quadrature_functions;
   const runintgen_form_context* form;
 };
 
