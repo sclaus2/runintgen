@@ -201,10 +201,7 @@ def _compute_unscaled_ffcx_form_data(
                 metadata["quadrature_rule"] = "default"
             elif "quadrature_rule" not in metadata:
                 metadata["quadrature_rule"] = "default"
-            if (
-                "quadrature_degree" not in metadata
-                or metadata["quadrature_degree"] < 0
-            ):
+            if "quadrature_degree" not in metadata or metadata["quadrature_degree"] < 0:
                 qd = metadata.get("estimated_polynomial_degree", 0)
                 if isinstance(qd, (tuple, list)):
                     qd = max(qd) if qd else 0
@@ -238,10 +235,7 @@ def _compute_standard_ffcx_form_data(
                 metadata["quadrature_rule"] = "default"
             elif "quadrature_rule" not in metadata:
                 metadata["quadrature_rule"] = "default"
-            if (
-                "quadrature_degree" not in metadata
-                or metadata["quadrature_degree"] < 0
-            ):
+            if "quadrature_degree" not in metadata or metadata["quadrature_degree"] < 0:
                 qd = metadata.get("estimated_polynomial_degree", 0)
                 if isinstance(qd, (tuple, list)):
                     qd = max(qd) if qd else 0
@@ -276,9 +270,7 @@ def _normalised_subdomain_ids(subdomain_id: Any) -> tuple[Any, ...]:
         subdomain_ids = tuple(subdomain_id)
     else:
         subdomain_ids = (subdomain_id,)
-    return tuple(
-        "otherwise" if sid == "everywhere" else sid for sid in subdomain_ids
-    )
+    return tuple("otherwise" if sid == "everywhere" else sid for sid in subdomain_ids)
 
 
 def _lookup_runtime_provider(
@@ -318,7 +310,6 @@ def _combine_runtime_modes(
 def _build_runtime_groups_and_map(
     form: ufl.Form,
     form_data: Any,
-    ir: Any,
 ) -> tuple[list[RuntimeGroup], dict[IntegralKey, RuntimeGroup]]:
     """Build RuntimeGroup objects and a mapping to IR indices.
 
@@ -455,6 +446,41 @@ def _analyse_single_runtime_integral(
     return info
 
 
+def _analyse_runtime_integrals(
+    ir: Any,
+    form_data: Any,
+    ir_to_group: dict[IntegralKey, RuntimeGroup],
+) -> dict[IntegralKey, RuntimeIntegralInfo]:
+    """Build runtime integral analysis info for runtime-mapped IR integrals."""
+    integral_infos: dict[IntegralKey, RuntimeIntegralInfo] = {}
+
+    ir_type_counts: dict[str, int] = {}
+    for integral_ir in ir.integrals:
+        itype = integral_ir.expression.integral_type
+        idx = ir_type_counts.get(itype, 0)
+        ir_type_counts[itype] = idx + 1
+
+        key: IntegralKey = (itype, idx)
+        group = ir_to_group.get(key)
+        if group is None:
+            continue
+
+        subdomain_id = group.subdomain_ids[0] if group.subdomain_ids else 0
+        subdomain_id = -1 if subdomain_id == "otherwise" else int(subdomain_id)
+
+        info = _analyse_single_runtime_integral(
+            integral_ir=integral_ir,
+            integral_type=itype,
+            ir_index=idx,
+            form_data=form_data,
+            subdomain_id=subdomain_id,
+            mode=group.mode,
+        )
+        integral_infos[key] = info
+
+    return integral_infos
+
+
 def _process_modified_terminal(
     mt: Any,
     coefficient_numbering: dict,
@@ -540,33 +566,10 @@ def build_runtime_analysis(
     )
 
     # 3. Build runtime groups and IR mapping
-    groups, ir_to_group = _build_runtime_groups_and_map(form, form_data, ir)
+    groups, ir_to_group = _build_runtime_groups_and_map(form, form_data)
 
     # 4. For each runtime integral, build RuntimeIntegralInfo
-    integral_infos: dict[IntegralKey, RuntimeIntegralInfo] = {}
-
-    ir_type_counts: dict[str, int] = {}
-    for integral_ir in ir.integrals:
-        itype = integral_ir.expression.integral_type
-        idx = ir_type_counts.get(itype, 0)
-        ir_type_counts[itype] = idx + 1
-
-        key: IntegralKey = (itype, idx)
-        group = ir_to_group.get(key)
-        if group is None:
-            continue  # Not a runtime integral
-        subdomain_id = group.subdomain_ids[0] if group.subdomain_ids else 0
-        subdomain_id = -1 if subdomain_id == "otherwise" else int(subdomain_id)
-
-        info = _analyse_single_runtime_integral(
-            integral_ir=integral_ir,
-            integral_type=itype,
-            ir_index=idx,
-            form_data=form_data,
-            subdomain_id=subdomain_id,
-            mode=group.mode,
-        )
-        integral_infos[key] = info
+    integral_infos = _analyse_runtime_integrals(ir, form_data, ir_to_group)
 
     # 5. Pack metadata
     meta = {
