@@ -23,6 +23,7 @@ class RuntimeKernelInfo:
         name: The C function name for this kernel.
         integral_type: The type of integral ("cell", "exterior_facet", etc.).
         subdomain_id: The subdomain identifier.
+        subdomain_ids: Full FFCx subdomain-id group this kernel was derived from.
         ir_index: Index in FFCx IR for this integral type.
         c_declaration: The C function declaration (header).
         c_definition: The C function definition (implementation).
@@ -50,6 +51,12 @@ class RuntimeKernelInfo:
     geometry_type: str | None = None
     base_name: str | None = None
     mode: str = "runtime"
+    subdomain_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Populate grouped subdomain ids for older construction sites."""
+        if not self.subdomain_ids:
+            self.subdomain_ids = (self.subdomain_id,)
 
 
 @dataclass
@@ -134,11 +141,16 @@ def compile_runtime_integrals(
     # Generate kernels with metadata
     kernels = generate_C_runtime_kernels(runtime_info, options, form_metadata)
 
-    providers = [
-        group.quadrature_provider
-        for group in runtime_info.groups
-        if group.quadrature_provider is not None
-    ]
+    providers = []
+    for group in runtime_info.groups:
+        if group.quadrature_providers:
+            providers.extend(
+                provider
+                for provider in group.quadrature_providers.values()
+                if provider is not None
+            )
+        elif group.quadrature_provider is not None:
+            providers.append(group.quadrature_provider)
     unique_provider_ids = {id(provider) for provider in providers}
     quadrature_provider = providers[0] if len(unique_provider_ids) == 1 else None
 

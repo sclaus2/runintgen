@@ -263,6 +263,89 @@ class TestBuildRuntimeAnalysis:
         info = analysis.integral_infos[("cell", 1)]
         assert info.subdomain_id == 2
 
+    def test_standard_and_runtime_same_integrand_split_by_subdomain_id(
+        self, mesh, V, options
+    ):
+        """Test runtime selection survives FFCx grouping with standard ids."""
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=1)
+        dx_runtime = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_id=2,
+            metadata={"quadrature_rule": "runtime"},
+        )
+
+        analysis = build_runtime_analysis(
+            ufl.inner(u, v) * dx_standard + ufl.inner(u, v) * dx_runtime,
+            options,
+        )
+
+        assert len(analysis.groups) == 1
+        assert analysis.groups[0].subdomain_ids == (2,)
+        info = next(iter(analysis.integral_infos.values()))
+        assert info.subdomain_id == 2
+        assert info.subdomain_ids == (2,)
+
+    def test_runtime_subdomain_id_tuple_survives(self, mesh, V, options):
+        """Test grouped FFCx integral data keeps all runtime subdomain ids."""
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        provider = MockQuadratureProvider()
+        dx = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_id=(1, 2),
+            subdomain_data=provider,
+            metadata={"quadrature_rule": "runtime"},
+        )
+
+        analysis = build_runtime_analysis(ufl.inner(u, v) * dx, options)
+
+        assert len(analysis.groups) == 1
+        assert analysis.groups[0].subdomain_ids == (1, 2)
+        assert analysis.groups[0].quadrature_providers[1] is provider
+        assert analysis.groups[0].quadrature_providers[2] is provider
+        info = analysis.integral_infos[("cell", 0)]
+        assert info.subdomain_id == 1
+        assert info.subdomain_ids == (1, 2)
+
+    def test_runtime_providers_survive_ffcx_subdomain_grouping(
+        self, mesh, V, options
+    ):
+        """Test per-id providers survive when FFCx groups identical integrands."""
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        provider_1 = MockQuadratureProvider()
+        provider_2 = MockQuadratureProvider()
+        dx_1 = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_id=1,
+            subdomain_data=provider_1,
+            metadata={"quadrature_rule": "runtime"},
+        )
+        dx_2 = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_id=2,
+            subdomain_data=provider_2,
+            metadata={"quadrature_rule": "runtime"},
+        )
+
+        analysis = build_runtime_analysis(
+            ufl.inner(u, v) * dx_1 + ufl.inner(u, v) * dx_2,
+            options,
+        )
+
+        assert len(analysis.groups) == 1
+        group = analysis.groups[0]
+        assert group.subdomain_ids == (1, 2)
+        assert group.quadrature_provider is None
+        assert group.quadrature_providers[1] is provider_1
+        assert group.quadrature_providers[2] is provider_2
+
 
 class TestElementInfo:
     """Tests for ElementInfo dataclass."""

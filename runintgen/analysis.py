@@ -92,6 +92,7 @@ class RuntimeIntegralInfo:
     ir_index: int  # index in DataIR.integrals for this type
     subdomain_id: int
     mode: RuntimeIntegralMode = RuntimeIntegralMode.RUNTIME
+    subdomain_ids: tuple[int, ...] = ()
 
     # (role, index) -> ArgumentInfo
     arguments: dict[tuple[ArgumentRole, int], ArgumentInfo] = field(
@@ -100,6 +101,11 @@ class RuntimeIntegralInfo:
 
     # element_id -> ElementInfo
     elements: dict[str, ElementInfo] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Populate the full subdomain-id tuple for older callers."""
+        if not self.subdomain_ids:
+            self.subdomain_ids = (self.subdomain_id,)
 
     def get_or_add_argument(
         self,
@@ -142,6 +148,7 @@ class RuntimeGroup:
         integral_type: The type of integral ("cell", "exterior_facet", etc.).
         subdomain_ids: Tuple of subdomain identifiers.
         quadrature_provider: The quadrature provider object (e.g., C++ class).
+        quadrature_providers: Runtime quadrature providers keyed by subdomain id.
     """
 
     domain: Any  # ufl.Mesh - use Any for hashability
@@ -149,6 +156,7 @@ class RuntimeGroup:
     subdomain_ids: tuple[Any, ...]
     quadrature_provider: Any = None
     mode: RuntimeIntegralMode = RuntimeIntegralMode.RUNTIME
+    quadrature_providers: dict[Any, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -273,6 +281,20 @@ def _normalised_subdomain_ids(subdomain_id: Any) -> tuple[Any, ...]:
     return tuple("otherwise" if sid == "everywhere" else sid for sid in subdomain_ids)
 
 
+def _integral_subdomain_id(subdomain_id: Any) -> int:
+    """Return a DOLFINx/UFCx-compatible integer subdomain id."""
+    return -1 if subdomain_id in ("otherwise", "everywhere") else int(subdomain_id)
+
+
+def _representative_provider(providers: dict[Any, Any]) -> Any | None:
+    """Return the sole non-null provider when a group has exactly one."""
+    values = [provider for provider in providers.values() if provider is not None]
+    if not values:
+        return None
+    provider_ids = {id(provider) for provider in values}
+    return values[0] if len(provider_ids) == 1 else None
+
+
 def _lookup_runtime_provider(
     domain: Any,
     integral_type: str,
@@ -342,7 +364,6 @@ def _build_runtime_groups_and_map(
         subdomain_ids = tuple(itg_data.subdomain_id)
         key: Key = (domain, itype, subdomain_ids)
 
-        quadrature_provider: Any = None
         runtime_integrals = [
             integral for integral in itg_data.integrals if is_runtime_integral(integral)
         ]
@@ -350,42 +371,46 @@ def _build_runtime_groups_and_map(
             runtime_integral_mode(integral) for integral in runtime_integrals
         ]
 
-        for integral in runtime_integrals:
-            provider = get_quadrature_provider(integral)
-            if provider is not None:
-                quadrature_provider = provider
-                break
-
         is_runtime_group = bool(runtime_integrals)
+        quadrature_providers: dict[Any, Any] = {}
+        for sid in subdomain_ids:
+            found, provider, mode = _lookup_runtime_provider(
+                itg_data.domain,
+                itype,
+                sid,
+                original_providers,
+                original_providers_by_id,
+                original_modes,
+                original_modes_by_id,
+            )
+            is_runtime_group = is_runtime_group or found
+            if found:
+                quadrature_providers[sid] = provider
+                if mode is not None:
+                    runtime_modes.append(mode)
+
+        runtime_subdomain_ids = tuple(quadrature_providers)
+        if is_runtime_group and not runtime_subdomain_ids:
+            runtime_subdomain_ids = subdomain_ids
+            for sid in runtime_subdomain_ids:
+                for integral in runtime_integrals:
+                    quadrature_providers[sid] = get_quadrature_provider(integral)
+                    break
+        is_runtime_group = bool(runtime_subdomain_ids)
+
         group_mode = (
             _combine_runtime_modes(runtime_modes)
             if runtime_modes
             else RuntimeIntegralMode.RUNTIME
         )
-        if quadrature_provider is None:
-            for sid in subdomain_ids:
-                found, provider, mode = _lookup_runtime_provider(
-                    itg_data.domain,
-                    itype,
-                    sid,
-                    original_providers,
-                    original_providers_by_id,
-                    original_modes,
-                    original_modes_by_id,
-                )
-                is_runtime_group = is_runtime_group or found
-                if found and mode is RuntimeIntegralMode.MIXED:
-                    group_mode = RuntimeIntegralMode.MIXED
-                if provider is not None:
-                    quadrature_provider = provider
-                    break
 
         if is_runtime_group:
             groups_dict[key] = RuntimeGroup(
                 domain=domain,
                 integral_type=itype,
-                subdomain_ids=subdomain_ids,
-                quadrature_provider=quadrature_provider,
+                subdomain_ids=runtime_subdomain_ids,
+                quadrature_provider=_representative_provider(quadrature_providers),
+                quadrature_providers=quadrature_providers,
                 mode=group_mode,
             )
 
@@ -414,6 +439,7 @@ def _analyse_single_runtime_integral(
     ir_index: int,
     form_data: Any,
     subdomain_id: int,
+    subdomain_ids: tuple[int, ...],
     mode: RuntimeIntegralMode,
 ) -> RuntimeIntegralInfo:
     """Extract ArgumentInfo + ElementInfo for one runtime integral."""
@@ -422,6 +448,7 @@ def _analyse_single_runtime_integral(
         integral_type=integral_type,
         ir_index=ir_index,
         subdomain_id=subdomain_id,
+        subdomain_ids=subdomain_ids,
         mode=mode,
     )
 
@@ -465,8 +492,10 @@ def _analyse_runtime_integrals(
         if group is None:
             continue
 
-        subdomain_id = group.subdomain_ids[0] if group.subdomain_ids else 0
-        subdomain_id = -1 if subdomain_id == "otherwise" else int(subdomain_id)
+        subdomain_ids = tuple(
+            _integral_subdomain_id(sid) for sid in group.subdomain_ids
+        )
+        subdomain_id = subdomain_ids[0] if subdomain_ids else 0
 
         info = _analyse_single_runtime_integral(
             integral_ir=integral_ir,
@@ -474,6 +503,7 @@ def _analyse_runtime_integrals(
             ir_index=idx,
             form_data=form_data,
             subdomain_id=subdomain_id,
+            subdomain_ids=subdomain_ids,
             mode=group.mode,
         )
         integral_infos[key] = info

@@ -308,6 +308,45 @@ class TestCodeGeneration:
         assert kernel.name.startswith("integral_")
         assert kernel.name.endswith("_triangle")
 
+    def test_runtime_subdomain_id_tuple_generates_one_kernel_per_id(self):
+        """Test grouped subdomain ids expand to separate runtime kernels."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx_rt = dxq(subdomain_id=(1, 2), domain=mesh)
+
+        module = compile_runtime_integrals(ufl.inner(u, v) * dx_rt)
+
+        assert len(module.kernels) == 2
+        assert [kernel.subdomain_id for kernel in module.kernels] == [1, 2]
+        assert {kernel.subdomain_ids for kernel in module.kernels} == {(1, 2)}
+        assert len({kernel.name for kernel in module.kernels}) == 2
+        assert all("subdomain_" in kernel.name for kernel in module.kernels)
+        assert [kernel.ir_index for kernel in module.kernels] == [0, 0]
+        assert module.form_metadata.integral_layouts[("cell", 0)].subdomain_ids == (
+            1,
+            2,
+        )
+
+    def test_same_integrand_standard_id_does_not_generate_runtime_kernel(self):
+        """Test only runtime-marked ids generate runtime kernels in a group."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=1)
+        dx_runtime = dxq(subdomain_id=2, domain=mesh)
+        form = ufl.inner(u, v) * dx_standard + ufl.inner(u, v) * dx_runtime
+
+        module = compile_runtime_integrals(form)
+
+        assert len(module.kernels) == 1
+        assert module.kernels[0].subdomain_id == 2
+        assert module.kernels[0].subdomain_ids == (2,)
+
     def test_write_runtime_code_files(self, tmp_path):
         """Test generated kernels can be written as inspectable files."""
         from runintgen import write_runtime_code

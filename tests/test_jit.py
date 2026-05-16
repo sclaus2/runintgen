@@ -84,6 +84,86 @@ def test_compile_combined_standard_and_runtime_form():
     assert modes == {"standard", "runtime"}
 
 
+def test_compile_runtime_subdomain_tuple_uses_distinct_kernels():
+    """Runtime form slots with grouped subdomain ids use per-id kernels."""
+    mesh, V = _space()
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    dx_rt = ufl.Measure(
+        "dx",
+        domain=mesh,
+        subdomain_id=(1, 2),
+        subdomain_data=_runtime_rules(),
+    )
+    form = ufl.inner(u, v) * dx_rt
+
+    forms, module, _ = compile_forms([form])
+    kernels = module._runintgen_jit.kernels
+    infos = module._runintgen_jit.forms[0].integral_infos
+
+    assert forms[0].form_integral_offsets[1] == 2
+    assert [kernel.subdomain_id for kernel in kernels] == [1, 2]
+    assert len({kernel.name for kernel in kernels}) == 2
+    assert [info.subdomain_id for info in infos] == [1, 2]
+    assert [info.kernel.subdomain_id for info in infos] == [1, 2]
+
+
+def test_runtime_subdomain_ids_affect_jit_cache_key(tmp_path):
+    """Changing runtime subdomain ids must produce a distinct cached module."""
+    mesh, V = _space()
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    dx_0 = ufl.Measure(
+        "dx",
+        domain=mesh,
+        subdomain_id=0,
+        subdomain_data=_runtime_rules(),
+    )
+    dx_1 = ufl.Measure(
+        "dx",
+        domain=mesh,
+        subdomain_id=1,
+        subdomain_data=_runtime_rules(),
+    )
+    form_two_ids = ufl.inner(u, v) * dx_0 + ufl.inner(u, v) * dx_1
+    form_one_id = ufl.inner(u, v) * dx_0
+
+    _, module_two_ids, _ = compile_forms([form_two_ids], cache_dir=tmp_path)
+    _, module_one_id, code_one_id = compile_forms([form_one_id], cache_dir=tmp_path)
+
+    info_two_ids = module_two_ids._runintgen_jit
+    info_one_id = module_one_id._runintgen_jit
+    assert info_two_ids.module_name != info_one_id.module_name
+    assert [kernel.subdomain_id for kernel in info_two_ids.kernels] == [0, 1]
+    assert [kernel.subdomain_id for kernel in info_one_id.kernels] == [0]
+    assert code_one_id != (None, None)
+
+
+def test_compile_same_integrand_standard_and_runtime_ids_split_kernels():
+    """Standard ids remain standard when FFCx groups them with runtime ids."""
+    mesh, V = _space()
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    dx_runtime = ufl.Measure(
+        "dx",
+        domain=mesh,
+        subdomain_id=2,
+        subdomain_data=_runtime_rules(),
+    )
+    form = (
+        ufl.inner(u, v) * ufl.Measure("dx", domain=mesh, subdomain_id=1)
+        + ufl.inner(u, v) * dx_runtime
+    )
+
+    forms, module, _ = compile_forms([form])
+    infos = module._runintgen_jit.forms[0].integral_infos
+
+    assert forms[0].form_integral_offsets[1] == 2
+    assert [info.subdomain_id for info in infos] == [1, 2]
+    assert [info.needs_custom_data for info in infos] == [False, True]
+    assert [info.kernel.mode for info in infos] == ["standard", "runtime"]
+
+
 def test_compile_mixed_entity_runtime_form():
     """Mixed entity/runtime integrals compile into one mixed UFCx integral."""
     mesh, V = _space()

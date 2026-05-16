@@ -41,31 +41,44 @@ def _runtime_options(options: dict[str, Any]) -> dict[str, Any]:
 
 def _subdomain_ids_by_integral(
     analysis: RuntimeAnalysisInfo,
-) -> dict[tuple[str, int], int]:
-    """Build a runtime integral key to subdomain id map."""
+) -> dict[tuple[str, int], tuple[int, ...]]:
+    """Build a runtime integral key to subdomain ids map."""
     return {
-        key: info.subdomain_id for key, info in analysis.integral_infos.items()
+        key: info.subdomain_ids for key, info in analysis.integral_infos.items()
     }
 
 
 def _all_subdomain_ids_by_integral(ir: Any) -> dict[tuple[str, int], int]:
     """Build an integral key to first subdomain id map for all form integrals."""
+    return {
+        key: ids[0]
+        for key, ids in _all_subdomain_id_groups_by_integral(ir).items()
+        if ids
+    }
+
+
+def _all_subdomain_id_groups_by_integral(
+    ir: Any,
+) -> dict[tuple[str, int], tuple[int, ...]]:
+    """Build an integral key to all subdomain ids in each FFCx form segment."""
     if not getattr(ir, "forms", None):
         return {}
 
     form_ir = ir.forms[0]
-    ids_by_key: dict[tuple[str, int], int] = {}
+    ids_by_key: dict[tuple[str, int], tuple[int, ...]] = {}
     for integral_type, ids in form_ir.subdomain_ids.items():
         names = form_ir.integral_names[integral_type]
         pos = 0
         group_index = 0
         while pos < len(names):
             name = names[pos]
-            sid = ids[pos]
-            ids_by_key[(integral_type, group_index)] = int(sid)
+            start = pos
             pos += 1
             while pos < len(names) and names[pos] == name:
                 pos += 1
+            ids_by_key[(integral_type, group_index)] = tuple(
+                int(sid) for sid in ids[start:pos]
+            )
             group_index += 1
     return ids_by_key
 
@@ -88,12 +101,39 @@ def _integrals_by_key(ir: Any) -> dict[tuple[str, int], Any]:
     return integrals
 
 
+def _subdomain_name_suffix(subdomain_id: int) -> str:
+    """Return a C-identifier-safe suffix for a subdomain id."""
+    label = str(subdomain_id).replace("-", "minus_")
+    return f"subdomain_{label}"
+
+
+def _kernel_base_name(
+    integral_ir: Any,
+    *,
+    subdomain_id: int | None = None,
+    split_subdomain: bool = False,
+) -> str:
+    """Return the UFCx integral object base name before the cell-domain suffix."""
+    base_name = integral_ir.expression.name
+    if split_subdomain and subdomain_id is not None:
+        return f"{base_name}_{_subdomain_name_suffix(subdomain_id)}"
+    return base_name
+
+
 def _kernel_name(
     integral_ir: Any,
     domain: Any,
+    *,
+    subdomain_id: int | None = None,
+    split_subdomain: bool = False,
 ) -> str:
     """Return FFCx's UFCx integral object name."""
-    return f"{integral_ir.expression.name}_{domain.name}"
+    base_name = _kernel_base_name(
+        integral_ir,
+        subdomain_id=subdomain_id,
+        split_subdomain=split_subdomain,
+    )
+    return f"{base_name}_{domain.name}"
 
 
 def _standard_kernel_info(
@@ -114,6 +154,7 @@ def _standard_kernel_info(
         name=_kernel_name(integral_ir, domain),
         integral_type=integral_type,
         subdomain_id=subdomain_id,
+        subdomain_ids=(subdomain_id,),
         ir_index=ir_index,
         c_declaration=c_decl,
         c_definition=c_def,
@@ -201,13 +242,22 @@ def _element_table_requests(runtime_tables: list[Any]) -> list[_ElementTableRequ
     return requests
 
 
-def _table_requests(element_requests: list[_ElementTableRequest]) -> str:
+def _table_request_symbol(factory_name: str, slot: int) -> str:
+    """Return the file-scope C symbol for one kernel table request."""
+    return f"{factory_name}_rt_element_request_{slot}"
+
+
+def _table_requests(
+    element_requests: list[_ElementTableRequest],
+    factory_name: str,
+) -> str:
     """Generate static C requests for per-element runtime FE tabulations."""
     lines = []
     for request in element_requests:
+        request_symbol = _table_request_symbol(factory_name, request.slot)
         lines.append(
             f"static const runintgen_table_request "
-            f"rt_element_request_{request.slot} = {{\n"
+            f"{request_symbol} = {{\n"
             f"  .slot = {request.slot},\n"
             f"  .derivative_order = {request.max_derivative_order},\n"
             f"  .is_permuted = {int(request.is_permuted)},\n"
@@ -216,10 +266,14 @@ def _table_requests(element_requests: list[_ElementTableRequest]) -> str:
     return "\n".join(lines)
 
 
-def _table_preparation(element_requests: list[_ElementTableRequest]) -> str:
+def _table_preparation(
+    element_requests: list[_ElementTableRequest],
+    factory_name: str,
+) -> str:
     """Generate in-kernel Basix wrapper calls for runtime FE element slots."""
     lines = []
     for request in element_requests:
+        request_symbol = _table_request_symbol(factory_name, request.slot)
         lines.extend(
             [
                 f"  if (form == 0 || elements == 0 || "
@@ -230,7 +284,7 @@ def _table_preparation(element_requests: list[_ElementTableRequest]) -> str:
                 f"  runintgen_table_view rt_element_view_{request.slot};",
                 f"  if (elements[{request.element_index}].tabulate(",
                 f"          &elements[{request.element_index}], rule,",
-                f"          &rt_element_request_{request.slot}, "
+                f"          &{request_symbol}, "
                 f"&rt_element_view_{request.slot}) != 0)",
                 "    return;",
                 f"  const double* {request.c_symbol} = "
@@ -477,7 +531,7 @@ def generate_C_runtime_kernels(
     scalar_c = dtype_to_c_type(scalar_type)
     geom_c = dtype_to_c_type(geometry_type)
 
-    subdomain_by_key = _subdomain_ids_by_integral(analysis)
+    subdomains_by_key = _subdomain_ids_by_integral(analysis)
     standard_integrals = (
         _integrals_by_key(analysis.standard_ir)
         if analysis.standard_ir is not None
@@ -499,109 +553,122 @@ def generate_C_runtime_kernels(
         if key not in analysis.integral_infos:
             continue
 
-        subdomain_id = subdomain_by_key.get(key, 0)
+        subdomain_ids = subdomains_by_key.get(key, (0,))
+        split_subdomain = len(subdomain_ids) > 1
         mode = analysis.integral_infos[key].mode
         domains = _domains_for_integral(integral_ir)
-        for domain_id, domain in enumerate(domains):
-            generated = generator.generate_runtime(integral_ir, domain)
-            runtime_tables = _apply_form_element_indices(
-                generated.runtime_tables, element_indices_by_hash
-            )
-            element_requests = _element_table_requests(runtime_tables)
-            func_name = _kernel_name(integral_ir, domain)
-            kernel_id = ir_index * 1024 + domain_id
-            enabled_coefficients_init, enabled_coefficients = _enabled_coefficients(
-                integral_ir, func_name, q_infos
-            )
-            tabulate_tensor = _tabulate_tensor_initializers(scalar_type, func_name)
-            standard_integral_ir = standard_integrals.get(key, integral_ir)
-            local_index_expr = _local_index_expr(integral_type)
-            table_preparation = _table_preparation(element_requests)
-            q_preparation = _quadrature_function_preparation(
-                generated.quadrature_function_slots, q_infos
-            )
-            standard_body = (
-                _standard_body(standard_integral_ir, domain, ffcx_options)
-                if mode is RuntimeIntegralMode.MIXED
-                else ""
-            )
+        for subdomain_pos, subdomain_id in enumerate(subdomain_ids):
+            for domain_id, domain in enumerate(domains):
+                generated = generator.generate_runtime(integral_ir, domain)
+                runtime_tables = _apply_form_element_indices(
+                    generated.runtime_tables, element_indices_by_hash
+                )
+                element_requests = _element_table_requests(runtime_tables)
+                base_name = _kernel_base_name(
+                    integral_ir,
+                    subdomain_id=subdomain_id,
+                    split_subdomain=split_subdomain,
+                )
+                func_name = _kernel_name(
+                    integral_ir,
+                    domain,
+                    subdomain_id=subdomain_id,
+                    split_subdomain=split_subdomain,
+                )
+                kernel_id = ir_index * 1_000_000 + subdomain_pos * 1024 + domain_id
+                enabled_coefficients_init, enabled_coefficients = (
+                    _enabled_coefficients(integral_ir, func_name, q_infos)
+                )
+                tabulate_tensor = _tabulate_tensor_initializers(scalar_type, func_name)
+                standard_integral_ir = standard_integrals.get(key, integral_ir)
+                local_index_expr = _local_index_expr(integral_type)
+                table_preparation = _table_preparation(element_requests, func_name)
+                q_preparation = _quadrature_function_preparation(
+                    generated.quadrature_function_slots, q_infos
+                )
+                standard_body = (
+                    _standard_body(standard_integral_ir, domain, ffcx_options)
+                    if mode is RuntimeIntegralMode.MIXED
+                    else ""
+                )
 
-            c_def = factory_runtime_kernel.format(
-                factory_name=func_name,
-                scalar=scalar_c,
-                geom=geom_c,
-                enabled_coefficients_init=enabled_coefficients_init,
-                enabled_coefficients=enabled_coefficients,
-                table_requests=_table_requests(element_requests),
-                tabulate_tensor_functions=_tabulate_tensor_functions(
-                    mode=mode,
+                c_def = factory_runtime_kernel.format(
                     factory_name=func_name,
                     scalar=scalar_c,
                     geom=geom_c,
-                    local_index_expr=local_index_expr,
-                    table_preparation=table_preparation,
-                    quadrature_function_preparation=q_preparation,
-                    body=generated.body,
-                    standard_body=standard_body,
-                ),
-                tabulate_tensor_float32=tabulate_tensor["tabulate_tensor_float32"],
-                tabulate_tensor_float64=tabulate_tensor["tabulate_tensor_float64"],
-                tabulate_tensor_complex64=tabulate_tensor[
-                    "tabulate_tensor_complex64"
-                ],
-                tabulate_tensor_complex128=tabulate_tensor[
-                    "tabulate_tensor_complex128"
-                ],
-                needs_facet_permutations=(
-                    "true"
-                    if integral_ir.expression.needs_facet_permutations
-                    else "false"
-                ),
-                coordinate_element_hash=(
-                    f"UINT64_C({integral_ir.expression.coordinate_element_hash})"
-                ),
-                domain=int(domain),
-            )
-
-            c_decl = factory_runtime_kernel_decl.format(
-                factory_name=func_name,
-            )
-
-            max_derivative_by_slot = {
-                request.slot: request.max_derivative_order
-                for request in element_requests
-            }
-            table_info = [
-                {
-                    **table.to_dict(),
-                    "element_max_derivative_order": max_derivative_by_slot[
-                        table.slot
+                    enabled_coefficients_init=enabled_coefficients_init,
+                    enabled_coefficients=enabled_coefficients,
+                    table_requests=_table_requests(element_requests, func_name),
+                    tabulate_tensor_functions=_tabulate_tensor_functions(
+                        mode=mode,
+                        factory_name=func_name,
+                        scalar=scalar_c,
+                        geom=geom_c,
+                        local_index_expr=local_index_expr,
+                        table_preparation=table_preparation,
+                        quadrature_function_preparation=q_preparation,
+                        body=generated.body,
+                        standard_body=standard_body,
+                    ),
+                    tabulate_tensor_float32=tabulate_tensor["tabulate_tensor_float32"],
+                    tabulate_tensor_float64=tabulate_tensor["tabulate_tensor_float64"],
+                    tabulate_tensor_complex64=tabulate_tensor[
+                        "tabulate_tensor_complex64"
                     ],
-                }
-                for table in runtime_tables
-            ]
-            table_slots = {table.name: table.slot for table in runtime_tables}
-
-            kernels.append(
-                RuntimeKernelInfo(
-                    name=func_name,
-                    integral_type=integral_type,
-                    subdomain_id=subdomain_id,
-                    ir_index=ir_index,
-                    c_declaration=c_decl,
-                    c_definition=c_def,
-                    tensor_shape=tuple(integral_ir.expression.tensor_shape),
-                    table_info=table_info,
-                    table_slots=table_slots,
-                    quadrature_function_slots=generated.quadrature_function_slots,
-                    domain=domain.name,
-                    kernel_id=kernel_id,
-                    scalar_type=scalar_type,
-                    geometry_type=geometry_type,
-                    base_name=integral_ir.expression.name,
-                    mode=mode.value,
+                    tabulate_tensor_complex128=tabulate_tensor[
+                        "tabulate_tensor_complex128"
+                    ],
+                    needs_facet_permutations=(
+                        "true"
+                        if integral_ir.expression.needs_facet_permutations
+                        else "false"
+                    ),
+                    coordinate_element_hash=(
+                        f"UINT64_C({integral_ir.expression.coordinate_element_hash})"
+                    ),
+                    domain=int(domain),
                 )
-            )
+
+                c_decl = factory_runtime_kernel_decl.format(
+                    factory_name=func_name,
+                )
+
+                max_derivative_by_slot = {
+                    request.slot: request.max_derivative_order
+                    for request in element_requests
+                }
+                table_info = [
+                    {
+                        **table.to_dict(),
+                        "element_max_derivative_order": max_derivative_by_slot[
+                            table.slot
+                        ],
+                    }
+                    for table in runtime_tables
+                ]
+                table_slots = {table.name: table.slot for table in runtime_tables}
+
+                kernels.append(
+                    RuntimeKernelInfo(
+                        name=func_name,
+                        integral_type=integral_type,
+                        subdomain_id=subdomain_id,
+                        subdomain_ids=subdomain_ids,
+                        ir_index=ir_index,
+                        c_declaration=c_decl,
+                        c_definition=c_def,
+                        tensor_shape=tuple(integral_ir.expression.tensor_shape),
+                        table_info=table_info,
+                        table_slots=table_slots,
+                        quadrature_function_slots=generated.quadrature_function_slots,
+                        domain=domain.name,
+                        kernel_id=kernel_id,
+                        scalar_type=scalar_type,
+                        geometry_type=geometry_type,
+                        base_name=base_name,
+                        mode=mode.value,
+                    )
+                )
 
     return kernels
 
@@ -614,13 +681,16 @@ def generate_C_combined_kernels(
     """Generate C kernels for standard, runtime, and mixed integrals."""
     ffcx_options = _runtime_options(options)
     runtime_keys = set(analysis.integral_infos)
-    runtime_kernels = {
-        (kernel.integral_type, kernel.ir_index, kernel.domain): kernel
-        for kernel in generate_C_runtime_kernels(analysis, options, form_metadata)
-    }
+    runtime_kernels_by_key: dict[tuple[str, int], list[RuntimeKernelInfo]] = {}
+    for kernel in generate_C_runtime_kernels(analysis, options, form_metadata):
+        runtime_kernels_by_key.setdefault(
+            (kernel.integral_type, kernel.ir_index),
+            [],
+        ).append(kernel)
 
     runtime_integrals = _integrals_by_key(analysis.ir)
     subdomain_by_key = _all_subdomain_ids_by_integral(analysis.standard_ir)
+    subdomain_groups_by_key = _all_subdomain_id_groups_by_integral(analysis.standard_ir)
 
     kernels: list[RuntimeKernelInfo] = []
     ir_type_counts: dict[str, int] = {}
@@ -634,7 +704,26 @@ def generate_C_combined_kernels(
         domains = _domains_for_integral(source_ir)
         for domain_id, domain in enumerate(domains):
             if key in runtime_keys:
-                kernel = runtime_kernels[(integral_type, ir_index, domain.name)]
+                runtime_subdomains = set(analysis.integral_infos[key].subdomain_ids)
+                form_subdomains = set(subdomain_groups_by_key.get(key, ()))
+                standard_subdomains = form_subdomains - runtime_subdomains
+                if standard_subdomains:
+                    kernels.append(
+                        _standard_kernel_info(
+                            integral_ir,
+                            domain,
+                            integral_type=integral_type,
+                            ir_index=ir_index,
+                            subdomain_id=sorted(standard_subdomains)[0],
+                            options=ffcx_options,
+                            kernel_id=ir_index * 1_000_000 + 999_000 + domain_id,
+                        )
+                    )
+                kernels.extend(
+                    kernel
+                    for kernel in runtime_kernels_by_key[key]
+                    if kernel.domain == domain.name
+                )
             else:
                 kernel = _standard_kernel_info(
                     integral_ir,
@@ -645,7 +734,7 @@ def generate_C_combined_kernels(
                     options=ffcx_options,
                     kernel_id=ir_index * 1024 + domain_id,
                 )
-            kernels.append(kernel)
+                kernels.append(kernel)
 
     return kernels
 

@@ -776,10 +776,16 @@ def _runtime_providers(jit_info: "JITFormInfo") -> dict[tuple[str, int], Any]:
     """Return runtime quadrature providers keyed by integral type/subdomain id."""
     providers: dict[tuple[str, int], Any] = {}
     for group in jit_info.analysis.groups:
-        for sid in group.subdomain_ids:
-            providers[(group.integral_type, _normalised_subdomain_id(sid))] = (
-                group.quadrature_provider
-            )
+        if group.quadrature_providers:
+            for sid, provider in group.quadrature_providers.items():
+                providers[(group.integral_type, _normalised_subdomain_id(sid))] = (
+                    provider
+                )
+        else:
+            for sid in group.subdomain_ids:
+                providers[(group.integral_type, _normalised_subdomain_id(sid))] = (
+                    group.quadrature_provider
+                )
     return providers
 
 

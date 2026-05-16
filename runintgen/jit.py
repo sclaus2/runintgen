@@ -40,7 +40,7 @@ from .codegeneration.C.integrals import (
 )
 from .cpp_headers import runtime_abi_header_text
 from .form_metadata import FormRuntimeMetadata, build_form_runtime_metadata
-from .measures import is_runtime_integral
+from .measures import is_runtime_integral, runtime_integral_mode
 from .quadrature_function import (
     collect_quadrature_function_infos,
     integral_quadrature_functions,
@@ -120,6 +120,36 @@ def _runtime_signature() -> str:
     return digest.hexdigest()
 
 
+def _normalised_subdomain_ids(subdomain_id: Any) -> tuple[Any, ...]:
+    """Return subdomain ids in a stable cache-signature form."""
+    if isinstance(subdomain_id, (tuple, list)):
+        ids = tuple(subdomain_id)
+    else:
+        ids = (subdomain_id,)
+    return tuple("otherwise" if sid == "everywhere" else sid for sid in ids)
+
+
+def _runtime_form_signature(forms: list[ufl.Form]) -> str:
+    """Return a signature for runtime metadata that FFCx may not hash."""
+    digest = hashlib.sha1()
+    digest.update(b"runintgen-runtime-form-signature-v1")
+    for form_index, form in enumerate(forms):
+        digest.update(f"form:{form_index};".encode("utf-8"))
+        for integral in form.integrals():
+            mode = runtime_integral_mode(integral).value
+            ids = _normalised_subdomain_ids(integral.subdomain_id())
+            digest.update(
+                repr(
+                    (
+                        integral.integral_type(),
+                        ids,
+                        mode,
+                    )
+                ).encode("utf-8")
+            )
+    return digest.hexdigest()
+
+
 def _jit_libraries(extra_libraries: list[str] | None) -> list[str]:
     """Return C libraries for the JIT build."""
     if extra_libraries is None:
@@ -168,7 +198,7 @@ def _combined_form_ir(analysis: RuntimeAnalysisInfo, kernels: list[RuntimeKernel
     """Return a standard FFCx FormIR pointing at combined kernel names."""
     form_ir = analysis.standard_ir.forms[0]
     runtime_base_names = {
-        (kernel.integral_type, kernel.ir_index): kernel.base_name
+        (kernel.integral_type, kernel.ir_index, kernel.subdomain_id): kernel.base_name
         for kernel in kernels
         if kernel.mode != "standard" and kernel.base_name is not None
     }
@@ -185,12 +215,15 @@ def _combined_form_ir(analysis: RuntimeAnalysisInfo, kernels: list[RuntimeKernel
         key: list(value) for key, value in form_ir.integral_domains.items()
     }
     for integral_type, names in integral_names.items():
+        ids = form_ir.subdomain_ids[integral_type]
         for ir_index, (start, end) in enumerate(_form_integral_segments(names)):
             key = (integral_type, ir_index)
-            base_name = runtime_base_names.get(key)
-            if base_name is None:
-                continue
             for pos in range(start, end):
+                base_name = runtime_base_names.get(
+                    (integral_type, ir_index, int(ids[pos]))
+                )
+                if base_name is None:
+                    continue
                 integral_names[integral_type][pos] = base_name
                 integral_domains[integral_type][pos] = runtime_domains[key]
 
@@ -219,8 +252,8 @@ def _form_integral_infos(
     kernels: list[RuntimeKernelInfo],
 ) -> list[JITIntegralInfo]:
     """Return generated-integral metadata in UFCx form order."""
-    kernels_by_key_domain = {
-        (kernel.integral_type, kernel.ir_index, kernel.domain): kernel
+    kernels_by_name_domain = {
+        (kernel.integral_type, kernel.base_name, kernel.domain): kernel
         for kernel in kernels
     }
     infos: list[JITIntegralInfo] = []
@@ -229,22 +262,19 @@ def _form_integral_infos(
         names = form_ir.integral_names[integral_type]
         ids = form_ir.subdomain_ids[integral_type]
         domains = form_ir.integral_domains[integral_type]
-        for ir_index, (start, end) in enumerate(_form_integral_segments(names)):
-            for pos in range(start, end):
-                for domain in domains[pos]:
-                    kernel = kernels_by_key_domain[
-                        (integral_type, ir_index, domain.name)
-                    ]
-                    infos.append(
-                        JITIntegralInfo(
-                            form_index=form_index,
-                            integral_type=integral_type,
-                            integral_position=len(infos),
-                            subdomain_id=int(ids[pos]),
-                            kernel=kernel,
-                            needs_custom_data=kernel.mode != "standard",
-                        )
+        for pos, name in enumerate(names):
+            for domain in domains[pos]:
+                kernel = kernels_by_name_domain[(integral_type, name, domain.name)]
+                infos.append(
+                    JITIntegralInfo(
+                        form_index=form_index,
+                        integral_type=integral_type,
+                        integral_position=len(infos),
+                        subdomain_id=int(ids[pos]),
+                        kernel=kernel,
+                        needs_custom_data=kernel.mode != "standard",
                     )
+                )
     return infos
 
 
@@ -268,11 +298,16 @@ def _compile_form_source(
     )
     form_decl, form_impl = ffcx_form.generator(combined_form_ir, options)
 
-    providers = [
-        group.quadrature_provider
-        for group in analysis.groups
-        if group.quadrature_provider is not None
-    ]
+    providers = []
+    for group in analysis.groups:
+        if group.quadrature_providers:
+            providers.extend(
+                provider
+                for provider in group.quadrature_providers.values()
+                if provider is not None
+            )
+        elif group.quadrature_provider is not None:
+            providers.append(group.quadrature_provider)
     unique_provider_ids = {id(provider) for provider in providers}
     quadrature_provider = providers[0] if len(unique_provider_ids) == 1 else None
     module = RunintModule(
@@ -463,6 +498,7 @@ def compile_forms(
         _compute_option_signature(p)
         + _compilation_signature(cffi_extra_compile_args, cffi_debug)
         + _runtime_signature()
+        + _runtime_form_signature(forms)
     )
     module_name = "librunintgen_forms_" + ffcx.naming.compute_signature(
         forms,

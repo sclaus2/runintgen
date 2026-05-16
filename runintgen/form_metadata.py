@@ -385,6 +385,7 @@ class IntegralRuntimeLayout:
         integral_type: Type of integral ("cell", "exterior_facet", etc.).
         ir_index: Index in FFCx IR for this integral type.
         subdomain_id: Subdomain identifier.
+        subdomain_ids: Full FFCx subdomain-id group.
         element_usages: List of IntegralElementUsage for elements in this integral.
         terminal_to_table_slot: Map from (role, terminal_index) to table slot index.
     """
@@ -394,6 +395,12 @@ class IntegralRuntimeLayout:
     subdomain_id: int
     element_usages: list[IntegralElementUsage] = field(default_factory=list)
     terminal_to_table_slot: dict[tuple[Role, int], int] = field(default_factory=dict)
+    subdomain_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Populate grouped subdomain ids for older construction sites."""
+        if not self.subdomain_ids:
+            self.subdomain_ids = (self.subdomain_id,)
 
     def get_table_slot(self, role: Role, terminal_index: int) -> int:
         """Get the table slot for a specific terminal.
@@ -591,6 +598,7 @@ def build_form_runtime_metadata(
             integral_type=itype,
             ir_index=ir_index,
             subdomain_id=subdomain_id,
+            subdomain_ids=integral_info.subdomain_ids,
         )
 
         # Collect elements used in this integral with their max derivatives
@@ -739,6 +747,7 @@ def export_metadata_for_cpp(metadata: FormRuntimeMetadata) -> dict[str, Any]:
             "integral_type": layout.integral_type,
             "ir_index": layout.ir_index,
             "subdomain_id": layout.subdomain_id,
+            "subdomain_ids": list(layout.subdomain_ids),
             "element_usages": element_usages,
             "terminal_to_table_slot": terminal_map,
         }
