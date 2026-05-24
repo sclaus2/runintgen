@@ -53,8 +53,8 @@ factory_runtime_tabulate_tensor = r"""
   const int rule_index = entities->rule_indices[local_index];
   if (rule_index < 0 || rule_index >= quadrature->num_rules)
     return;
-  const int64_t q0 = quadrature->offsets[rule_index];
-  const int64_t q1 = quadrature->offsets[rule_index + 1];
+  const int32_t q0 = quadrature->offsets[rule_index];
+  const int32_t q1 = quadrature->offsets[rule_index + 1];
   if (q0 < 0 || q1 < q0)
     return;
   const runintgen_quadrature_rule rule_storage = {{

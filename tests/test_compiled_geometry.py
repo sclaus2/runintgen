@@ -28,7 +28,7 @@ def test_compiled_per_entity_geometry_maps_and_scales_weights() -> None:
         dtype=np.float64,
     )
     weights = np.array([0.1, 0.2, 0.3], dtype=np.float64)
-    offsets = np.array([0, 2, 3], dtype=np.int64)
+    offsets = np.array([0, 2, 3], dtype=np.int32)
     parent_map = np.array([0, 1], dtype=np.int32)
 
     physical_points, scaled_weights = _basix_runtime.map_per_entity_geometry(

@@ -23,7 +23,7 @@ def _runtime_rules() -> QuadratureRules:
         tdim=2,
         points=np.array([[1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64),
         weights=np.array([0.5], dtype=np.float64),
-        offsets=np.array([0, 1], dtype=np.int64),
+        offsets=np.array([0, 1], dtype=np.int32),
         parent_map=np.array([0], dtype=np.int32),
     )
 
@@ -174,7 +174,7 @@ def test_compile_mixed_entity_runtime_form():
         tdim=2,
         points=np.array([[1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64),
         weights=np.array([0.5], dtype=np.float64),
-        offsets=np.array([0, 1], dtype=np.int64),
+        offsets=np.array([0, 1], dtype=np.int32),
         parent_map=np.array([8], dtype=np.int32),
     )
     dx_mixed = ufl.Measure(

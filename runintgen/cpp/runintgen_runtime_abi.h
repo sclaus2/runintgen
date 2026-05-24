@@ -48,7 +48,7 @@ typedef struct
 {
   int tdim;
   int num_rules;
-  const int64_t* offsets;
+  const int32_t* offsets;
   const double* points;
   const double* weights;
   const int32_t* parent_map;

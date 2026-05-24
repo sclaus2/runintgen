@@ -28,7 +28,7 @@ def _rules(*, physical_points: np.ndarray | None = None) -> QuadratureRules:
     """Return a small runtime quadrature rule set."""
     points = np.array([[0.2, 0.3], [0.6, 0.2]], dtype=np.float64)
     weights = np.array([0.25, 0.25], dtype=np.float64)
-    offsets = np.array([0, 2], dtype=np.int64)
+    offsets = np.array([0, 2], dtype=np.int32)
     kwargs = {}
     if physical_points is not None:
         kwargs["gdim"] = 2

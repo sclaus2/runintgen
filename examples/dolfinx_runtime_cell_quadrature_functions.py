@@ -55,7 +55,7 @@ def _runtime_cell_rules(mesh) -> rig.QuadratureRules:
         tdim=mesh.topology.dim,
         points=np.ascontiguousarray(np.tile(reference_points, (cells.size, 1))),
         weights=np.ascontiguousarray(np.tile(scaled_reference_weights, cells.size)),
-        offsets=np.arange(cells.size + 1, dtype=np.int64) * nq,
+        offsets=np.arange(cells.size + 1, dtype=np.int32) * nq,
         parent_map=cells,
     )
     return rigx.compute_physical_points(mesh, rules)

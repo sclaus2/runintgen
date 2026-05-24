@@ -89,6 +89,7 @@ from .runtime_data import (
     as_runtime_quadrature_payload,
     as_runtime_quadrature_rules,
     build_quadrature_function_value_set,
+    facet_runtime_quadrature_payload,
     to_intptr,
 )
 from .runtime_tables import (
@@ -184,6 +185,7 @@ __all__ = [
     "as_runtime_quadrature_payload",
     "as_runtime_quadrature_rules",
     "build_quadrature_function_value_set",
+    "facet_runtime_quadrature_payload",
     "to_intptr",
     # Runtime tables
     "DerivativeMapping",

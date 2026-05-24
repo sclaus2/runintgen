@@ -69,7 +69,7 @@ def _runtime_rules_for_cells(
         tdim=2,
         points=np.ascontiguousarray(np.tile(points, (len(cells), 1))),
         weights=np.ascontiguousarray((detJ[:, None] * weights[None, :]).ravel()),
-        offsets=np.arange(len(cells) + 1, dtype=np.int64) * nq,
+        offsets=np.arange(len(cells) + 1, dtype=np.int32) * nq,
         parent_map=cells,
     )
 

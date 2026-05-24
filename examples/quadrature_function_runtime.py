@@ -41,7 +41,7 @@ def _runtime_rules() -> QuadratureRules:
     """Return a two-point per-entity rule with component-first physical points."""
     points = np.array([[0.2, 0.3], [0.6, 0.2]], dtype=np.float64)
     weights = np.array([0.25, 0.25], dtype=np.float64)
-    offsets = np.array([0, 2], dtype=np.int64)
+    offsets = np.array([0, 2], dtype=np.int32)
 
     # Storage organisation:
     # - reference points stay point-major: points[q, reference_component]

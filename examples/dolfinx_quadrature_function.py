@@ -58,7 +58,7 @@ def main() -> None:
     weights = np.ascontiguousarray(np.tile(reference_weights, cells.size))
     offsets = np.arange(
         cells.size + 1,
-        dtype=np.int64,
+        dtype=np.int32,
     ) * reference_weights.size
     rules = QuadratureRules(
         kind="per_entity",

@@ -25,12 +25,12 @@ namespace
 using FloatArray = nb::ndarray<nb::numpy, const double, nb::c_contig>;
 using Array1D = nb::ndarray<nb::numpy, const double, nb::ndim<1>, nb::c_contig>;
 using Array2D = nb::ndarray<nb::numpy, const double, nb::ndim<2>, nb::c_contig>;
+using Int32ArrayAny
+    = nb::ndarray<nb::numpy, const std::int32_t, nb::c_contig>;
 using Int32Array
     = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>, nb::c_contig>;
 using Int32Array2D
     = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>, nb::c_contig>;
-using Int64Array
-    = nb::ndarray<nb::numpy, const std::int64_t, nb::ndim<1>, nb::c_contig>;
 using UInt8Array
     = nb::ndarray<nb::numpy, const std::uint8_t, nb::ndim<1>, nb::c_contig>;
 
@@ -350,7 +350,7 @@ nb::tuple map_per_entity_geometry(int cell_type, int degree, int lagrange_varian
                                   int tdim, int gdim,
                                   const FloatArray& points,
                                   const Array1D& weights,
-                                  const Int64Array& offsets,
+                                  const Int32Array& offsets,
                                   const Int32Array& parent_map,
                                   const Array2D& geometry_x,
                                   const Int32Array2D& geometry_dofmap,
@@ -393,8 +393,8 @@ nb::tuple map_per_entity_geometry(int cell_type, int degree, int lagrange_varian
     const std::int32_t cell = parent_map.data()[rule];
     if (cell < 0 || static_cast<std::size_t>(cell) >= geometry_dofmap.shape(0))
       throw std::runtime_error("parent_map contains invalid local cells.");
-    const std::int64_t q0 = offsets.data()[rule];
-    const std::int64_t q1 = offsets.data()[rule + 1];
+    const std::int32_t q0 = offsets.data()[rule];
+    const std::int32_t q1 = offsets.data()[rule + 1];
     map_entity_points(basis, shape, raw_weights, &geometry_dofmap(cell, 0),
                       geometry_x.data(), geometry_x.shape(1), tdim, gdim,
                       static_cast<std::size_t>(q0), static_cast<std::size_t>(q1),
@@ -548,9 +548,9 @@ private:
     const int tdim = object_cast<int>(_quadrature_owner, "tdim");
     FloatArray points = object_cast<FloatArray>(_quadrature_owner, "points");
     Array1D weights = object_cast<Array1D>(_quadrature_owner, "weights");
-    Int64Array offsets = object_cast<Int64Array>(_quadrature_owner, "offsets");
-    Int32Array entity_indices
-        = object_cast<Int32Array>(_quadrature_owner, "entity_indices");
+    Int32Array offsets = object_cast<Int32Array>(_quadrature_owner, "offsets");
+    Int32ArrayAny entity_indices
+        = object_cast<Int32ArrayAny>(_quadrature_owner, "entity_indices");
     UInt8Array is_cut = object_cast<UInt8Array>(_quadrature_owner, "is_cut");
     Int32Array rule_indices
         = object_cast<Int32Array>(_quadrature_owner, "rule_indices");
@@ -589,6 +589,11 @@ private:
           "Runtime quadrature offsets must end at total nq.");
 
     const int num_rules = static_cast<int>(offsets.shape(0) - 1);
+    if (entity_indices.ndim() != 1 && entity_indices.ndim() != 2)
+    {
+      throw std::runtime_error(
+          "Runtime entity indices must be one- or two-dimensional.");
+    }
     if (entity_indices.shape(0) != is_cut.shape(0)
         || entity_indices.shape(0) != rule_indices.shape(0))
     {

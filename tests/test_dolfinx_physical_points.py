@@ -66,7 +66,7 @@ def test_compute_physical_points_for_per_entity_rules() -> None:
         dtype=np.float64,
     )
     weights = np.array([0.1, 0.2, 0.3], dtype=np.float64)
-    offsets = np.array([0, 2, 3], dtype=np.int64)
+    offsets = np.array([0, 2, 3], dtype=np.int32)
     parent_map = np.array([0, 1], dtype=np.int32)
     rules = QuadratureRules(
         kind="per_entity",
@@ -125,7 +125,7 @@ def test_compute_physical_points_requires_parent_map() -> None:
         tdim=2,
         points=np.array([[0.25, 0.25]], dtype=np.float64),
         weights=np.array([0.1], dtype=np.float64),
-        offsets=np.array([0, 1], dtype=np.int64),
+        offsets=np.array([0, 1], dtype=np.int32),
     )
 
     with pytest.raises(ValueError, match="parent_map"):
@@ -139,13 +139,67 @@ def test_compute_physical_points_allows_empty_local_rules() -> None:
         tdim=2,
         points=np.empty((0, 2), dtype=np.float64),
         weights=np.empty(0, dtype=np.float64),
-        offsets=np.array([0], dtype=np.int64),
+        offsets=np.array([0], dtype=np.int32),
         parent_map=np.empty(0, dtype=np.int32),
     )
 
     mapped = compute_physical_points(_FakeMesh(), rules)
 
     assert mapped.physical_points.shape == (2, 0)
+
+
+def test_exterior_facet_payload_maps_points_to_parent_reference() -> None:
+    """Exterior-facet runtime rules should bind to parent-cell reference points."""
+    basix = pytest.importorskip("basix")
+    dolfinx_mesh = pytest.importorskip("dolfinx.mesh")
+    mpi = pytest.importorskip("mpi4py.MPI")
+
+    msh = dolfinx_mesh.create_unit_square(
+        mpi.COMM_WORLD,
+        1,
+        1,
+        cell_type=dolfinx_mesh.CellType.triangle,
+    )
+    topology = msh.topology
+    topology.create_entities(1)
+    topology.create_connectivity(1, topology.dim)
+    exterior_facets = dolfinx_mesh.exterior_facet_indices(topology)
+    facet = np.asarray(exterior_facets, dtype=np.int32)[:1]
+    assert facet.size == 1
+
+    rules = QuadratureRules(
+        kind="per_entity",
+        tdim=1,
+        points=np.array([[0.25], [0.75]], dtype=np.float64),
+        weights=np.array([0.5, 0.5], dtype=np.float64),
+        offsets=np.array([0, 2], dtype=np.int32),
+        parent_map=facet,
+        rule_id="boundary-facet-rule",
+    )
+
+    domain, payload = dolfinx_utils._parent_reference_payload_for_exterior_facets(
+        msh,
+        rules,
+    )
+
+    assert domain.shape == (1, 2)
+    assert payload.entity_indices.shape == (1, 2)
+    assert payload.rules.tdim == msh.topology.dim
+    np.testing.assert_array_equal(payload.rules.parent_map, domain[:, 0])
+    np.testing.assert_array_equal(payload.rules.weights, rules.weights)
+
+    parent_cell = msh.basix_cell()
+    vertices = np.asarray(
+        basix.geometry(parent_cell)[basix.topology(parent_cell)[1][domain[0, 1]]],
+        dtype=np.float64,
+    )
+    expected = np.vstack(
+        [
+            (1.0 - 0.25) * vertices[0] + 0.25 * vertices[1],
+            (1.0 - 0.75) * vertices[0] + 0.75 * vertices[1],
+        ]
+    )
+    np.testing.assert_allclose(payload.rules.points, expected)
 
 
 def test_dolfinx_quadrature_function_factory_tags_function(monkeypatch) -> None:
@@ -182,7 +236,7 @@ def test_dolfinx_quadrature_function_factory_tags_function(monkeypatch) -> None:
         tdim=2,
         points=np.array([[0.25, 0.25]], dtype=np.float64),
         weights=np.array([0.1], dtype=np.float64),
-        offsets=np.array([0, 1], dtype=np.int64),
+        offsets=np.array([0, 1], dtype=np.int32),
         rule_id="rule",
     )
     values = np.array([2.0], dtype=np.float64)
@@ -219,7 +273,7 @@ def test_background_dolfinx_evaluator_uses_parent_cells() -> None:
         gdim=2,
         points=np.array([[0.25, 0.25], [0.5, 0.25]], dtype=np.float64),
         weights=np.array([0.1, 0.2], dtype=np.float64),
-        offsets=np.array([0, 1, 2], dtype=np.int64),
+        offsets=np.array([0, 1, 2], dtype=np.int32),
         parent_map=np.array([7, 8], dtype=np.int32),
         physical_points=np.array([[0.2, 0.6], [0.4, 0.8]], dtype=np.float64),
     )

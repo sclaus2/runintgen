@@ -109,7 +109,7 @@ def _runtime_rules_for_cells(mesh, cells: np.ndarray) -> QuadratureRules:
         tdim=mesh.topology.dim,
         points=np.ascontiguousarray(np.tile(points, (cells.size, 1))),
         weights=np.ascontiguousarray((detj[:, None] * weights[None, :]).ravel()),
-        offsets=np.arange(cells.size + 1, dtype=np.int64) * nq,
+        offsets=np.arange(cells.size + 1, dtype=np.int32) * nq,
         parent_map=cells,
     )
 

@@ -12,6 +12,8 @@ from runintgen.measures import (
     RUNTIME_QUADRATURE_RULE,
     RuntimeIntegralMode,
     RuntimeMeasure,
+    dSq,
+    dsq,
     dxq,
     get_quadrature_provider,
     is_runtime_integral,
@@ -190,6 +192,21 @@ class TestIsRuntimeIntegral:
         integral = (x[0] * dx1).integrals()[0]
         assert is_runtime_integral(integral) is True
         assert get_quadrature_provider(integral) is quadrature_rule
+
+    def test_runtime_facet_measure_helpers_use_fenicsx_integral_types(self, mesh):
+        """Facet helpers should remain ordinary ds/dS measures with runtime data."""
+        exterior_provider = object()
+        interior_provider = object()
+
+        ds_rt = dsq(domain=mesh, quadrature_provider=exterior_provider)
+        dS_rt = dSq(domain=mesh, quadrature_provider=interior_provider)
+
+        assert ds_rt.integral_type() == "exterior_facet"
+        assert dS_rt.integral_type() == "interior_facet"
+        assert ds_rt.subdomain_data() is exterior_provider
+        assert dS_rt.subdomain_data() is interior_provider
+        assert ds_rt.metadata()["quadrature_rule"] == RUNTIME_QUADRATURE_RULE
+        assert dS_rt.metadata()["quadrature_rule"] == RUNTIME_QUADRATURE_RULE
 
     def test_runtime_measure_rejects_ambiguous_provider_arguments(self, mesh):
         """Test provider aliases cannot both be supplied."""

@@ -444,14 +444,103 @@ def _default_cell_entities(mesh: Any) -> npt.NDArray[np.int32]:
     return np.arange(num_cells, dtype=np.int32)
 
 
+def _facet_domain_from_parent_map(
+    mesh: Any,
+    parent_map: npt.NDArray[np.int32],
+    integral_type: str,
+) -> npt.NDArray[np.int32]:
+    """Convert geometric facet ids to DOLFINx facet integration rows."""
+    tdim = int(mesh.topology.dim)
+    if tdim < 1:
+        raise ValueError("Facet runtime quadrature requires a positive mesh tdim.")
+    facet_dim = tdim - 1
+    topology = mesh.topology
+    topology.create_entities(facet_dim)
+    topology.create_connectivity(facet_dim, tdim)
+    topology.create_connectivity(tdim, facet_dim)
+    facet_to_cell = topology.connectivity(facet_dim, tdim)
+    cell_to_facet = topology.connectivity(tdim, facet_dim)
+    if facet_to_cell is None or cell_to_facet is None:
+        raise RuntimeError("Mesh facet-cell connectivity is unavailable.")
+
+    rows: list[list[int]] = []
+    for raw_facet in parent_map:
+        facet = int(raw_facet)
+        cells = np.asarray(facet_to_cell.links(facet), dtype=np.int32)
+        if integral_type == "exterior_facet":
+            if cells.size != 1:
+                raise ValueError(
+                    "Runtime exterior-facet quadrature received a facet "
+                    "that is not on the exterior boundary."
+                )
+            cell = int(cells[0])
+            local_facets = np.asarray(cell_to_facet.links(cell), dtype=np.int32)
+            matches = np.flatnonzero(local_facets == facet)
+            if matches.size != 1:
+                raise RuntimeError("Could not resolve local facet index.")
+            rows.append([cell, int(matches[0])])
+        elif integral_type == "interior_facet":
+            if cells.size != 2:
+                raise ValueError(
+                    "Runtime interior-facet quadrature received a facet "
+                    "without exactly two adjacent local cells."
+                )
+            row: list[int] = []
+            for cell in cells:
+                local_facets = np.asarray(cell_to_facet.links(int(cell)), dtype=np.int32)
+                matches = np.flatnonzero(local_facets == facet)
+                if matches.size != 1:
+                    raise RuntimeError("Could not resolve local facet index.")
+                row.extend([int(cell), int(matches[0])])
+            rows.append(row)
+        else:
+            raise ValueError(f"Unsupported facet runtime integral {integral_type!r}.")
+
+    return np.ascontiguousarray(rows, dtype=np.int32)
+
+
 def _points_as_2d(
     points: npt.NDArray[np.float64],
     tdim: int,
 ) -> npt.NDArray[np.float64]:
     """Return reference points with shape ``(num_points, tdim)``."""
+    if tdim == 0:
+        if points.ndim == 2:
+            return points
+        return points.reshape((-1, 0))
     if points.ndim == 2:
         return points
     return points.reshape((-1, tdim))
+
+
+def _parent_reference_payload_for_exterior_facets(
+    mesh: Any,
+    provider: Any,
+) -> tuple[npt.NDArray[np.int32], Any]:
+    """Build a kernel payload for runtime exterior-facet quadrature."""
+    from runintgen.runtime_data import (
+        as_runtime_quadrature_payload,
+        facet_runtime_quadrature_payload,
+    )
+
+    payload = as_runtime_quadrature_payload(provider)
+    rules = payload.rules
+    if rules.parent_map is None:
+        raise RuntimeError(
+            "Runtime exterior-facet quadrature requires QuadratureRules.parent_map "
+            "with local facet ids."
+        )
+
+    facet_domain = _facet_domain_from_parent_map(
+        mesh,
+        np.asarray(rules.parent_map, dtype=np.int32),
+        "exterior_facet",
+    )
+    return facet_domain, facet_runtime_quadrature_payload(
+        parent_cell_type=_mesh_basix_cell(mesh),
+        quadrature=payload,
+        entity_indices=facet_domain,
+    )
 
 
 def _as_contiguous_array(value: Any, dtype: npt.DTypeLike) -> np.ndarray:
@@ -462,11 +551,33 @@ def _as_contiguous_array(value: Any, dtype: npt.DTypeLike) -> np.ndarray:
     return np.ascontiguousarray(array)
 
 
+def _mesh_basix_cell(mesh: Any) -> Any:
+    """Return the Basix cell type for a Python or C++ DOLFINx mesh."""
+    if hasattr(mesh, "basix_cell"):
+        return mesh.basix_cell()
+
+    topology = getattr(mesh, "topology", None)
+    cell_type = getattr(topology, "cell_type", None)
+    name = getattr(cell_type, "name", None)
+    if name is None:
+        raise TypeError("Could not determine the mesh Basix cell type.")
+
+    import basix
+
+    try:
+        return getattr(basix.CellType, str(name))
+    except AttributeError as exc:
+        raise TypeError(
+            f"Could not map DOLFINx cell type {name!r} to a Basix cell type."
+        ) from exc
+
+
 def _basix_cell_type_id(mesh: Any) -> int | None:
     """Return the Basix cell type id for a DOLFINx mesh if available."""
-    if not hasattr(mesh, "basix_cell"):
+    try:
+        return int(_mesh_basix_cell(mesh))
+    except (AttributeError, TypeError):
         return None
-    return int(mesh.basix_cell())
 
 
 def _compiled_physical_points(mesh: Any, rules: "QuadratureRules", gdim: int) -> Any:
@@ -803,12 +914,6 @@ def _runtime_domain_and_custom_data(
     from runintgen.basix_runtime import CustomData
     from runintgen.runtime_data import as_runtime_quadrature_payload
 
-    if integral_type != "cell":
-        raise NotImplementedError(
-            "runintgen.dolfinx.form currently supports runtime cell "
-            f"integrals only, got {integral_type!r}."
-        )
-
     providers = _runtime_providers(compiled.jit_info)
     provider = providers.get((integral_type, subdomain_id))
     if provider is None:
@@ -817,11 +922,30 @@ def _runtime_domain_and_custom_data(
             f"{integral_type} subdomain {subdomain_id}."
         )
 
-    payload = as_runtime_quadrature_payload(provider)
-    if payload.parent_map is None:
-        raise RuntimeError(
-            "DOLFINx runtime quadrature requires QuadratureRules.parent_map "
-            "so per-entity rules can be mapped to mesh entities."
+    if integral_type == "cell":
+        payload = as_runtime_quadrature_payload(provider)
+        if payload.parent_map is None:
+            raise RuntimeError(
+                "DOLFINx runtime quadrature requires QuadratureRules.parent_map "
+                "so per-entity rules can be mapped to mesh entities."
+            )
+        entities = np.ascontiguousarray(payload.entity_indices, dtype=np.int32)
+        quadrature_provider = provider
+    elif integral_type == "exterior_facet":
+        entities, quadrature_provider = _parent_reference_payload_for_exterior_facets(
+            mesh,
+            provider,
+        )
+    elif integral_type == "interior_facet":
+        raise NotImplementedError(
+            "Runtime interior-facet assembly needs separate parent-reference "
+            "point maps for the two facet sides. The current runintgen custom "
+            "data ABI carries one runtime point map per quadrature rule."
+        )
+    else:
+        raise NotImplementedError(
+            "runintgen.dolfinx.form does not support runtime "
+            f"{integral_type!r} integrals yet."
         )
 
     data_ptr = _resolve_custom_data(
@@ -838,7 +962,7 @@ def _runtime_domain_and_custom_data(
             quadrature = _quadrature_for_custom_data(
                 mesh,
                 compiled.jit_info.module,
-                provider,
+                quadrature_provider,
             )
             owner = CustomData(
                 compiled.jit_info.module,
@@ -850,7 +974,6 @@ def _runtime_domain_and_custom_data(
             cache[cache_key] = owner
         data_ptr = int(owner.ptr)
 
-    entities = np.ascontiguousarray(payload.entity_indices, dtype=np.int32)
     return entities, data_ptr, owner
 
 

@@ -80,7 +80,7 @@ class QuadratureRules:
     tdim: int
     points: npt.NDArray[np.float64]
     weights: npt.NDArray[np.float64]
-    offsets: npt.NDArray[np.int64] | None = None
+    offsets: npt.NDArray[np.int32] | None = None
     parent_map: npt.NDArray[np.int32] | None = None
     rule_id: str | None = None
     kind: str = "per_entity"
@@ -90,8 +90,8 @@ class QuadratureRules:
     def __post_init__(self) -> None:
         """Validate borrowed quadrature buffers."""
         self.tdim = int(self.tdim)
-        if self.tdim <= 0:
-            raise ValueError("tdim must be positive.")
+        if self.tdim < 0:
+            raise ValueError("tdim must be non-negative.")
         if self.kind not in {"per_entity", "shared"}:
             raise ValueError("kind must be 'per_entity' or 'shared'.")
         if self.rule_id is None:
@@ -127,7 +127,7 @@ class QuadratureRules:
             if self.offsets is None:
                 raise ValueError("per-entity quadrature rules require offsets.")
             self.offsets = _borrow_array(
-                self.offsets, dtype=np.dtype(np.int64), name="offsets"
+                self.offsets, dtype=np.dtype(np.int32), name="offsets"
             )
             if self.offsets.ndim != 1 or self.offsets.size == 0:
                 raise ValueError("offsets must be a non-empty 1D array.")
@@ -253,7 +253,7 @@ class QuadratureRules:
 
         points = np.ascontiguousarray(np.vstack(point_blocks), dtype=np.float64)
         weights = np.ascontiguousarray(np.concatenate(weight_blocks), dtype=np.float64)
-        offset_array = np.asarray(offsets, dtype=np.int64)
+        offset_array = np.asarray(offsets, dtype=np.int32)
         parent_array = (
             None
             if parent_map is None
@@ -288,14 +288,12 @@ class RuntimeEntityMap:
         self.rule_indices = _borrow_array(
             self.rule_indices, dtype=np.dtype(np.int32), name="rule_indices"
         )
-        if (
-            self.entity_indices.ndim != 1
-            or self.is_cut.ndim != 1
-            or self.rule_indices.ndim != 1
-        ):
-            raise ValueError("entity map arrays must be 1D.")
+        if self.entity_indices.ndim not in {1, 2}:
+            raise ValueError("entity_indices must be 1D or 2D.")
+        if self.is_cut.ndim != 1 or self.rule_indices.ndim != 1:
+            raise ValueError("is_cut and rule_indices must be 1D.")
         if not (
-            self.entity_indices.size
+            self.entity_indices.shape[0]
             == self.is_cut.size
             == self.rule_indices.size
         ):
@@ -304,7 +302,7 @@ class RuntimeEntityMap:
     @property
     def num_entities(self) -> int:
         """Number of integration-loop entities."""
-        return int(self.entity_indices.size)
+        return int(self.entity_indices.shape[0])
 
     @classmethod
     def runtime_only(cls, rules: QuadratureRules) -> "RuntimeEntityMap":
@@ -329,25 +327,39 @@ class RuntimeEntityMap:
     ) -> "RuntimeEntityMap":
         """Build an entity map from standard entities and per-entity rules."""
         standard = np.ascontiguousarray(standard_entities, dtype=np.int32)
-        if standard.ndim != 1:
-            standard = np.ravel(standard)
+        if standard.ndim not in {1, 2}:
+            raise ValueError("standard_entities must be 1D or 2D.")
         runtime_entities = (
             rules.parent_map
             if rules.parent_map is not None
             else np.arange(rules.num_rules, dtype=np.int32)
         )
+        if standard.size and standard.ndim != runtime_entities.ndim:
+            raise ValueError(
+                "standard_entities and runtime entity indices must have "
+                "matching rank."
+            )
+        if (
+            standard.size
+            and standard.ndim == 2
+            and standard.shape[1] != runtime_entities.shape[1]
+        ):
+            raise ValueError(
+                "standard_entities and runtime entity rows must have the "
+                "same width."
+            )
         entity_indices = np.ascontiguousarray(
-            np.concatenate([standard, runtime_entities]), dtype=np.int32
+            np.concatenate([standard, runtime_entities], axis=0), dtype=np.int32
         )
         is_cut = np.concatenate(
             [
-                np.zeros(standard.size, dtype=np.uint8),
-                np.ones(runtime_entities.size, dtype=np.uint8),
+                np.zeros(standard.shape[0], dtype=np.uint8),
+                np.ones(runtime_entities.shape[0], dtype=np.uint8),
             ]
         )
         rule_indices = np.concatenate(
             [
-                np.full(standard.size, -1, dtype=np.int32),
+                np.full(standard.shape[0], -1, dtype=np.int32),
                 np.arange(rules.num_rules, dtype=np.int32),
             ]
         )
@@ -392,7 +404,7 @@ class RuntimeQuadraturePayload:
         return self.rules.weights
 
     @property
-    def offsets(self) -> npt.NDArray[np.int64]:
+    def offsets(self) -> npt.NDArray[np.int32]:
         """Rule offsets in quadrature-point units."""
         return self.rules.offsets
 
@@ -425,6 +437,135 @@ class RuntimeQuadraturePayload:
     def num_entities(self) -> int:
         """Number of integration-loop entities."""
         return self.entities.num_entities
+
+
+def _points_as_2d(
+    points: npt.NDArray[np.float64],
+    tdim: int,
+) -> npt.NDArray[np.float64]:
+    """Return reference points with shape ``(num_points, tdim)``."""
+    if points.ndim == 2:
+        return points
+    return points.reshape((-1, tdim))
+
+
+def _map_facet_points_to_parent_reference(
+    *,
+    parent_cell_type: Any,
+    rules: QuadratureRules,
+    entity_indices: npt.NDArray[np.int32],
+    local_facet_column: int,
+) -> npt.NDArray[np.float64]:
+    """Map facet-chart quadrature points into the parent reference cell."""
+    import basix
+
+    if entity_indices.ndim != 2:
+        raise ValueError("facet entity_indices must be a 2D array.")
+    if local_facet_column < 0 or local_facet_column >= entity_indices.shape[1]:
+        raise ValueError("local_facet_column is outside entity_indices width.")
+
+    parent_cell = basix.CellType(parent_cell_type)
+    geometry = np.asarray(basix.geometry(parent_cell), dtype=np.float64)
+    topology = basix.topology(parent_cell)
+    parent_tdim = len(topology) - 1
+    facet_tdim = parent_tdim - 1
+    if facet_tdim < 0:
+        raise ValueError("Facet mapping requires a positive-dimensional parent cell.")
+    if rules.tdim != facet_tdim:
+        raise ValueError(
+            "Facet runtime quadrature points must have tdim equal to parent "
+            f"tdim - 1 ({facet_tdim}); got {rules.tdim}."
+        )
+    if rules.offsets is None:
+        raise ValueError("per-entity facet QuadratureRules require offsets.")
+    if entity_indices.shape[0] != rules.num_rules:
+        raise ValueError("entity_indices must have one row per quadrature rule.")
+
+    facet_topology = topology[facet_tdim]
+    facet_points = (
+        np.empty((rules.weights.size, 0), dtype=np.float64)
+        if rules.tdim == 0
+        else _points_as_2d(rules.points, rules.tdim)
+    )
+    mapped = np.empty((rules.weights.size, parent_tdim), dtype=np.float64)
+
+    for rule_index in range(rules.num_rules):
+        q0 = int(rules.offsets[rule_index])
+        q1 = int(rules.offsets[rule_index + 1])
+        local_facet = int(entity_indices[rule_index, local_facet_column])
+        vertices = geometry[np.asarray(facet_topology[local_facet], dtype=np.int32)]
+        points = facet_points[q0:q1]
+
+        if facet_tdim == 0:
+            mapped[q0:q1, :] = vertices[0]
+        elif facet_tdim == 1:
+            s = points[:, 0:1]
+            mapped[q0:q1, :] = (1.0 - s) * vertices[0] + s * vertices[1]
+        elif facet_tdim == 2:
+            r = points[:, 0:1]
+            s = points[:, 1:2]
+            mapped[q0:q1, :] = (
+                (1.0 - r - s) * vertices[0] + r * vertices[1] + s * vertices[2]
+            )
+        else:
+            raise NotImplementedError(
+                "Runtime facet point mapping currently supports intervals, "
+                "triangles, and tetrahedra."
+            )
+
+    return np.ascontiguousarray(mapped, dtype=np.float64)
+
+
+def facet_runtime_quadrature_payload(
+    *,
+    parent_cell_type: Any,
+    quadrature: Any,
+    entity_indices: npt.ArrayLike,
+    local_facet_column: int = 1,
+) -> RuntimeQuadraturePayload:
+    """Build a parent-reference runtime payload for facet integration.
+
+    ``quadrature`` is the geometric rule set on the reference facet cell.
+    ``entity_indices`` are the DOLFINx-shaped loop rows that identify where the
+    facet lives in each parent cell, for example ``(cell, local_facet)`` for
+    exterior facets. The returned payload is directly consumable by the
+    Basix-only ``CustomData`` backend.
+    """
+    source_payload = as_runtime_quadrature_payload(quadrature)
+    source_rules = source_payload.rules
+    rows = np.ascontiguousarray(entity_indices, dtype=np.int32)
+    mapped_points = _map_facet_points_to_parent_reference(
+        parent_cell_type=parent_cell_type,
+        rules=source_rules,
+        entity_indices=rows,
+        local_facet_column=local_facet_column,
+    )
+
+    mapped_rules = QuadratureRules(
+        tdim=mapped_points.shape[1],
+        points=mapped_points,
+        weights=source_rules.weights,
+        offsets=source_rules.offsets,
+        parent_map=np.ascontiguousarray(rows[:, local_facet_column - 1], dtype=np.int32)
+        if local_facet_column > 0
+        else source_rules.parent_map,
+        rule_id=source_rules.rule_id,
+        kind=source_rules.kind,
+        gdim=source_rules.gdim,
+        physical_points=getattr(source_rules, "__dict__", {}).get(
+            "physical_points", None
+        ),
+    )
+    entities = RuntimeEntityMap(
+        entity_indices=rows,
+        is_cut=np.ones(rows.shape[0], dtype=np.uint8),
+        rule_indices=np.arange(rows.shape[0], dtype=np.int32),
+    )
+    return RuntimeQuadraturePayload(
+        rules=mapped_rules,
+        entities=entities,
+        quadrature_functions=source_payload.quadrature_functions,
+    )
 
 
 @dataclass
@@ -595,8 +736,8 @@ def _is_rule_like(value: Any) -> bool:
 def _entity_array(value: Any) -> npt.NDArray[np.int32]:
     """Return entity ids as a contiguous int32 array."""
     entities = np.ascontiguousarray(value, dtype=np.int32)
-    if entities.ndim != 1:
-        entities = np.ravel(entities)
+    if entities.ndim not in {1, 2}:
+        raise ValueError("entity subdomain data must be 1D or 2D.")
     return entities
 
 
@@ -761,7 +902,7 @@ class RuntimeContextBuilder:
         self._refs.append(c_quadrature)
         c_quadrature.tdim = rules.tdim
         c_quadrature.num_rules = rules.num_rules
-        c_quadrature.offsets = ffi.cast("const int64_t*", rules.offsets.ctypes.data)
+        c_quadrature.offsets = ffi.cast("const int32_t*", rules.offsets.ctypes.data)
         c_quadrature.points = ffi.cast("const double*", rules.points.ctypes.data)
         c_quadrature.weights = ffi.cast("const double*", rules.weights.ctypes.data)
         c_quadrature.parent_map = (

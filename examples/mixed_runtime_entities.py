@@ -133,7 +133,7 @@ def main() -> None:
         dtype=np.float64,
     )
     weights = np.array([0.5, 0.2, 0.2, 0.2, 0.15], dtype=np.float64)
-    offsets = np.array([0, 1, 3, 5], dtype=np.int64)
+    offsets = np.array([0, 1, 3, 5], dtype=np.int32)
     runtime_rules = QuadratureRules(
         kind="per_entity",
         tdim=2,

@@ -123,7 +123,7 @@ class TestCodeGeneration:
         assert "int nq;" in struct_def
         assert "const double* points;" in struct_def
         assert "const double* weights;" in struct_def
-        assert "const int64_t* offsets;" in struct_def
+        assert "const int32_t* offsets;" in struct_def
         assert "const int32_t* entity_indices;" in struct_def
         assert "const int32_t* rule_indices;" in struct_def
 
@@ -250,7 +250,7 @@ class TestCodeGeneration:
             tdim=2,
             points=np.array([1.0 / 3.0, 1.0 / 3.0], dtype=np.float64),
             weights=np.array([0.5], dtype=np.float64),
-            offsets=np.array([0, 1], dtype=np.int64),
+            offsets=np.array([0, 1], dtype=np.int32),
             parent_map=np.array([8], dtype=np.int32),
         )
 
