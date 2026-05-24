@@ -46,10 +46,18 @@ inline int tabulate_runtime_table(const Element& element,
     return 2;
   if (request->derivative_order < 0)
     return 2;
-  if (request->is_permuted)
-    return 3;
   if (request->slot < 0)
     return 6;
+  if (request->point_set < 0 || request->point_set > 1)
+    return 7;
+
+  runintgen_quadrature_rule selected_rule = *rule;
+  if (request->point_set == 1)
+  {
+    if (rule->secondary_points == nullptr)
+      return 8;
+    selected_rule.points = rule->secondary_points;
+  }
 
   try
   {
@@ -61,7 +69,8 @@ inline int tabulate_runtime_table(const Element& element,
     std::vector<double>& basis
         = std::forward<BasisForSlot>(basis_for_slot)(request->slot);
     const std::array<std::size_t, 4> view_shape = shape;
-    tabulate_basis(element, request->derivative_order, *rule, basis, shape);
+    tabulate_basis(element, request->derivative_order, selected_rule, basis,
+                   shape);
 
     view->values = basis.data();
     view->num_derivatives = static_cast<int>(view_shape[0]);

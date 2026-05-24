@@ -61,6 +61,9 @@ factory_runtime_tabulate_tensor = r"""
       .nq = (int)(q1 - q0),
       .tdim = quadrature->tdim,
       .points = quadrature->points + q0 * quadrature->tdim,
+      .secondary_points = quadrature->secondary_points == 0
+          ? 0
+          : quadrature->secondary_points + q0 * quadrature->tdim,
       .weights = quadrature->weights + q0,
   }};
   const runintgen_quadrature_rule* rule = &rule_storage;

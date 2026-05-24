@@ -488,11 +488,11 @@ def compile_forms(
     p["sum_factorization"] = False
 
     if np.issubdtype(np.dtype(p["scalar_type"]), np.complexfloating):
-        raise NotImplementedError("runintgen.dolfinx currently supports float64 only.")
+        raise NotImplementedError("runintgen JIT currently supports float64 only.")
 
     dtype = np.dtype(p["scalar_type"])
     if dtype != np.dtype(np.float64):
-        raise NotImplementedError("runintgen.dolfinx currently supports float64 only.")
+        raise NotImplementedError("runintgen JIT currently supports float64 only.")
 
     signature_tag = (
         _compute_option_signature(p)

@@ -13,6 +13,7 @@ import numpy.typing as npt
 import ufl
 
 QuadratureFunctionCallable = Callable[[npt.NDArray[np.float64]], npt.ArrayLike]
+QuadratureFunctionSource = QuadratureFunctionCallable | Any
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,7 @@ class QuadratureFunction(ufl.Coefficient):
     def __init__(
         self,
         space_or_domain: Any,
-        source: QuadratureFunctionCallable | None = None,
+        source: QuadratureFunctionSource | None = None,
         *,
         name: str | None = None,
         shape: tuple[int, ...] = (),
@@ -106,6 +107,7 @@ class QuadratureFunction(ufl.Coefficient):
         )
         self._runintgen_source = source
         self._runintgen_values: dict[str, npt.ArrayLike] = {}
+        self._runintgen_cache: dict[Any, npt.ArrayLike] = {}
 
     def set_values(self, quadrature: Any, values: npt.ArrayLike) -> None:
         """Attach explicit provider-owned values for one quadrature rule set."""
@@ -113,6 +115,26 @@ class QuadratureFunction(ufl.Coefficient):
         if rule_id is None:
             raise TypeError("quadrature must carry a stable rule_id.")
         self._runintgen_values[str(rule_id)] = values
+        self._runintgen_cache.pop(str(rule_id), None)
+
+    def set_evaluator(self, evaluator: Any) -> None:
+        """Attach a context-aware evaluator source and clear cached values."""
+        self._runintgen_source = evaluator
+        self._runintgen_cache.clear()
+
+    def invalidate(self) -> None:
+        """Clear cached quadrature values for this coefficient."""
+        self._runintgen_cache.clear()
+        invalidate = getattr(self._runintgen_source, "invalidate", None)
+        if invalidate is not None:
+            invalidate()
+
+    def update(self, *, version: int | None = None) -> None:
+        """Notify the evaluator that its source data changed."""
+        update = getattr(self._runintgen_source, "update", None)
+        if update is not None:
+            update(version=version)
+        self._runintgen_cache.clear()
 
     def is_cellwise_constant(self) -> bool:
         """Return false so UFL does not simplify derivatives to zero.
@@ -135,7 +157,7 @@ def quadrature_function_spec(value: Any) -> QuadratureFunctionSpec:
     return getattr(value, "_runintgen_quadrature_function")
 
 
-def quadrature_function_source(value: Any) -> QuadratureFunctionCallable | None:
+def quadrature_function_source(value: Any) -> QuadratureFunctionSource | None:
     """Return the optional callable source attached to a quadrature function."""
     return getattr(value, "_runintgen_source", None)
 
@@ -143,6 +165,15 @@ def quadrature_function_source(value: Any) -> QuadratureFunctionCallable | None:
 def quadrature_function_values(value: Any) -> dict[str, npt.ArrayLike]:
     """Return explicit rule-bound values attached to a quadrature function."""
     return getattr(value, "_runintgen_values", {})
+
+
+def quadrature_function_cache(value: Any) -> dict[Any, npt.ArrayLike]:
+    """Return evaluator cache storage attached to a quadrature function."""
+    cache = getattr(value, "_runintgen_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(value, "_runintgen_cache", cache)
+    return cache
 
 
 def expression_quadrature_functions(value: Any) -> tuple[ufl.Coefficient, ...]:
@@ -251,11 +282,13 @@ __all__ = [
     "QuadratureFunctionCallable",
     "QuadratureFunctionInfo",
     "QuadratureFunctionSpec",
+    "QuadratureFunctionSource",
     "collect_quadrature_function_infos",
     "expression_quadrature_functions",
     "form_quadrature_functions",
     "integral_quadrature_functions",
     "is_quadrature_function",
+    "quadrature_function_cache",
     "quadrature_function_space",
     "quadrature_function_source",
     "quadrature_function_spec",

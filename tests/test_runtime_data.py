@@ -14,6 +14,7 @@ from runintgen.runtime_data import (
     RuntimeQuadraturePayload,
     as_runtime_quadrature_payload,
     facet_runtime_quadrature_payload,
+    interior_facet_runtime_quadrature_payload,
 )
 
 
@@ -65,6 +66,20 @@ def test_runtime_payload_collects_mixed_form_entities() -> None:
     )
     np.testing.assert_array_equal(payload.is_cut, [0, 0, 0, 0, 1, 1, 1])
     np.testing.assert_array_equal(payload.rule_indices, [-1, -1, -1, -1, 0, 1, 2])
+
+
+def test_runtime_payload_rejects_duplicate_mixed_entities() -> None:
+    """Mixed standard/runtime payloads should fail on double-counting."""
+    rules = QuadratureRules(
+        tdim=2,
+        points=np.array([[1.0 / 3.0, 1.0 / 3.0]], dtype=np.float64),
+        weights=np.array([0.5], dtype=np.float64),
+        offsets=np.array([0, 1], dtype=np.int32),
+        parent_map=np.array([8], dtype=np.int32),
+    )
+
+    with pytest.raises(ValueError, match="duplicate standard/runtime entities"):
+        as_runtime_quadrature_payload([np.array([1, 8], dtype=np.int32), rules])
 
 
 def test_runtime_entity_map_accepts_facet_rows() -> None:
@@ -225,6 +240,56 @@ def test_facet_runtime_payload_maps_triangle_facets_to_parent_cell() -> None:
     np.testing.assert_allclose(payload.rules.points, expected)
 
 
+def test_interior_facet_runtime_payload_maps_both_triangle_sides() -> None:
+    """Interior-facet payloads should carry plus and minus parent references."""
+    basix = pytest.importorskip("basix")
+    points = np.array([[0.25], [0.75], [0.5]], dtype=np.float64)
+    weights = np.array([0.2, 0.3, 0.4], dtype=np.float64)
+    offsets = np.array([0, 2, 3], dtype=np.int32)
+    rules = QuadratureRules(
+        tdim=1,
+        points=points,
+        weights=weights,
+        offsets=offsets,
+        parent_map=np.array([6, 7], dtype=np.int32),
+    )
+    rows = np.array([[10, 0, 11, 1], [12, 1, 13, 2]], dtype=np.int32)
+
+    payload = interior_facet_runtime_quadrature_payload(
+        parent_cell_type=basix.CellType.triangle,
+        quadrature=rules,
+        entity_indices=rows,
+    )
+
+    assert payload.rules.tdim == 2
+    assert payload.entity_indices.shape == (2, 4)
+    assert payload.rules.secondary_points is not None
+    np.testing.assert_array_equal(payload.rules.parent_map, rows[:, 0])
+    np.testing.assert_array_equal(payload.rules.weights, weights)
+
+    geometry = np.asarray(basix.geometry(basix.CellType.triangle), dtype=np.float64)
+    topology = basix.topology(basix.CellType.triangle)
+    facet0 = geometry[np.asarray(topology[1][0], dtype=np.int32)]
+    facet1 = geometry[np.asarray(topology[1][1], dtype=np.int32)]
+    facet2 = geometry[np.asarray(topology[1][2], dtype=np.int32)]
+    expected_side0 = np.vstack(
+        [
+            (1.0 - 0.25) * facet0[0] + 0.25 * facet0[1],
+            (1.0 - 0.75) * facet0[0] + 0.75 * facet0[1],
+            (1.0 - 0.5) * facet1[0] + 0.5 * facet1[1],
+        ]
+    )
+    expected_side1 = np.vstack(
+        [
+            (1.0 - 0.25) * facet1[0] + 0.25 * facet1[1],
+            (1.0 - 0.75) * facet1[0] + 0.75 * facet1[1],
+            (1.0 - 0.5) * facet2[0] + 0.5 * facet2[1],
+        ]
+    )
+    np.testing.assert_allclose(payload.rules.points, expected_side0)
+    np.testing.assert_allclose(payload.rules.secondary_points, expected_side1)
+
+
 def test_facet_runtime_payload_handles_interval_boundary_points() -> None:
     """Point facets of an interval map to parent interval reference points."""
     basix = pytest.importorskip("basix")
@@ -301,3 +366,76 @@ def test_basix_custom_data_accepts_facet_payload_rows() -> None:
 
     assert custom_data.num_rules == 2
     assert custom_data.num_entities == 2
+
+
+def test_basix_custom_data_accepts_interior_facet_payload_rows() -> None:
+    """The Basix-only CustomData backend should accept interior-facet rows."""
+    basix = pytest.importorskip("basix")
+    pytest.importorskip("runintgen._basix_runtime")
+    from runintgen.basix_runtime import CustomData
+    from runintgen.form_metadata import (
+        FormRuntimeMetadata,
+        Role,
+        element_key_from_basix,
+    )
+
+    rules = QuadratureRules(
+        tdim=1,
+        points=np.array([[0.25], [0.75]], dtype=np.float64),
+        weights=np.array([0.5, 0.5], dtype=np.float64),
+        offsets=np.array([0, 1, 2], dtype=np.int32),
+        parent_map=np.array([5, 6], dtype=np.int32),
+    )
+    payload = interior_facet_runtime_quadrature_payload(
+        parent_cell_type=basix.CellType.triangle,
+        quadrature=rules,
+        entity_indices=np.array([[3, 0, 4, 1], [5, 1, 6, 2]], dtype=np.int32),
+    )
+
+    element = basix.create_element(
+        basix.ElementFamily.P, basix.CellType.triangle, 1
+    )
+    metadata = FormRuntimeMetadata()
+    metadata.add_unique_element(element_key_from_basix(element), element, Role.TEST, 0)
+    custom_data = CustomData(metadata, payload)
+
+    ffi = cffi.FFI()
+    ffi.cdef(CFFI_DEF)
+    ctx = ffi.cast("runintgen_context*", custom_data.ptr)
+    q0 = int(ctx.quadrature.offsets[0])
+    q1 = int(ctx.quadrature.offsets[1])
+
+    rule = ffi.new("runintgen_quadrature_rule*")
+    rule.nq = q1 - q0
+    rule.tdim = ctx.quadrature.tdim
+    rule.points = ctx.quadrature.points + q0 * ctx.quadrature.tdim
+    rule.secondary_points = (
+        ctx.quadrature.secondary_points + q0 * ctx.quadrature.tdim
+    )
+    rule.weights = ctx.quadrature.weights + q0
+
+    request = ffi.new("runintgen_table_request*")
+    request.slot = 0
+    request.derivative_order = 0
+    request.is_permuted = 0
+
+    primary_view = ffi.new("runintgen_table_view*")
+    primary_status = ctx.form.elements[0].tabulate(
+        ctx.form.elements, rule, request, primary_view
+    )
+
+    request.point_set = 1
+    secondary_view = ffi.new("runintgen_table_view*")
+    secondary_status = ctx.form.elements[0].tabulate(
+        ctx.form.elements, rule, request, secondary_view
+    )
+
+    assert payload.rules.secondary_points is not None
+    assert custom_data.num_rules == 2
+    assert custom_data.num_entities == 2
+    assert primary_status == 0
+    assert secondary_status == 0
+    assert primary_view.num_points == 1
+    assert secondary_view.num_points == 1
+    assert primary_view.num_dofs == 3
+    assert secondary_view.num_dofs == 3

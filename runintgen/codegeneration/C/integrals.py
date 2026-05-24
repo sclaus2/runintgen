@@ -204,6 +204,7 @@ class _ElementTableRequest:
     max_source_dof: int
     max_component: int
     is_permuted: bool
+    point_set: int
     c_symbol: str
 
 
@@ -216,10 +217,16 @@ def _element_table_requests(runtime_tables: list[Any]) -> list[_ElementTableRequ
     requests: list[_ElementTableRequest] = []
     for slot, tables in sorted(by_slot.items()):
         element_indices = {int(table.element_index) for table in tables}
+        point_sets = {int(getattr(table, "point_set", 0)) for table in tables}
         if len(element_indices) != 1:
             raise ValueError(
                 "Runtime table references sharing a Basix tabulation slot "
                 f"resolved to multiple form element indices: {sorted(element_indices)}."
+            )
+        if len(point_sets) != 1:
+            raise ValueError(
+                "Runtime table references sharing a Basix tabulation slot "
+                f"resolved to multiple point sets: {sorted(point_sets)}."
             )
 
         requests.append(
@@ -235,6 +242,7 @@ def _element_table_requests(runtime_tables: list[Any]) -> list[_ElementTableRequ
                 max_source_dof=max(_max_source_dof(table) for table in tables),
                 max_component=0,
                 is_permuted=any(bool(table.is_permuted) for table in tables),
+                point_set=next(iter(point_sets)),
                 c_symbol=tables[0].c_symbol,
             )
         )
@@ -261,6 +269,7 @@ def _table_requests(
             f"  .slot = {request.slot},\n"
             f"  .derivative_order = {request.max_derivative_order},\n"
             f"  .is_permuted = {int(request.is_permuted)},\n"
+            f"  .point_set = {request.point_set},\n"
             f"}};"
         )
     return "\n".join(lines)

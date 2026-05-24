@@ -76,6 +76,7 @@ from .quadrature_function import (
 from .runtime_api import RunintModule, RuntimeKernelInfo, compile_runtime_integrals
 from .runtime_data import (
     CFFI_DEF,
+    QuadratureEvaluationContext,
     QuadratureFunctionValue,
     QuadratureFunctionValueSet,
     QuadratureRules,
@@ -90,6 +91,7 @@ from .runtime_data import (
     as_runtime_quadrature_rules,
     build_quadrature_function_value_set,
     facet_runtime_quadrature_payload,
+    interior_facet_runtime_quadrature_payload,
     to_intptr,
 )
 from .runtime_tables import (
@@ -174,6 +176,7 @@ __all__ = [
     "CFFI_DEF",
     "QuadratureFunctionValue",
     "QuadratureFunctionValueSet",
+    "QuadratureEvaluationContext",
     "QuadratureRules",
     "RuntimeBasixElement",
     "RuntimeContextBuilder",
@@ -186,6 +189,7 @@ __all__ = [
     "as_runtime_quadrature_rules",
     "build_quadrature_function_value_set",
     "facet_runtime_quadrature_payload",
+    "interior_facet_runtime_quadrature_payload",
     "to_intptr",
     # Runtime tables
     "DerivativeMapping",

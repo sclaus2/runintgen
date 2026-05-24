@@ -41,6 +41,7 @@ typedef struct
   int nq;
   int tdim;
   const double* points;
+  const double* secondary_points;
   const double* weights;
 } runintgen_quadrature_rule;
 
@@ -50,6 +51,7 @@ typedef struct
   int num_rules;
   const int32_t* offsets;
   const double* points;
+  const double* secondary_points;
   const double* weights;
   const int32_t* parent_map;
 } runintgen_quadrature_rules;
@@ -89,6 +91,7 @@ typedef struct
   int slot;
   int derivative_order;
   int is_permuted;
+  int point_set;
 } runintgen_table_request;
 
 typedef struct runintgen_basix_element runintgen_basix_element;

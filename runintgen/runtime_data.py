@@ -82,6 +82,7 @@ class QuadratureRules:
     weights: npt.NDArray[np.float64]
     offsets: npt.NDArray[np.int32] | None = None
     parent_map: npt.NDArray[np.int32] | None = None
+    secondary_points: npt.NDArray[np.float64] | None = None
     rule_id: str | None = None
     kind: str = "per_entity"
     gdim: int | None = None
@@ -122,6 +123,15 @@ class QuadratureRules:
 
         if self.weights.ndim != 1:
             raise ValueError("weights must have shape (total_nq,).")
+
+        if self.secondary_points is not None:
+            self.secondary_points = _borrow_array(
+                self.secondary_points,
+                dtype=np.dtype(np.float64),
+                name="secondary_points",
+            )
+            if self.secondary_points.shape != self.points.shape:
+                raise ValueError("secondary_points must have the same shape as points.")
 
         if self.kind == "per_entity":
             if self.offsets is None:
@@ -348,6 +358,22 @@ class RuntimeEntityMap:
                 "standard_entities and runtime entity rows must have the "
                 "same width."
             )
+        if standard.size and runtime_entities.size:
+            if standard.ndim == 1:
+                duplicates = np.intersect1d(standard, runtime_entities)
+                if duplicates.size:
+                    raise ValueError(
+                        "Mixed runtime subdomain data contains duplicate "
+                        "standard/runtime entities."
+                    )
+            else:
+                standard_rows = {tuple(row) for row in standard.tolist()}
+                runtime_rows = {tuple(row) for row in runtime_entities.tolist()}
+                if standard_rows.intersection(runtime_rows):
+                    raise ValueError(
+                        "Mixed runtime subdomain data contains duplicate "
+                        "standard/runtime entities."
+                    )
         entity_indices = np.ascontiguousarray(
             np.concatenate([standard, runtime_entities], axis=0), dtype=np.int32
         )
@@ -397,6 +423,11 @@ class RuntimeQuadraturePayload:
     def points(self) -> npt.NDArray[np.float64]:
         """Flat or 2D quadrature points."""
         return self.rules.points
+
+    @property
+    def secondary_points(self) -> npt.NDArray[np.float64] | None:
+        """Optional secondary point map for two-sided runtime facet tables."""
+        return self.rules.secondary_points
 
     @property
     def weights(self) -> npt.NDArray[np.float64]:
@@ -546,8 +577,77 @@ def facet_runtime_quadrature_payload(
         points=mapped_points,
         weights=source_rules.weights,
         offsets=source_rules.offsets,
-        parent_map=np.ascontiguousarray(rows[:, local_facet_column - 1], dtype=np.int32)
+        parent_map=np.ascontiguousarray(
+            rows[:, local_facet_column - 1], dtype=np.int32
+        )
         if local_facet_column > 0
+        else source_rules.parent_map,
+        rule_id=source_rules.rule_id,
+        kind=source_rules.kind,
+        gdim=source_rules.gdim,
+        physical_points=getattr(source_rules, "__dict__", {}).get(
+            "physical_points", None
+        ),
+    )
+    entities = RuntimeEntityMap(
+        entity_indices=rows,
+        is_cut=np.ones(rows.shape[0], dtype=np.uint8),
+        rule_indices=np.arange(rows.shape[0], dtype=np.int32),
+    )
+    return RuntimeQuadraturePayload(
+        rules=mapped_rules,
+        entities=entities,
+        quadrature_functions=source_payload.quadrature_functions,
+    )
+
+
+def interior_facet_runtime_quadrature_payload(
+    *,
+    parent_cell_type: Any,
+    quadrature: Any,
+    entity_indices: npt.ArrayLike,
+    local_facet_columns: tuple[int, int] = (1, 3),
+) -> RuntimeQuadraturePayload:
+    """Build a two-sided parent-reference payload for interior facets.
+
+    ``quadrature`` is the geometric rule set on the cut facet mesh. The
+    ``entity_indices`` rows must have DOLFINx interior-facet shape
+    ``(cell0, local_facet0, cell1, local_facet1)``. The primary points map to
+    the first side and ``secondary_points`` map to the second side, while the
+    integration entity map still contains one row per geometric facet rule.
+    """
+    source_payload = as_runtime_quadrature_payload(quadrature)
+    source_rules = source_payload.rules
+    rows = np.ascontiguousarray(entity_indices, dtype=np.int32)
+    if rows.ndim != 2 or rows.shape[1] != 4:
+        raise ValueError(
+            "interior facet entity_indices must have shape (num_facets, 4)."
+        )
+
+    side0_column, side1_column = local_facet_columns
+    mapped_side0 = _map_facet_points_to_parent_reference(
+        parent_cell_type=parent_cell_type,
+        rules=source_rules,
+        entity_indices=rows,
+        local_facet_column=side0_column,
+    )
+    mapped_side1 = _map_facet_points_to_parent_reference(
+        parent_cell_type=parent_cell_type,
+        rules=source_rules,
+        entity_indices=rows,
+        local_facet_column=side1_column,
+    )
+
+    mapped_rules = QuadratureRules(
+        tdim=mapped_side0.shape[1],
+        points=mapped_side0,
+        secondary_points=mapped_side1,
+        weights=source_rules.weights,
+        offsets=source_rules.offsets,
+        parent_map=np.ascontiguousarray(
+            rows[:, side0_column - 1], dtype=np.int32
+        )
+        if side0_column > 0
         else source_rules.parent_map,
         rule_id=source_rules.rule_id,
         kind=source_rules.kind,
@@ -612,6 +712,16 @@ class QuadratureFunctionValueSet:
         return len(self.functions)
 
 
+@dataclass(frozen=True)
+class QuadratureEvaluationContext:
+    """Context passed to context-aware QuadratureFunction evaluators."""
+
+    rules: QuadratureRules
+    info: Any
+    mesh: Any | None = None
+    metadata: dict[str, Any] | None = None
+
+
 def _normalise_quadrature_function_values(
     values: npt.ArrayLike,
     *,
@@ -657,6 +767,7 @@ def build_quadrature_function_value_set(
         return None
 
     from .quadrature_function import (
+        quadrature_function_cache,
         quadrature_function_source,
         quadrature_function_values,
     )
@@ -674,7 +785,21 @@ def build_quadrature_function_value_set(
             )
         else:
             source = quadrature_function_source(info.terminal)
-            if source is not None:
+            if source is not None and hasattr(source, "evaluate"):
+                context = QuadratureEvaluationContext(rules=rules, info=info)
+                source_key_fn = getattr(source, "cache_key", None)
+                source_key = (
+                    source_key_fn(context)
+                    if source_key_fn is not None
+                    else id(source)
+                )
+                cache_key = (str(rules.rule_id), source_key)
+                cache = quadrature_function_cache(info.terminal)
+                raw_values = cache.get(cache_key)
+                if raw_values is None:
+                    raw_values = source.evaluate(context)
+                    cache[cache_key] = raw_values
+            elif source is not None:
                 if rules.physical_points is None:
                     raise ValueError(
                         f"QuadratureFunction {info.label!r} uses a callable source, "
@@ -828,6 +953,7 @@ class RuntimeTableRequest:
     slot: int
     derivative_order: int = 0
     is_permuted: bool = False
+    point_set: int = 0
 
 
 @dataclass
@@ -904,6 +1030,11 @@ class RuntimeContextBuilder:
         c_quadrature.num_rules = rules.num_rules
         c_quadrature.offsets = ffi.cast("const int32_t*", rules.offsets.ctypes.data)
         c_quadrature.points = ffi.cast("const double*", rules.points.ctypes.data)
+        c_quadrature.secondary_points = (
+            ffi.cast("const double*", rules.secondary_points.ctypes.data)
+            if rules.secondary_points is not None
+            else ffi.NULL
+        )
         c_quadrature.weights = ffi.cast("const double*", rules.weights.ctypes.data)
         c_quadrature.parent_map = (
             ffi.cast("const int32_t*", rules.parent_map.ctypes.data)
@@ -988,6 +1119,7 @@ class RuntimeContextBuilder:
         c_request.slot = request.slot
         c_request.derivative_order = request.derivative_order
         c_request.is_permuted = int(request.is_permuted)
+        c_request.point_set = int(request.point_set)
         return c_request
 
 

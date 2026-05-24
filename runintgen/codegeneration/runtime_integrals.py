@@ -54,6 +54,8 @@ class RuntimeTableReferenceInfo:
     flat_component: int | None = None
     role: str | None = None
     terminal_index: int | None = None
+    restriction: str | None = None
+    point_set: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable table description."""
@@ -76,6 +78,8 @@ class RuntimeTableReferenceInfo:
             "flat_component": self.flat_component,
             "role": self.role,
             "terminal_index": self.terminal_index,
+            "restriction": self.restriction,
+            "point_set": self.point_set,
         }
 
 
@@ -85,7 +89,7 @@ class RuntimeTableRegistry:
     def __init__(self, table_metadata: dict[str, dict[str, Any]] | None = None) -> None:
         """Initialise an empty registry."""
         self._name_to_reference_index: dict[str, int] = {}
-        self._element_to_slot: dict[int | str, int] = {}
+        self._element_to_slot: dict[tuple[int | str, int], int] = {}
         self.references: list[RuntimeTableReferenceInfo] = []
         self.table_metadata = table_metadata or {}
 
@@ -105,24 +109,35 @@ class RuntimeTableRegistry:
             "topological dimension 3."
         )
 
-    def register(self, tabledata: UniqueTableReferenceT) -> RuntimeTableReferenceInfo:
+    def register(
+        self,
+        tabledata: UniqueTableReferenceT,
+        *,
+        integral_type: str,
+        restriction: str | None,
+    ) -> RuntimeTableReferenceInfo:
         """Register a table reference and return its runtime slot info."""
         if tabledata.has_tensor_factorisation:
             raise NotImplementedError(
                 "Runtime integrals do not support FFCx sum-factorized tables yet."
             )
 
-        if tabledata.name in self._name_to_reference_index:
-            return self.references[self._name_to_reference_index[tabledata.name]]
+        point_set = (
+            1 if integral_type == "interior_facet" and restriction == "-" else 0
+        )
+        reference_key = f"{tabledata.name}:{point_set}"
+        if reference_key in self._name_to_reference_index:
+            return self.references[self._name_to_reference_index[reference_key]]
 
         reference_index = len(self.references)
         metadata = self.table_metadata.get(tabledata.name, {})
         element_key = metadata.get("element_hash")
         if element_key is None:
             element_key = f"table:{tabledata.name}"
-        if element_key not in self._element_to_slot:
-            self._element_to_slot[element_key] = len(self._element_to_slot)
-        element_slot = self._element_to_slot[element_key]
+        element_slot_key = (element_key, point_set)
+        if element_slot_key not in self._element_to_slot:
+            self._element_to_slot[element_slot_key] = len(self._element_to_slot)
+        element_slot = self._element_to_slot[element_slot_key]
         c_symbol = f"rt_element_{element_slot}"
         derivative_counts = tuple(metadata.get("derivative_counts", ()))
         info = RuntimeTableReferenceInfo(
@@ -144,8 +159,10 @@ class RuntimeTableRegistry:
             flat_component=metadata.get("flat_component"),
             role=metadata.get("role"),
             terminal_index=metadata.get("terminal_index"),
+            restriction=restriction,
+            point_set=point_set,
         )
-        self._name_to_reference_index[tabledata.name] = reference_index
+        self._name_to_reference_index[reference_key] = reference_index
         self.references.append(info)
         return info
 
@@ -300,7 +317,11 @@ class RuntimeBackendAccess(FFCXBackendAccess):
                 tabledata, entity_type, restriction, quadrature_index, dof_index
             )
 
-        table_ref = self.table_registry.register(tabledata)
+        table_ref = self.table_registry.register(
+            tabledata,
+            integral_type=self.integral_type,
+            restriction=restriction,
+        )
         table_symbol = L.Symbol(table_ref.c_symbol, dtype=L.DataType.REAL)
         self.symbols.element_tables[tabledata.name] = table_symbol
 

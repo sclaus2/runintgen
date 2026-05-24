@@ -58,10 +58,12 @@ struct TableCacheKey
 {
   const BasixElementHandle* handle = nullptr;
   int slot = 0;
+  int point_set = 0;
 
   bool operator==(const TableCacheKey& other) const noexcept
   {
-    return handle == other.handle && slot == other.slot;
+    return handle == other.handle && slot == other.slot
+           && point_set == other.point_set;
   }
 };
 
@@ -70,9 +72,12 @@ struct TableCacheKeyHash
   std::size_t operator()(const TableCacheKey& key) const noexcept
   {
     const auto ptr = reinterpret_cast<std::uintptr_t>(key.handle);
-    return std::hash<std::uintptr_t>{}(ptr)
-           ^ (std::hash<int>{}(key.slot) + 0x9e3779b9 + (ptr << 6)
-              + (ptr >> 2));
+    std::size_t seed = std::hash<std::uintptr_t>{}(ptr);
+    seed ^= std::hash<int>{}(key.slot) + 0x9e3779b9 + (seed << 6)
+            + (seed >> 2);
+    seed ^= std::hash<int>{}(key.point_set) + 0x9e3779b9 + (seed << 6)
+            + (seed >> 2);
+    return seed;
   }
 };
 
@@ -478,8 +483,8 @@ int basix_runtime_tabulate(const runintgen_basix_element* element,
       cache;
   return runintgen::detail::tabulate_runtime_table(
       handle->element, rule, request, view,
-      [handle](int slot) -> std::vector<double>& {
-        return cache[{handle, slot}];
+      [handle, request](int slot) -> std::vector<double>& {
+        return cache[{handle, slot, request->point_set}];
       },
       handle->block_size);
 }
@@ -615,6 +620,30 @@ private:
     _abi_quadrature.num_rules = num_rules;
     _abi_quadrature.offsets = offsets.data();
     _abi_quadrature.points = points.data();
+    _abi_quadrature.secondary_points = nullptr;
+    if (object_has_non_none(_quadrature_owner, "secondary_points"))
+    {
+      FloatArray secondary_points
+          = object_cast<FloatArray>(_quadrature_owner, "secondary_points");
+      if (secondary_points.ndim() != points.ndim())
+        throw std::runtime_error(
+            "Runtime secondary_points rank must match points.");
+      if (secondary_points.ndim() == 2)
+      {
+        if (secondary_points.shape(0) != points.shape(0)
+            || secondary_points.shape(1) != points.shape(1))
+        {
+          throw std::runtime_error(
+              "Runtime secondary_points shape must match points.");
+        }
+      }
+      else if (secondary_points.size() != points.size())
+      {
+        throw std::runtime_error(
+            "Runtime secondary_points shape must match points.");
+      }
+      _abi_quadrature.secondary_points = secondary_points.data();
+    }
     _abi_quadrature.weights = weights.data();
     _abi_quadrature.parent_map = nullptr;
     if (object_has_non_none(_quadrature_owner, "parent_map"))

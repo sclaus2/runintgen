@@ -10,6 +10,7 @@ from runintgen import (
     QuadratureRules,
     RuntimeQuadratureRule,
     compile_runtime_integrals,
+    dSq,
     dxq,
     get_runintgen_data_struct,
 )
@@ -460,6 +461,27 @@ class TestCodeGeneration:
         assert "entity_local_index[0]" in cell_kernel.c_definition
         assert "entity_local_index[1]" in exterior_kernel.c_definition
         assert "entity_local_index[2]" in interior_kernel.c_definition
+
+    def test_runtime_interior_facet_tables_use_two_point_sets(self):
+        """Interior facet restrictions should request side-specific points."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        V_el = element("Lagrange", "triangle", 1)
+        V = ufl.FunctionSpace(mesh, V_el)
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+
+        dS_rt = dSq(domain=mesh)
+        kernel = compile_runtime_integrals(ufl.jump(u) * ufl.jump(v) * dS_rt).kernels[
+            0
+        ]
+
+        point_sets = {
+            (table["restriction"], table["point_set"]) for table in kernel.table_info
+        }
+        assert ("+", 0) in point_sets
+        assert ("-", 1) in point_sets
+        assert ".point_set = 0" in kernel.c_definition
+        assert ".point_set = 1" in kernel.c_definition
 
     def test_table_requests_use_form_element_indices(self):
         """Test table requests refer to the form-level element descriptor list."""
