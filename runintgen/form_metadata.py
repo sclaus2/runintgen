@@ -175,11 +175,73 @@ class BasixElementSpec:
 
 def _unwrap_basix_element(element: Any) -> Any:
     """Return the underlying Basix element from common wrappers."""
-    if hasattr(element, "basix_element"):
-        return element.basix_element
+    try:
+        basix_element = getattr(element, "basix_element")
+    except (AttributeError, NotImplementedError):
+        basix_element = None
+    if basix_element is not None:
+        return basix_element
     if hasattr(element, "_element"):
         return element._element
     return element
+
+
+def _is_mixed_element(element: Any) -> bool:
+    """Return whether ``element`` is a Basix/UFL mixed element."""
+    try:
+        return bool(getattr(element, "is_mixed"))
+    except (AttributeError, NotImplementedError):
+        return False
+
+
+def _reference_value_size(element: Any) -> int:
+    """Return the flattened reference-value size of an element."""
+    try:
+        value_size = getattr(element, "reference_value_size")
+    except (AttributeError, NotImplementedError):
+        value_size = None
+    if value_size is not None:
+        return int(value_size)
+
+    try:
+        value_shape = getattr(element, "reference_value_shape")
+    except (AttributeError, NotImplementedError):
+        value_shape = ()
+    size = 1
+    for extent in value_shape or ():
+        size *= int(extent)
+    return size
+
+
+def component_element_from_mixed(element: Any, flat_component: int | None) -> Any:
+    """Return the sub-element that owns a flat mixed-element component.
+
+    FFCx table metadata for split mixed functions reports the parent mixed
+    element together with the flattened component used by that table. Runtime
+    Basix tabulation must use the concrete sub-element, e.g. the velocity P2
+    block or pressure P1 scalar in a Taylor-Hood space.
+    """
+    if not _is_mixed_element(element):
+        return element
+    if flat_component is None:
+        raise NotImplementedError(
+            "Runtime mixed-element tables require a flat component index."
+        )
+
+    sub_elements = list(getattr(element, "sub_elements", []) or [])
+    component = int(flat_component)
+    offset = 0
+    for sub_element in sub_elements:
+        size = _reference_value_size(sub_element)
+        if offset <= component < offset + size:
+            local_component = component - offset
+            return component_element_from_mixed(sub_element, local_component)
+        offset += size
+
+    raise ValueError(
+        f"Mixed-element component {component} is outside reference value size "
+        f"{offset}."
+    )
 
 
 def _as_tuple_of_ints(value: Any) -> tuple[int, ...]:
@@ -240,15 +302,13 @@ def element_key_from_basix(element: Any) -> ElementKey:
     Returns:
         ElementKey with the element's identifying properties.
     """
-    # Handle both basix elements and basix.ufl wrapped elements
-    if hasattr(element, "_element"):
-        # basix.ufl wrapped element
-        basix_elem = element._element
-    elif hasattr(element, "basix_element"):
-        # Another wrapper type
-        basix_elem = element.basix_element
-    else:
-        basix_elem = element
+    if _is_mixed_element(element):
+        raise TypeError(
+            "Mixed elements must be resolved to concrete sub-elements before "
+            "building runintgen runtime metadata."
+        )
+
+    basix_elem = _unwrap_basix_element(element)
 
     # Get properties from basix element
     family = int(basix_elem.family)
@@ -286,11 +346,21 @@ def element_key_from_ufl(element: Any) -> ElementKey:
     Returns:
         ElementKey identifying the element.
     """
+    if _is_mixed_element(element):
+        raise TypeError(
+            "Mixed elements must be resolved to concrete sub-elements before "
+            "building runintgen runtime metadata."
+        )
+
     # Try to get basix element from UFL element
     if hasattr(element, "_element"):
         return element_key_from_basix(element._element)
-    elif hasattr(element, "basix_element"):
-        return element_key_from_basix(element.basix_element)
+    try:
+        basix_element = getattr(element, "basix_element")
+    except (AttributeError, NotImplementedError):
+        basix_element = None
+    if basix_element is not None:
+        return element_key_from_basix(basix_element)
     elif hasattr(element, "family"):
         # Direct basix element
         return element_key_from_basix(element)
@@ -679,12 +749,10 @@ def _get_element_dims(element: Any) -> tuple[int, int]:
 
 def _basix_hash(element: Any) -> int:
     """Return the Basix element hash, or zero when unavailable."""
-    if hasattr(element, "_element"):
-        basix_elem = element._element
-    elif hasattr(element, "basix_element"):
-        basix_elem = element.basix_element
-    else:
-        basix_elem = element
+    if _is_mixed_element(element):
+        return 0
+
+    basix_elem = _unwrap_basix_element(element)
 
     if hasattr(basix_elem, "basix_hash"):
         return int(basix_elem.basix_hash())

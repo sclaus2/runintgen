@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import ufl
-from basix.ufl import element
+from basix.ufl import element, mixed_element
 
 from runintgen import (
     QuadratureRules,
@@ -529,6 +529,33 @@ class TestCodeGeneration:
         assert "num_components" in kernel.c_definition
         assert "A[12 * (2 * (i) + 1) + (2 * (j) + 1)]" in kernel.c_definition
         assert "* rt_element_0_num_components + 1" not in kernel.c_definition
+
+    def test_taylor_hood_mixed_space_tables_use_sub_elements(self):
+        """Test split mixed spaces tabulate concrete velocity/pressure elements."""
+        mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+        p2 = element("Lagrange", "triangle", 2, shape=(2,))
+        p1 = element("Lagrange", "triangle", 1)
+        W = ufl.FunctionSpace(mesh, mixed_element([p2, p1]))
+        w = ufl.TrialFunction(W)
+        z = ufl.TestFunction(W)
+        u, p = ufl.split(w)
+        v, q = ufl.split(z)
+
+        dx_rt = dxq(subdomain_id=6, domain=mesh)
+        form = (
+            ufl.inner(ufl.grad(u), ufl.grad(v))
+            - ufl.div(v) * p
+            - ufl.div(u) * q
+        ) * dx_rt
+        module = compile_runtime_integrals(form)
+        kernel = module.kernels[0]
+
+        assert kernel.tensor_shape == (15, 15)
+        assert len(module.form_metadata.unique_elements) == 2
+        assert {table["block_size"] for table in kernel.table_info} == {1, 2}
+        assert {table["element_index"] for table in kernel.table_info} == {0, 1}
+        assert any(table["flat_component"] == 2 for table in kernel.table_info)
+        assert kernel.c_definition.count(".tabulate(") == 2
 
     def test_curved_geometry_jacobian_is_quadrature_varying(self):
         """Test higher-order coordinate Jacobians stay inside the quadrature loop."""

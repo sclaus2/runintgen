@@ -24,6 +24,7 @@ from ffcx.ir.elementtables import get_modified_terminal_element
 from ffcx.ir.representation import compute_ir
 from ffcx.options import get_options
 
+from .form_metadata import component_element_from_mixed
 from .measures import (
     RuntimeIntegralMode,
     get_quadrature_provider,
@@ -522,6 +523,7 @@ def _process_modified_terminal(
         return
 
     element, averaged, local_derivatives, flat_component = mte
+    element = component_element_from_mixed(element, flat_component)
     terminal = mt.terminal
 
     # Determine role and index

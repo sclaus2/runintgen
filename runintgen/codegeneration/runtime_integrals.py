@@ -26,6 +26,7 @@ from ffcx.ir.elementtables import (
 from ffcx.ir.representation import IntegralIR
 from ffcx.ir.representationutils import QuadratureRule
 
+from ..form_metadata import component_element_from_mixed
 from ..quadrature_function import (
     QuadratureFunctionInfo,
     is_quadrature_function,
@@ -523,6 +524,7 @@ class RuntimeIntegralGenerator:
                     continue
 
                 element, averaged, local_derivatives, flat_component = mte
+                element = component_element_from_mixed(element, flat_component)
                 terminal = mt.terminal
                 role = type(terminal).__name__.lower()
                 terminal_index: int | None = None
@@ -543,9 +545,14 @@ class RuntimeIntegralGenerator:
 
                 element_hash = None
                 if hasattr(element, "basix_hash"):
-                    element_hash = int(element.basix_hash())
+                    value = element.basix_hash()
+                    element_hash = None if value is None else int(value)
                 elif hasattr(element, "_element") and hasattr(element._element, "hash"):
-                    element_hash = int(element._element.hash())
+                    value = element._element.hash()
+                    element_hash = None if value is None else int(value)
+                elif hasattr(element, "basix_element"):
+                    value = element.basix_element.hash()
+                    element_hash = None if value is None else int(value)
 
                 metadata[tr.name] = {
                     "element_hash": element_hash,
