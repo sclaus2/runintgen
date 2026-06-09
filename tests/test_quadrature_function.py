@@ -14,7 +14,6 @@ from runintgen import (
     QuadratureRules,
     RuntimeContextBuilder,
     compile_runtime_integrals,
-    dxq,
 )
 from runintgen.runtime_data import build_quadrature_function_value_set
 
@@ -22,6 +21,15 @@ from runintgen.runtime_data import build_quadrature_function_value_set
 def _mesh() -> ufl.Mesh:
     """Return a symbolic triangle mesh."""
     return ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+
+
+class _RuntimeRule:
+    points = ()
+    weights = ()
+
+
+def _dx_runtime(mesh: ufl.Mesh) -> ufl.Measure:
+    return ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
 
 
 def _rules(*, physical_points: np.ndarray | None = None) -> QuadratureRules:
@@ -58,7 +66,7 @@ def test_callable_source_is_evaluated_on_component_first_points() -> None:
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     alpha = QuadratureFunction(mesh, lambda x: x[0] + x[1])
-    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * dxq(domain=mesh))
+    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * _dx_runtime(mesh))
     rules = _rules(physical_points=np.ascontiguousarray([[0.2, 0.6], [0.3, 0.2]]))
 
     values = build_quadrature_function_value_set(module.quadrature_functions, rules)
@@ -74,7 +82,7 @@ def test_explicit_values_are_borrowed_by_rule_id() -> None:
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     alpha = QuadratureFunction(mesh)
-    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * dxq(domain=mesh))
+    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * _dx_runtime(mesh))
     rules = _rules()
     explicit = np.array([2.0, 3.0], dtype=np.float64)
     alpha.set_values(rules, explicit)
@@ -93,7 +101,7 @@ def test_generated_runtime_kernel_loads_quadrature_function_from_custom_data() -
     v = ufl.TestFunction(V)
     alpha = QuadratureFunction(mesh)
 
-    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * dxq(domain=mesh))
+    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * _dx_runtime(mesh))
     kernel = module.kernels[0]
 
     assert len(module.quadrature_functions) == 1
@@ -111,7 +119,7 @@ def test_cffi_context_builder_exposes_quadrature_function_values() -> None:
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     alpha = QuadratureFunction(mesh)
-    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * dxq(domain=mesh))
+    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * _dx_runtime(mesh))
     rules = _rules()
     explicit = np.array([2.0, 3.0], dtype=np.float64)
     alpha.set_values(rules, explicit)
@@ -137,7 +145,7 @@ def test_fallback_evaluator_supplies_background_values() -> None:
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
     alpha = QuadratureFunction(mesh)
-    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * dxq(domain=mesh))
+    module = compile_runtime_integrals(alpha * ufl.inner(u, v) * _dx_runtime(mesh))
     rules = _rules(physical_points=np.ascontiguousarray([[0.2, 0.6], [0.3, 0.2]]))
 
     def evaluator(info, active_rules):
@@ -162,7 +170,7 @@ def test_vector_quadrature_function_uses_component_inner_stride() -> None:
     v = ufl.TestFunction(V)
     normal = QuadratureFunction(mesh, shape=(2,))
 
-    module = compile_runtime_integrals(ufl.dot(normal, v) * dxq(domain=mesh))
+    module = compile_runtime_integrals(ufl.dot(normal, v) * _dx_runtime(mesh))
     kernel = module.kernels[0]
 
     assert "q_function_0[(q0 + iq) * 2]" in kernel.c_definition
@@ -179,7 +187,7 @@ def test_multiple_quadrature_functions_in_pointwise_expression() -> None:
     beta = QuadratureFunction(mesh, name="beta")
 
     module = compile_runtime_integrals(
-        (alpha + beta) * ufl.inner(u, v) * dxq(domain=mesh)
+        (alpha + beta) * ufl.inner(u, v) * _dx_runtime(mesh)
     )
     kernel = module.kernels[0]
 
@@ -203,7 +211,7 @@ def test_quadrature_function_algebra_stays_inside_quadrature_loop() -> None:
     alpha = QuadratureFunction(mesh, name="alpha")
 
     module = compile_runtime_integrals(
-        (c + alpha) * ufl.inner(u, v) * dxq(domain=mesh)
+        (c + alpha) * ufl.inner(u, v) * _dx_runtime(mesh)
     )
     kernel = module.kernels[0]
     loop_pos = kernel.c_definition.find("for (int iq")
@@ -225,5 +233,5 @@ def test_quadrature_function_derivative_is_rejected() -> None:
         match="Derivatives and averages of QuadratureFunction",
     ):
         compile_runtime_integrals(
-            ufl.inner(ufl.grad(alpha), ufl.grad(v)) * dxq(domain=mesh)
+            ufl.inner(ufl.grad(alpha), ufl.grad(v)) * _dx_runtime(mesh)
         )

@@ -24,18 +24,18 @@ Basix tabulation callbacks supplied by the runtime context.
 
 ## Installation
 
-For this development branch, use Basix, UFL, and FFCx from their `main`
-branches so the Python codegen imports and Basix C++ ABI stay consistent:
+Use the FEniCSx 0.11 release stack so the Python code-generation imports and
+Basix C++ ABI stay consistent:
 
 ```bash
 # Install build tools
 python -m pip install --upgrade pip setuptools wheel scikit-build-core nanobind numpy cffi
 
-# Install FEniCSx main packages directly from GitHub
-python -m pip install --upgrade --force-reinstall --no-deps \
-  "fenics-basix @ git+https://github.com/FEniCS/basix.git@main" \
-  "fenics-ufl @ git+https://github.com/FEniCS/ufl.git@main" \
-  "fenics-ffcx @ git+https://github.com/FEniCS/ffcx.git@main"
+# Install the FEniCSx 0.11 release packages
+python -m pip install --upgrade --force-reinstall \
+  "fenics-basix>=0.11.0,<0.12.0" \
+  "fenics-ufl>=2026.1.0,<2026.2.0" \
+  "fenics-ffcx>=0.11.0,<0.12.0"
 
 # Install runintgen against that stack
 cd PATH_TO/runintgen
@@ -52,8 +52,8 @@ library ABI.
 
 - Python >= 3.10.
 - NumPy.
-- FEniCSx Python packages: Basix >= 0.11.0.dev0,
-  UFL >= 2025.3.0.dev0, and FFCx >= 0.11.0.dev0.
+- FEniCSx Python packages: Basix >= 0.11.0 and < 0.12.0,
+  UFL >= 2026.1.0 and < 2026.2.0, and FFCx >= 0.11.0 and < 0.12.0.
 - UFCx headers and a C/C++ compiler when compiling generated kernels.
 - DOLFINx is optional and only needed when constructing DOLFINx forms.
 - `cffi` is optional and mainly useful for Python-side ABI tests/prototypes.
@@ -149,10 +149,8 @@ dx = ufl.Measure(
 ```
 
 Ordinary entity data without quadrature-rule payloads remains a standard UFL
-measure for FFCx/DOLFINx. The legacy
-`metadata={"quadrature_rule": "runtime"}` marker is still accepted, but new code
-should prefer `subdomain_data` because measure metadata is easy to lose when UFL
-reconfigures measures.
+measure for FFCx/DOLFINx. Runtime integrals are selected only by quadrature-rule
+payloads carried in `subdomain_data`.
 
 ## Runtime ABI
 
@@ -290,8 +288,9 @@ a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 A = dolfinx.fem.assemble_matrix(runintgen_form(a))
 ```
 
-The DOLFINx integration currently targets the patched DOLFINx branch with
-per-integral `custom_data` support. Runtime quadrature support is intentionally
+The DOLFINx integration requires a DOLFINx assembly path with per-integral
+`custom_data` support. CutFEMx provides DOLFINx-derived custom assemblers for
+this runtime quadrature path. Runtime quadrature support is intentionally
 limited to `float64` cell integrals for the first implementation. Standard-only
 forms passed to `runintgen.dolfinx.form` delegate to `dolfinx.fem.form`.
 
@@ -344,7 +343,6 @@ UFCx kernel called with void* custom_data
 
 ### Measures
 
-- `RUNTIME_QUADRATURE_RULE`: Constant `"runtime"` for UFL metadata.
 - `RuntimeIntegralMode`: Classification enum with `STANDARD`, `RUNTIME`, and
   `MIXED`.
 - `is_runtime_quadrature_rule(value)`: Check the structural quadrature-rule
@@ -422,7 +420,7 @@ UFCx kernel called with void* custom_data
 - `RuntimeElementMapping`, `UniqueElementInfo`, `ElementUsage`: Compatibility
   metadata for table analysis.
 - `build_runtime_element_mapping`, `build_runtime_element_mapping_from_ir`:
-  Mapping helpers used by tests and migration code.
+  Mapping helpers used by tests and compatibility code.
 
 ### Geometry
 

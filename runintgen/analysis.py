@@ -206,9 +206,7 @@ def _compute_unscaled_ffcx_form_data(
     for integral_data in form_data.integral_data:
         for i, integral in enumerate(integral_data.integrals):
             metadata = dict(integral.metadata() or {})
-            if metadata.get("quadrature_rule") == "runtime":
-                metadata["quadrature_rule"] = "default"
-            elif "quadrature_rule" not in metadata:
+            if "quadrature_rule" not in metadata:
                 metadata["quadrature_rule"] = "default"
             if "quadrature_degree" not in metadata or metadata["quadrature_degree"] < 0:
                 qd = metadata.get("estimated_polynomial_degree", 0)
@@ -240,9 +238,7 @@ def _compute_standard_ffcx_form_data(
     for integral_data in form_data.integral_data:
         for i, integral in enumerate(integral_data.integrals):
             metadata = dict(integral.metadata() or {})
-            if metadata.get("quadrature_rule") == "runtime":
-                metadata["quadrature_rule"] = "default"
-            elif "quadrature_rule" not in metadata:
+            if "quadrature_rule" not in metadata:
                 metadata["quadrature_rule"] = "default"
             if "quadrature_degree" not in metadata or metadata["quadrature_degree"] < 0:
                 qd = metadata.get("estimated_polynomial_degree", 0)

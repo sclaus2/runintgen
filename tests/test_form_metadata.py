@@ -17,13 +17,18 @@ from runintgen.form_metadata import (
 )
 
 
+class _RuntimeRule:
+    points = ()
+    weights = ()
+
+
 def create_laplacian_form():
     """Create a simple Laplacian form for testing."""
     mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
     V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
-    dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+    dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
     return a
 
@@ -34,7 +39,7 @@ def create_p2_laplacian_form():
     V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 2))
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
-    dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+    dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
     return a
 

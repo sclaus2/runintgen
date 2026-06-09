@@ -45,6 +45,11 @@ from runintgen.tabulation import (
 )
 
 
+class _RuntimeRule:
+    points = ()
+    weights = ()
+
+
 # =============================================================================
 # Generic Utilities
 # =============================================================================
@@ -233,7 +238,7 @@ class TestPoissonComparison:
         V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         return inner(grad(u), grad(v)) * dx_rt
 
     @pytest.fixture
@@ -252,7 +257,7 @@ class TestPoissonComparison:
         V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 2))
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         return inner(grad(u), grad(v)) * dx_rt
 
     @pytest.fixture
@@ -413,7 +418,7 @@ class TestMassMatrixComparison:
         V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         return inner(u, v) * dx_rt
 
     @pytest.fixture
@@ -481,7 +486,7 @@ class TestStokesComparison:
         V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 2, shape=(2,)))
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         return inner(grad(u), grad(v)) * dx_rt
 
     @pytest.fixture
@@ -502,7 +507,7 @@ class TestStokesComparison:
         Q = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
         v = ufl.TestFunction(V)
         p = ufl.TrialFunction(Q)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         return -p * div(v) * dx_rt
 
     @pytest.fixture
@@ -595,7 +600,7 @@ class TestTabulationUtilities:
         V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         form = inner(grad(u), grad(v)) * dx_rt
 
         # Compile
@@ -618,7 +623,7 @@ class TestTabulationUtilities:
         V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         form = inner(grad(u), grad(v)) * dx_rt
 
         module = compile_runtime_integrals(form)
@@ -649,7 +654,7 @@ class TestExampleUsage:
         V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
         form_runtime = inner(grad(u), grad(v)) * dx_rt
 
         # Also create standard form for comparison

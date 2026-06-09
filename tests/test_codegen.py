@@ -10,10 +10,26 @@ from runintgen import (
     QuadratureRules,
     RuntimeQuadratureRule,
     compile_runtime_integrals,
-    dSq,
-    dxq,
     get_runintgen_data_struct,
 )
+
+
+class _RuntimeRule:
+    points = ()
+    weights = ()
+
+
+def _runtime_measure(
+    integral_type: str,
+    mesh: ufl.Mesh,
+    subdomain_id="everywhere",
+) -> ufl.Measure:
+    return ufl.Measure(
+        integral_type,
+        domain=mesh,
+        subdomain_id=subdomain_id,
+        subdomain_data=_RuntimeRule(),
+    )
 
 
 class TestCodeGeneration:
@@ -27,7 +43,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = dxq(subdomain_id=1, domain=mesh)
+        dx_rt = _runtime_measure("dx", mesh, subdomain_id=1)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -73,7 +89,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = dxq(subdomain_id=2, domain=mesh)
+        dx_rt = _runtime_measure("dx", mesh, subdomain_id=2)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -159,7 +175,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = _runtime_measure("dx", mesh)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -179,7 +195,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = _runtime_measure("dx", mesh)
         a = ufl.inner(u, v) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -296,7 +312,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
         dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=0)
-        dx_runtime = dxq(subdomain_id=2, domain=mesh)
+        dx_runtime = _runtime_measure("dx", mesh, subdomain_id=2)
         a = ufl.inner(u, v) * dx_standard
         a += ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_runtime
 
@@ -316,7 +332,7 @@ class TestCodeGeneration:
         V = ufl.FunctionSpace(mesh, V_el)
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = dxq(subdomain_id=(1, 2), domain=mesh)
+        dx_rt = _runtime_measure("dx", mesh, subdomain_id=(1, 2))
 
         module = compile_runtime_integrals(ufl.inner(u, v) * dx_rt)
 
@@ -339,7 +355,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
         dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=1)
-        dx_runtime = dxq(subdomain_id=2, domain=mesh)
+        dx_runtime = _runtime_measure("dx", mesh, subdomain_id=2)
         form = ufl.inner(u, v) * dx_standard + ufl.inner(u, v) * dx_runtime
 
         module = compile_runtime_integrals(form)
@@ -357,7 +373,7 @@ class TestCodeGeneration:
         V = ufl.FunctionSpace(mesh, V_el)
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = dxq(subdomain_id=2, domain=mesh)
+        dx_rt = _runtime_measure("dx", mesh, subdomain_id=2)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -395,7 +411,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = _runtime_measure("dx", mesh)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         module = compile_runtime_integrals(a)
@@ -413,7 +429,7 @@ class TestCodeGeneration:
         V = ufl.FunctionSpace(mesh, V_el)
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = _runtime_measure("dx", mesh)
         a = ufl.inner(u, v) * dx_rt
 
         complex128_module = compile_runtime_integrals(
@@ -448,9 +464,9 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
-        ds_rt = ufl.Measure("ds", domain=mesh, metadata={"quadrature_rule": "runtime"})
-        dS_rt = ufl.Measure("dS", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = _runtime_measure("dx", mesh)
+        ds_rt = _runtime_measure("ds", mesh)
+        dS_rt = _runtime_measure("dS", mesh)
 
         cell_kernel = compile_runtime_integrals(ufl.inner(u, v) * dx_rt).kernels[0]
         exterior_kernel = compile_runtime_integrals(ufl.inner(u, v) * ds_rt).kernels[0]
@@ -470,7 +486,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dS_rt = dSq(domain=mesh)
+        dS_rt = _runtime_measure("dS", mesh)
         kernel = compile_runtime_integrals(ufl.jump(u) * ufl.jump(v) * dS_rt).kernels[
             0
         ]
@@ -494,7 +510,7 @@ class TestCodeGeneration:
         v = ufl.TestFunction(V)
         kappa = ufl.Coefficient(W)
 
-        dx_rt = dxq(subdomain_id=4, domain=mesh)
+        dx_rt = _runtime_measure("dx", mesh, subdomain_id=4)
         module = compile_runtime_integrals(kappa * ufl.inner(u, v) * dx_rt)
         kernel = module.kernels[0]
 
@@ -520,7 +536,7 @@ class TestCodeGeneration:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
 
-        dx_rt = dxq(subdomain_id=5, domain=mesh)
+        dx_rt = _runtime_measure("dx", mesh, subdomain_id=5)
         module = compile_runtime_integrals(ufl.inner(u, v) * dx_rt)
         kernel = module.kernels[0]
 
@@ -541,7 +557,7 @@ class TestCodeGeneration:
         u, p = ufl.split(w)
         v, q = ufl.split(z)
 
-        dx_rt = dxq(subdomain_id=6, domain=mesh)
+        dx_rt = _runtime_measure("dx", mesh, subdomain_id=6)
         form = (
             ufl.inner(ufl.grad(u), ufl.grad(v))
             - ufl.div(v) * p
@@ -604,7 +620,7 @@ class TestRuntimeElementMapping:
         v = ufl.TestFunction(V)
         kappa = ufl.Coefficient(V)
 
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = _runtime_measure("dx", mesh)
         a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         analysis = build_runtime_analysis(a, options={})
@@ -642,7 +658,7 @@ class TestRuntimeElementMapping:
         v = ufl.TestFunction(V)
         kappa = ufl.Coefficient(W)
 
-        dx_rt = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
+        dx_rt = _runtime_measure("dx", mesh)
         a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
 
         analysis = build_runtime_analysis(a, options={})

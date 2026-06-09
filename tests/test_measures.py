@@ -9,16 +9,10 @@ from ufl.pullback import identity_pullback
 from ufl.sobolevspace import H1
 
 from runintgen.measures import (
-    RUNTIME_QUADRATURE_RULE,
     RuntimeIntegralMode,
-    RuntimeMeasure,
-    dSq,
-    dsq,
-    dxq,
     get_quadrature_provider,
     is_runtime_integral,
     runtime_integral_mode,
-    runtime_measure,
 )
 
 
@@ -82,23 +76,18 @@ class TestIsRuntimeIntegral:
         coord_elem = LagrangeElement(cell, 1, (2,))
         return ufl.Mesh(coord_elem)
 
-    def test_runtime_integral_via_quadrature_rule(self, mesh):
-        """Test detection via quadrature_rule='runtime' metadata."""
-        dx = ufl.Measure("dx", domain=mesh, metadata={"quadrature_rule": "runtime"})
-        x = ufl.SpatialCoordinate(mesh)
-        form = x[0] * dx
-        integral = form.integrals()[0]
-        assert is_runtime_integral(integral) is True
+    def test_runtime_integral_with_subdomain_data(self, mesh):
+        """Test the runtime API with quadrature data in subdomain_data."""
 
-    def test_runtime_integral_with_subdomain_data_and_metadata(self, mesh):
-        """Test the recommended API with subdomain_data and metadata."""
-        # This is the recommended way to create runtime integrals
-        fake_quadrature_provider = {"type": "custom_quadrature"}
+        class Quadrature:
+            points = [(0.25, 0.25)]
+            weights = [0.5]
+
+        quadrature = Quadrature()
         dx = ufl.Measure(
             "dx",
             domain=mesh,
-            subdomain_data=fake_quadrature_provider,
-            metadata={"quadrature_rule": "runtime"},
+            subdomain_data=quadrature,
         )
         x = ufl.SpatialCoordinate(mesh)
         form = x[0] * dx
@@ -107,7 +96,7 @@ class TestIsRuntimeIntegral:
 
         # Check that we can get the provider back
         provider = get_quadrature_provider(integral)
-        assert provider == fake_quadrature_provider
+        assert provider is quadrature
 
     def test_runtime_integral_via_quadrature_subdomain_data(self, mesh):
         """Test detection via a quadrature rule in subdomain_data."""
@@ -171,52 +160,18 @@ class TestIsRuntimeIntegral:
         assert is_runtime_integral(integral) is False
         assert runtime_integral_mode(integral) is RuntimeIntegralMode.STANDARD
 
-    def test_dxq_preserves_marker_when_degree_is_set(self, mesh):
-        """Test runtime metadata survives UFL measure reconfiguration."""
-        quadrature_rule = {"type": "runtime_rule"}
-        dx0 = dxq(
-            domain=mesh,
-            subdomain_id=1,
-            subdomain_data=quadrature_rule,
-            metadata={"custom": "kept"},
-        )
-        dx1 = dx0(degree=5)
-
-        assert isinstance(dx1, RuntimeMeasure)
-        assert dx1.subdomain_data() is quadrature_rule
-        assert dx1.metadata()["quadrature_rule"] == RUNTIME_QUADRATURE_RULE
-        assert dx1.metadata()["quadrature_degree"] == 5
-        assert dx1.metadata()["custom"] == "kept"
-
-        x = ufl.SpatialCoordinate(mesh)
-        integral = (x[0] * dx1).integrals()[0]
-        assert is_runtime_integral(integral) is True
-        assert get_quadrature_provider(integral) is quadrature_rule
-
-    def test_runtime_facet_measure_helpers_use_fenicsx_integral_types(self, mesh):
-        """Facet helpers should remain ordinary ds/dS measures with runtime data."""
+    def test_runtime_facet_measures_use_fenicsx_integral_types(self, mesh):
+        """Plain ds/dS measures carry runtime data through subdomain_data."""
         exterior_provider = object()
         interior_provider = object()
 
-        ds_rt = dsq(domain=mesh, quadrature_provider=exterior_provider)
-        dS_rt = dSq(domain=mesh, quadrature_provider=interior_provider)
+        ds_rt = ufl.Measure("ds", domain=mesh, subdomain_data=exterior_provider)
+        dS_rt = ufl.Measure("dS", domain=mesh, subdomain_data=interior_provider)
 
         assert ds_rt.integral_type() == "exterior_facet"
         assert dS_rt.integral_type() == "interior_facet"
         assert ds_rt.subdomain_data() is exterior_provider
         assert dS_rt.subdomain_data() is interior_provider
-        assert ds_rt.metadata()["quadrature_rule"] == RUNTIME_QUADRATURE_RULE
-        assert dS_rt.metadata()["quadrature_rule"] == RUNTIME_QUADRATURE_RULE
-
-    def test_runtime_measure_rejects_ambiguous_provider_arguments(self, mesh):
-        """Test provider aliases cannot both be supplied."""
-        with pytest.raises(ValueError, match="either quadrature_provider"):
-            runtime_measure(
-                "dx",
-                domain=mesh,
-                quadrature_provider=object(),
-                subdomain_data=object(),
-            )
 
     def test_non_runtime_integral(self, mesh):
         """Test that regular integrals are not detected as runtime."""
@@ -225,7 +180,3 @@ class TestIsRuntimeIntegral:
         form = x[0] * dx
         integral = form.integrals()[0]
         assert is_runtime_integral(integral) is False
-
-    def test_runtime_quadrature_rule_constant(self):
-        """Test the RUNTIME_QUADRATURE_RULE constant."""
-        assert RUNTIME_QUADRATURE_RULE == "runtime"

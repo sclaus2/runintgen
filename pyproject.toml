@@ -2,7 +2,7 @@
 requires = [
     "scikit-build-core>=0.10",
     "nanobind>=2.0",
-    "fenics-basix>=0.11.0.dev0",
+    "fenics-basix>=0.11.0,<0.12.0",
     "numpy",
 ]
 build-backend = "scikit_build_core.build"
@@ -13,15 +13,15 @@ version = "0.1.0"
 description = "Runtime integration kernel generator for FEniCSx/FFCx"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Runintgen Developers"}
 ]
 dependencies = [
     "numpy",
-    "fenics-basix>=0.11.0.dev0",
-    "fenics-ufl>=2025.3.0.dev0",
-    "fenics-ffcx>=0.11.0.dev0",
+    "fenics-basix>=0.11.0,<0.12.0",
+    "fenics-ufl>=2026.1.0,<2026.2.0",
+    "fenics-ffcx>=0.11.0,<0.12.0",
 ]
 
 [project.optional-dependencies]

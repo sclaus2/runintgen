@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+__version__ = "0.1.0"
+
 from .analysis import (
     ArgumentInfo,
     ArgumentRole,
@@ -48,19 +50,13 @@ from .geometry import (
     scale_weights_by_jacobian,
 )
 from .measures import (
-    RUNTIME_QUADRATURE_RULE,
     RuntimeIntegralMode,
-    RuntimeMeasure,
-    dSq,
-    dsq,
-    dxq,
     get_quadrature_provider,
     has_runtime_quadrature,
     has_standard_subdomain_data,
     is_runtime_integral,
     is_runtime_quadrature_rule,
     runtime_integral_mode,
-    runtime_measure,
 )
 from .quadrature_function import (
     QuadratureFunction,
@@ -104,6 +100,7 @@ from .runtime_tables import (
 )
 
 __all__ = [
+    "__version__",
     # Analysis types
     "ArgumentInfo",
     "ArgumentRole",
@@ -145,19 +142,13 @@ __all__ = [
     "map_subcell_to_parent_reference",
     "scale_weights_by_jacobian",
     # Measures
-    "RUNTIME_QUADRATURE_RULE",
     "RuntimeIntegralMode",
-    "RuntimeMeasure",
-    "dSq",
-    "dsq",
-    "dxq",
     "get_quadrature_provider",
     "has_standard_subdomain_data",
     "has_runtime_quadrature",
     "is_runtime_quadrature_rule",
     "is_runtime_integral",
     "runtime_integral_mode",
-    "runtime_measure",
     # Quadrature functions
     "QuadratureFunction",
     "QuadratureFunctionInfo",

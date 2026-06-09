@@ -13,7 +13,7 @@ from runintgen.analysis import (
     RuntimeIntegralInfo,
     build_runtime_analysis,
 )
-from runintgen.measures import RUNTIME_QUADRATURE_RULE, RuntimeIntegralMode, dxq
+from runintgen.measures import RuntimeIntegralMode
 
 
 @pytest.fixture
@@ -38,7 +38,8 @@ def options():
 class MockQuadratureProvider:
     """Mock quadrature provider for testing."""
 
-    pass
+    points = ()
+    weights = ()
 
 
 class TestBuildRuntimeAnalysis:
@@ -54,7 +55,6 @@ class TestBuildRuntimeAnalysis:
             domain=mesh,
             subdomain_data=provider,
             subdomain_id=1,
-            metadata={"quadrature_rule": "runtime"},
         )
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
@@ -93,7 +93,6 @@ class TestBuildRuntimeAnalysis:
             domain=mesh,
             subdomain_data=provider,
             subdomain_id=1,
-            metadata={"quadrature_rule": "runtime"},
         )
         a = kappa * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
@@ -129,7 +128,6 @@ class TestBuildRuntimeAnalysis:
             domain=mesh,
             subdomain_data=provider,
             subdomain_id=1,
-            metadata={"quadrature_rule": "runtime"},
         )
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
@@ -154,7 +152,6 @@ class TestBuildRuntimeAnalysis:
             domain=mesh,
             subdomain_data=provider,
             subdomain_id=1,
-            metadata={"quadrature_rule": "runtime"},
         )
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
@@ -179,7 +176,6 @@ class TestBuildRuntimeAnalysis:
             domain=mesh,
             subdomain_data=provider,
             subdomain_id=1,
-            metadata={"quadrature_rule": "runtime"},
         )
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
 
@@ -197,7 +193,7 @@ class TestBuildRuntimeAnalysis:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
         provider = MockQuadratureProvider()
-        dx = dxq(domain=mesh, subdomain_id=3, subdomain_data=provider)
+        dx = ufl.Measure("dx", domain=mesh, subdomain_id=3, subdomain_data=provider)
         a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx(degree=5)
 
         analysis = build_runtime_analysis(a, options)
@@ -207,7 +203,6 @@ class TestBuildRuntimeAnalysis:
         assert analysis.groups[0].quadrature_provider is provider
         assert analysis.groups[0].mode is RuntimeIntegralMode.RUNTIME
         integral = analysis.form_data.integral_data[0].integrals[0]
-        assert integral.metadata()["quadrature_rule"] != RUNTIME_QUADRATURE_RULE
         assert integral.metadata()["quadrature_degree"] == 5
 
     def test_mixed_subdomain_data_group_mode(self, mesh, V, options):
@@ -248,11 +243,12 @@ class TestBuildRuntimeAnalysis:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
         dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=0)
+        provider = MockQuadratureProvider()
         dx_runtime = ufl.Measure(
             "dx",
             domain=mesh,
             subdomain_id=2,
-            metadata={"quadrature_rule": "runtime"},
+            subdomain_data=provider,
         )
         a = ufl.inner(u, v) * dx_standard
         a += ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_runtime
@@ -270,11 +266,12 @@ class TestBuildRuntimeAnalysis:
         u = ufl.TrialFunction(V)
         v = ufl.TestFunction(V)
         dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=1)
+        provider = MockQuadratureProvider()
         dx_runtime = ufl.Measure(
             "dx",
             domain=mesh,
             subdomain_id=2,
-            metadata={"quadrature_rule": "runtime"},
+            subdomain_data=provider,
         )
 
         analysis = build_runtime_analysis(
@@ -298,7 +295,6 @@ class TestBuildRuntimeAnalysis:
             domain=mesh,
             subdomain_id=(1, 2),
             subdomain_data=provider,
-            metadata={"quadrature_rule": "runtime"},
         )
 
         analysis = build_runtime_analysis(ufl.inner(u, v) * dx, options)
@@ -324,14 +320,12 @@ class TestBuildRuntimeAnalysis:
             domain=mesh,
             subdomain_id=1,
             subdomain_data=provider_1,
-            metadata={"quadrature_rule": "runtime"},
         )
         dx_2 = ufl.Measure(
             "dx",
             domain=mesh,
             subdomain_id=2,
             subdomain_data=provider_2,
-            metadata={"quadrature_rule": "runtime"},
         )
 
         analysis = build_runtime_analysis(

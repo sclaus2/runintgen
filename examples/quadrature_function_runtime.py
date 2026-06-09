@@ -23,7 +23,6 @@ from runintgen import (
     QuadratureFunction,
     QuadratureRules,
     compile_runtime_integrals,
-    dxq,
 )
 from runintgen.runtime_data import build_quadrature_function_value_set
 
@@ -68,7 +67,8 @@ def explicit_values_example() -> None:
     alpha_values = np.array([2.0, 3.0], dtype=np.float64)
     alpha.set_values(rules, alpha_values)
 
-    form = alpha * ufl.inner(u, v) * dxq(domain=mesh, quadrature_provider=rules)
+    dx_runtime = ufl.Measure("dx", domain=mesh, subdomain_data=rules)
+    form = alpha * ufl.inner(u, v) * dx_runtime
     module = compile_runtime_integrals(form)
     values = build_quadrature_function_value_set(module.quadrature_functions, rules)
 
@@ -90,7 +90,8 @@ def callable_source_example() -> None:
     alpha = QuadratureFunction(mesh, q_function)
     rules = _runtime_rules()
 
-    form = alpha * ufl.inner(u, v) * dxq(domain=mesh, quadrature_provider=rules)
+    dx_runtime = ufl.Measure("dx", domain=mesh, subdomain_data=rules)
+    form = alpha * ufl.inner(u, v) * dx_runtime
     module = compile_runtime_integrals(form)
     values = build_quadrature_function_value_set(module.quadrature_functions, rules)
 

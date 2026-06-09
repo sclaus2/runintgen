@@ -13,8 +13,7 @@ endif()
 
 if(_runintgen_compiler_prefix)
   if(EXISTS "${_runintgen_compiler_prefix}/bin/clang++")
-    if(NOT DEFINED CMAKE_CXX_COMPILER
-        OR CMAKE_CXX_COMPILER MATCHES "^/usr/bin/clang\\+\\+$")
+    if(NOT DEFINED CMAKE_CXX_COMPILER)
       set(CMAKE_CXX_COMPILER "${_runintgen_compiler_prefix}/bin/clang++"
         CACHE FILEPATH "C++ compiler" FORCE)
     endif()
