@@ -31,12 +31,98 @@ from .integrals_template import (
     runintgen_data_struct,
 )
 
+_SUPPORTED_SCALAR_DTYPES = {
+    np.dtype(np.float32),
+    np.dtype(np.float64),
+    np.dtype(np.complex64),
+    np.dtype(np.complex128),
+}
+_SUPPORTED_GEOMETRY_DTYPES = {np.dtype(np.float32), np.dtype(np.float64)}
+
 
 def _runtime_options(options: dict[str, Any]) -> dict[str, Any]:
     """Return FFCx options suitable for runtime code generation."""
     ffcx_options = get_options(dict(options or {}))
     ffcx_options["sum_factorization"] = False
+    scalar_type = _scalar_type_name(ffcx_options)
+    ffcx_options["scalar_type"] = np.dtype(scalar_type).type
+    ffcx_options["geometry_type"] = np.dtype(
+        _geometry_type_name(ffcx_options, scalar_type)
+    ).type
     return ffcx_options
+
+
+def _scalar_type_name(options: dict[str, Any]) -> str:
+    """Return the normalized PDE scalar dtype name."""
+    dtype = np.dtype(options.get("scalar_type", np.float64))
+    if dtype not in _SUPPORTED_SCALAR_DTYPES:
+        supported = ", ".join(sorted(dtype.name for dtype in _SUPPORTED_SCALAR_DTYPES))
+        raise NotImplementedError(f"runintgen supports scalar_type in {{{supported}}}.")
+    return dtype.name
+
+
+def _default_geometry_type_name(scalar_type: str) -> str:
+    """Return FFCx's default real coordinate dtype for a PDE scalar dtype."""
+    return np.dtype(dtype_to_scalar_dtype(scalar_type)).name
+
+
+def _geometry_type_name(
+    options: dict[str, Any], scalar_type: str | None = None
+) -> str:
+    """Return the normalized real coordinate dtype name."""
+    scalar_type = _scalar_type_name(options) if scalar_type is None else scalar_type
+    dtype = np.dtype(
+        options.get("geometry_type", _default_geometry_type_name(scalar_type))
+    )
+    if dtype not in _SUPPORTED_GEOMETRY_DTYPES:
+        supported = ", ".join(sorted(dtype.name for dtype in _SUPPORTED_GEOMETRY_DTYPES))
+        raise NotImplementedError(
+            f"runintgen supports geometry_type in {{{supported}}}."
+        )
+    return dtype.name
+
+
+def _patch_coordinate_dofs_signature(
+    code: str,
+    *,
+    scalar_type: str,
+    geometry_type: str,
+) -> str:
+    """Patch standard FFCx kernel coordinate_dofs type for split precision."""
+    default_geometry_type = _default_geometry_type_name(scalar_type)
+    if default_geometry_type == geometry_type:
+        return code
+
+    old = (
+        "const "
+        f"{dtype_to_c_type(default_geometry_type)}* restrict coordinate_dofs"
+    )
+    new = "const " f"{dtype_to_c_type(geometry_type)}* restrict coordinate_dofs"
+    patched = code.replace(old, new)
+    if patched == code:
+        raise RuntimeError(
+            "Unable to patch FFCx standard kernel coordinate_dofs signature "
+            f"from {default_geometry_type} to {geometry_type}."
+        )
+    return _patch_tabulate_tensor_initializer(
+        patched, scalar_type=scalar_type, geometry_type=geometry_type
+    )
+
+
+def _patch_tabulate_tensor_initializer(
+    code: str,
+    *,
+    scalar_type: str,
+    geometry_type: str,
+) -> str:
+    """Cast cross-geometry kernels into the fixed UFCx scalar slot type."""
+    if _default_geometry_type_name(scalar_type) == geometry_type:
+        return code
+    slot = f"tabulate_tensor_{scalar_type}"
+    return code.replace(
+        f".{slot} = tabulate_tensor_",
+        f".{slot} = (ufcx_{slot}*)tabulate_tensor_",
+    )
 
 
 def _subdomain_ids_by_integral(
@@ -148,8 +234,14 @@ def _standard_kernel_info(
 ) -> RuntimeKernelInfo:
     """Generate one standard FFCx kernel and return runintgen metadata."""
     c_decl, c_def = standard_integral_generator(integral_ir, domain, options)
-    scalar_type = np.dtype(options.get("scalar_type", np.float64)).name
-    geometry_type = np.dtype(dtype_to_scalar_dtype(scalar_type)).name
+    scalar_type = _scalar_type_name(options)
+    geometry_type = _geometry_type_name(options, scalar_type)
+    c_decl = _patch_coordinate_dofs_signature(
+        c_decl, scalar_type=scalar_type, geometry_type=geometry_type
+    )
+    c_def = _patch_coordinate_dofs_signature(
+        c_def, scalar_type=scalar_type, geometry_type=geometry_type
+    )
     return RuntimeKernelInfo(
         name=_kernel_name(integral_ir, domain),
         integral_type=integral_type,
@@ -452,7 +544,7 @@ def _tabulate_tensor_functions(
 
 
 def _tabulate_tensor_initializers(
-    scalar_type: str, factory_name: str
+    scalar_type: str, geometry_type: str, factory_name: str
 ) -> dict[str, str]:
     """Return UFCx tabulate function pointer initializers."""
     code = {
@@ -464,8 +556,11 @@ def _tabulate_tensor_initializers(
     if sys.platform.startswith("win32"):
         code["tabulate_tensor_complex64"] = ""
         code["tabulate_tensor_complex128"] = ""
+    function_name = f"tabulate_tensor_{factory_name}"
+    if _default_geometry_type_name(scalar_type) != geometry_type:
+        function_name = f"(ufcx_tabulate_tensor_{scalar_type}*){function_name}"
     code[f"tabulate_tensor_{scalar_type}"] = (
-        f".tabulate_tensor_{scalar_type} = tabulate_tensor_{factory_name},"
+        f".tabulate_tensor_{scalar_type} = {function_name},"
     )
     return code
 
@@ -535,8 +630,8 @@ def generate_C_runtime_kernels(
     ir = analysis.ir
     ffcx_options = _runtime_options(options)
 
-    scalar_type = np.dtype(ffcx_options.get("scalar_type", np.float64)).name
-    geometry_type = np.dtype(dtype_to_scalar_dtype(scalar_type)).name
+    scalar_type = _scalar_type_name(ffcx_options)
+    geometry_type = _geometry_type_name(ffcx_options, scalar_type)
     scalar_c = dtype_to_c_type(scalar_type)
     geom_c = dtype_to_c_type(geometry_type)
 
@@ -588,7 +683,9 @@ def generate_C_runtime_kernels(
                 enabled_coefficients_init, enabled_coefficients = (
                     _enabled_coefficients(integral_ir, func_name, q_infos)
                 )
-                tabulate_tensor = _tabulate_tensor_initializers(scalar_type, func_name)
+                tabulate_tensor = _tabulate_tensor_initializers(
+                    scalar_type, geometry_type, func_name
+                )
                 standard_integral_ir = standard_integrals.get(key, integral_ir)
                 local_index_expr = _local_index_expr(integral_type)
                 table_preparation = _table_preparation(element_requests, func_name)

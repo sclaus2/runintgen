@@ -11,6 +11,25 @@ from runintgen import QuadratureFunction
 from runintgen.jit import compile_forms
 from runintgen.runtime_data import QuadratureRules
 
+_SCALAR_KERNEL_SLOT = {
+    np.dtype(np.float32): "tabulate_tensor_float32",
+    np.dtype(np.float64): "tabulate_tensor_float64",
+    np.dtype(np.complex64): "tabulate_tensor_complex64",
+    np.dtype(np.complex128): "tabulate_tensor_complex128",
+}
+
+_SCALAR_C_TYPE = {
+    np.dtype(np.float32): "float",
+    np.dtype(np.float64): "double",
+    np.dtype(np.complex64): "float _Complex",
+    np.dtype(np.complex128): "double _Complex",
+}
+
+_GEOMETRY_C_TYPE = {
+    np.dtype(np.float32): "float",
+    np.dtype(np.float64): "double",
+}
+
 
 def _space():
     mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
@@ -59,6 +78,42 @@ def test_compile_runtime_form_exposes_runtime_metadata():
     assert module._runintgen_jit.kernels[0].mode == "runtime"
     assert module._runintgen_jit.forms[0].module.form_metadata is not None
     assert module._runintgen_jit.forms[0].integral_infos[0].needs_custom_data
+
+
+@pytest.mark.parametrize(
+    "scalar_dtype",
+    [np.float32, np.float64, np.complex64, np.complex128],
+)
+@pytest.mark.parametrize("geometry_dtype", [np.float32, np.float64])
+def test_compile_runtime_form_exposes_scalar_geometry_kernel(
+    scalar_dtype, geometry_dtype
+):
+    """Runtime kernels support independent PDE scalar and geometry dtypes."""
+    mesh, V = _space()
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_runtime_rules())
+    form = ufl.inner(u, v) * dx_rt
+
+    scalar_dtype = np.dtype(scalar_dtype)
+    geometry_dtype = np.dtype(geometry_dtype)
+    forms, module, code = compile_forms(
+        [form],
+        options={
+            "scalar_type": scalar_dtype.type,
+            "geometry_type": geometry_dtype.type,
+        },
+    )
+    integral = forms[0].form_integrals[0]
+    slot = _SCALAR_KERNEL_SLOT[scalar_dtype]
+    scalar_c = _SCALAR_C_TYPE[scalar_dtype]
+    geometry_c = _GEOMETRY_C_TYPE[geometry_dtype]
+
+    assert module._runintgen_jit.kernels[0].scalar_type == scalar_dtype.name
+    assert module._runintgen_jit.kernels[0].geometry_type == geometry_dtype.name
+    assert getattr(integral, slot) != module.ffi.NULL
+    assert f"{scalar_c}* restrict A" in code[1]
+    assert f"const {geometry_c}* restrict coordinate_dofs" in code[1]
 
 
 def test_compile_combined_standard_and_runtime_form():

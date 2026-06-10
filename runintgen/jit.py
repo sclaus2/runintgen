@@ -32,6 +32,7 @@ from ffcx.codegeneration.jit import (
     UFC_INTEGRAL_DECL,
     get_cached_module,
 )
+from ffcx.codegeneration.utils import dtype_to_scalar_dtype
 
 from .analysis import RuntimeAnalysisInfo, build_runtime_info
 from .codegeneration.C.integrals import (
@@ -51,6 +52,14 @@ from .runtime_data import CFFI_DEF
 
 logger = logging.getLogger("runintgen")
 root_logger = logging.getLogger()
+
+_SUPPORTED_SCALAR_DTYPES = {
+    np.dtype(np.float32),
+    np.dtype(np.float64),
+    np.dtype(np.complex64),
+    np.dtype(np.complex128),
+}
+_SUPPORTED_GEOMETRY_DTYPES = {np.dtype(np.float32), np.dtype(np.float64)}
 
 
 @dataclass(frozen=True)
@@ -118,6 +127,28 @@ def _runtime_signature() -> str:
     digest.update(runtime_abi_header_text().encode("utf-8"))
     digest.update(b"runintgen-combined-jit-v1")
     return digest.hexdigest()
+
+
+def _normalise_scalar_geometry_options(options: dict[str, Any]) -> None:
+    """Validate and normalize scalar_type/geometry_type in-place."""
+    scalar_dtype = np.dtype(options.get("scalar_type", np.float64))
+    if scalar_dtype not in _SUPPORTED_SCALAR_DTYPES:
+        supported = ", ".join(sorted(dtype.name for dtype in _SUPPORTED_SCALAR_DTYPES))
+        raise NotImplementedError(
+            f"runintgen JIT supports scalar_type in {{{supported}}}."
+        )
+
+    geometry_dtype = np.dtype(
+        options.get("geometry_type", dtype_to_scalar_dtype(scalar_dtype))
+    )
+    if geometry_dtype not in _SUPPORTED_GEOMETRY_DTYPES:
+        supported = ", ".join(sorted(dtype.name for dtype in _SUPPORTED_GEOMETRY_DTYPES))
+        raise NotImplementedError(
+            f"runintgen JIT supports geometry_type in {{{supported}}}."
+        )
+
+    options["scalar_type"] = scalar_dtype.type
+    options["geometry_type"] = geometry_dtype.type
 
 
 def _normalised_subdomain_ids(subdomain_id: Any) -> tuple[Any, ...]:
@@ -486,13 +517,7 @@ def compile_forms(
     cffi_extra_compile_args = list(cffi_extra_compile_args or [])
     p = ffcx.options.get_options(options or {})
     p["sum_factorization"] = False
-
-    if np.issubdtype(np.dtype(p["scalar_type"]), np.complexfloating):
-        raise NotImplementedError("runintgen JIT currently supports float64 only.")
-
-    dtype = np.dtype(p["scalar_type"])
-    if dtype != np.dtype(np.float64):
-        raise NotImplementedError("runintgen JIT currently supports float64 only.")
+    _normalise_scalar_geometry_options(p)
 
     signature_tag = (
         _compute_option_signature(p)
