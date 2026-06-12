@@ -57,6 +57,14 @@ def _quadrature_function_infos(metadata_or_module: Any) -> list[Any]:
     return list(getattr(metadata_or_module, "quadrature_functions", []) or [])
 
 
+def _quadrature_function_slots(metadata_or_module: Any) -> list[int] | None:
+    """Return active quadrature-function slots for a kernel view, if supplied."""
+    slots = getattr(metadata_or_module, "quadrature_function_slots", None)
+    if slots is None:
+        return None
+    return [int(slot) for slot in slots]
+
+
 class CustomData:
     """Basix-only owner for generated-kernel ``custom_data``.
 
@@ -93,8 +101,9 @@ class CustomData:
         )
         q_values = build_quadrature_function_value_set(
             _quadrature_function_infos(metadata_or_module),
-            self._payload.rules,
+            self._payload,
             fallback_evaluator=quadrature_function_evaluator,
+            active_slots=_quadrature_function_slots(metadata_or_module),
         )
         if q_values is not None:
             self._payload = RuntimeQuadraturePayload(

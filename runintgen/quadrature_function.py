@@ -30,6 +30,7 @@ class QuadratureFunctionInfo:
     """Compiler/runtime information for one quadrature function."""
 
     terminal: ufl.Coefficient
+    restriction: str | None
     coefficient_number: int
     slot: int
     name: str | None
@@ -251,21 +252,40 @@ def validate_quadrature_function_form(value: ufl.Form) -> None:
 
 def collect_quadrature_function_infos(ir: Any) -> list[QuadratureFunctionInfo]:
     """Collect quadrature functions from FFCx integral coefficient numbering."""
-    by_number: dict[int, ufl.Coefficient] = {}
+    by_key: dict[tuple[ufl.Coefficient, str | None], int] = {}
     for integral_ir in getattr(ir, "integrals", []):
-        numbering = getattr(integral_ir.expression, "coefficient_numbering", {})
-        for terminal, number in numbering.items():
-            if is_quadrature_function(terminal):
-                by_number.setdefault(int(number), terminal)
+        expression = integral_ir.expression
+        numbering = getattr(expression, "coefficient_numbering", {})
+        for integrand_data in getattr(expression, "integrand", {}).values():
+            factorization = integrand_data.get("factorization")
+            if factorization is None:
+                continue
+            for node_data in factorization.nodes.values():
+                mt = node_data.get("mt")
+                terminal = getattr(mt, "terminal", None)
+                if not is_quadrature_function(terminal):
+                    continue
+                if terminal not in numbering:
+                    continue
+                restriction = getattr(mt, "restriction", None)
+                by_key.setdefault((terminal, restriction), int(numbering[terminal]))
+
+    restriction_rank = {None: 0, "+": 1, "-": 2}
 
     infos: list[QuadratureFunctionInfo] = []
-    for slot, coefficient_number in enumerate(sorted(by_number)):
-        terminal = by_number[coefficient_number]
+    entries = sorted(
+        ((number, restriction_rank.get(restriction, 99), terminal, restriction)
+         for (terminal, restriction), number in by_key.items()),
+        key=lambda item: (item[0], item[1], repr(item[2])),
+    )
+    for slot, (coefficient_number, _, terminal, restriction) in enumerate(entries):
         spec = quadrature_function_spec(terminal)
-        label = spec.name or f"quadrature_function_{slot}"
+        base_label = spec.name or f"quadrature_function_{slot}"
+        label = f"{base_label}({restriction})" if restriction is not None else base_label
         infos.append(
             QuadratureFunctionInfo(
                 terminal=terminal,
+                restriction=restriction,
                 coefficient_number=coefficient_number,
                 slot=slot,
                 name=spec.name,

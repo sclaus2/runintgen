@@ -13,6 +13,8 @@ from runintgen import (
     QuadratureFunction,
     QuadratureRules,
     RuntimeContextBuilder,
+    RuntimeEntityMap,
+    RuntimeQuadraturePayload,
     compile_runtime_integrals,
 )
 from runintgen.runtime_data import build_quadrature_function_value_set
@@ -32,6 +34,10 @@ def _dx_runtime(mesh: ufl.Mesh) -> ufl.Measure:
     return ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
 
 
+def _dS_runtime(mesh: ufl.Mesh) -> ufl.Measure:
+    return ufl.Measure("dS", domain=mesh, subdomain_data=_RuntimeRule())
+
+
 def _rules(*, physical_points: np.ndarray | None = None) -> QuadratureRules:
     """Return a small runtime quadrature rule set."""
     points = np.array([[0.2, 0.3], [0.6, 0.2]], dtype=np.float64)
@@ -48,6 +54,24 @@ def _rules(*, physical_points: np.ndarray | None = None) -> QuadratureRules:
         offsets=offsets,
         **kwargs,
     )
+
+
+def _interior_payload() -> RuntimeQuadraturePayload:
+    """Return a two-sided runtime interior-facet payload."""
+    rules = QuadratureRules(
+        tdim=2,
+        points=np.array([[0.2, 0.3], [0.6, 0.2]], dtype=np.float64),
+        secondary_points=np.array([[0.8, 0.3], [0.4, 0.2]], dtype=np.float64),
+        weights=np.array([0.25, 0.25], dtype=np.float64),
+        offsets=np.array([0, 2], dtype=np.int32),
+        parent_map=np.array([10], dtype=np.int32),
+    )
+    entities = RuntimeEntityMap(
+        entity_indices=np.array([[10, 1, 20, 2]], dtype=np.int32),
+        is_cut=np.array([1], dtype=np.uint8),
+        rule_indices=np.array([0], dtype=np.int32),
+    )
+    return RuntimeQuadraturePayload(rules=rules, entities=entities)
 
 
 def test_quadrature_function_mesh_constructor_defaults_to_scalar_dg0() -> None:
@@ -175,6 +199,85 @@ def test_vector_quadrature_function_uses_component_inner_stride() -> None:
 
     assert "q_function_0[(q0 + iq) * 2]" in kernel.c_definition
     assert "q_function_0[(q0 + iq) * 2 + 1]" in kernel.c_definition
+
+
+def test_restricted_quadrature_function_occurrences_use_distinct_slots() -> None:
+    """Plus and minus restrictions should request separate value slots."""
+    mesh = _mesh()
+    V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
+    v = ufl.TestFunction(V)
+    alpha = QuadratureFunction(mesh, name="alpha")
+
+    module = compile_runtime_integrals(
+        (alpha("+") * v("+") + alpha("-") * v("-")) * _dS_runtime(mesh)
+    )
+    kernel = module.kernels[0]
+
+    assert [info.label for info in module.quadrature_functions] == [
+        "alpha(+)",
+        "alpha(-)",
+    ]
+    assert [info.restriction for info in module.quadrature_functions] == ["+", "-"]
+    assert kernel.quadrature_function_slots == [0, 1]
+    assert "q_function_0[q0 + iq]" in kernel.c_definition
+    assert "q_function_1[q0 + iq]" in kernel.c_definition
+
+
+def test_restricted_quadrature_function_evaluator_requests_are_distinct() -> None:
+    """Context-aware evaluators should receive side-specific rule views."""
+    mesh = _mesh()
+    V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
+    v = ufl.TestFunction(V)
+    payload = _interior_payload()
+    seen = []
+
+    class RestrictionEvaluator:
+        def evaluate(self, context):
+            seen.append(
+                (
+                    context.info.restriction,
+                    context.rules.points.copy(),
+                    context.rules.parent_map.copy(),
+                    dict(context.metadata or {}),
+                )
+            )
+            if context.info.restriction == "+":
+                return np.array([1.0, 2.0], dtype=np.float64)
+            if context.info.restriction == "-":
+                return np.array([3.0, 4.0], dtype=np.float64)
+            raise AssertionError("expected restricted QuadratureFunction request")
+
+    alpha = QuadratureFunction(mesh, RestrictionEvaluator(), name="alpha")
+    module = compile_runtime_integrals(
+        (alpha("+") * v("+") + alpha("-") * v("-")) * _dS_runtime(mesh)
+    )
+
+    values = build_quadrature_function_value_set(module.quadrature_functions, payload)
+
+    assert values is not None
+    np.testing.assert_allclose(values.functions[0].values, [1.0, 2.0])
+    np.testing.assert_allclose(values.functions[1].values, [3.0, 4.0])
+    assert [item[0] for item in seen] == ["+", "-"]
+    np.testing.assert_allclose(seen[0][1], payload.rules.points)
+    np.testing.assert_allclose(seen[1][1], payload.rules.secondary_points)
+    np.testing.assert_array_equal(seen[0][2], [10])
+    np.testing.assert_array_equal(seen[1][2], [20])
+    assert seen[0][3]["point_set"] == 0
+    assert seen[1][3]["point_set"] == 1
+    np.testing.assert_array_equal(seen[0][3]["local_facets"], [1])
+    np.testing.assert_array_equal(seen[1][3]["local_facets"], [2])
+
+
+def test_restricted_quadrature_function_requires_side_context() -> None:
+    """Side-restricted slots should not be evaluated from side-neutral rules."""
+    mesh = _mesh()
+    V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
+    v = ufl.TestFunction(V)
+    alpha = QuadratureFunction(mesh, name="alpha")
+    module = compile_runtime_integrals(alpha("+") * v("+") * _dS_runtime(mesh))
+
+    with pytest.raises(ValueError, match="RuntimeQuadraturePayload"):
+        build_quadrature_function_value_set(module.quadrature_functions, _rules())
 
 
 def test_multiple_quadrature_functions_in_pointwise_expression() -> None:

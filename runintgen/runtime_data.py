@@ -756,15 +756,139 @@ def _normalise_quadrature_function_values(
     return array
 
 
+def _interior_facet_rows_by_rule(
+    payload: RuntimeQuadraturePayload,
+    *,
+    label: str,
+) -> npt.NDArray[np.int32]:
+    """Return one DOLFINx interior-facet row for each runtime rule."""
+    rules = payload.rules
+    entities = payload.entities
+    rows = entities.entity_indices
+    if rows.ndim != 2 or rows.shape[1] != 4:
+        raise ValueError(
+            f"Restricted QuadratureFunction {label!r} requires an "
+            "interior-facet RuntimeQuadraturePayload with entity rows shaped "
+            "(cell_plus, local_facet_plus, cell_minus, local_facet_minus)."
+        )
+
+    cut_mask = entities.is_cut != 0
+    if int(np.count_nonzero(cut_mask)) != int(rules.num_rules):
+        raise ValueError(
+            f"Restricted QuadratureFunction {label!r} requires one cut "
+            "interior-facet row per runtime quadrature rule."
+        )
+
+    rows_by_rule = np.empty((rules.num_rules, rows.shape[1]), dtype=np.int32)
+    seen = np.zeros(rules.num_rules, dtype=bool)
+    for row, rule_index in zip(rows[cut_mask], entities.rule_indices[cut_mask]):
+        idx = int(rule_index)
+        if idx < 0 or idx >= rules.num_rules:
+            raise ValueError(
+                f"Restricted QuadratureFunction {label!r} received an invalid "
+                f"runtime rule index {idx}."
+            )
+        rows_by_rule[idx, :] = row
+        seen[idx] = True
+
+    if not bool(np.all(seen)):
+        missing = np.nonzero(~seen)[0].tolist()
+        raise ValueError(
+            f"Restricted QuadratureFunction {label!r} is missing side context "
+            f"for runtime rule(s) {missing}."
+        )
+    return np.ascontiguousarray(rows_by_rule, dtype=np.int32)
+
+
+def _quadrature_rules_for_info(
+    info: Any,
+    rules: QuadratureRules,
+    payload: RuntimeQuadraturePayload | None,
+) -> tuple[QuadratureRules, dict[str, Any] | None]:
+    """Return the rule view that should be used for one QF slot."""
+    restriction = getattr(info, "restriction", None)
+    if restriction is None:
+        return rules, None
+    if restriction not in {"+", "-"}:
+        raise ValueError(
+            f"Unsupported QuadratureFunction restriction {restriction!r} for "
+            f"{info.label!r}."
+        )
+    if payload is None:
+        raise ValueError(
+            f"Restricted QuadratureFunction {info.label!r} requires a "
+            "RuntimeQuadraturePayload carrying final dS side context; a "
+            "side-neutral QuadratureRules object is not sufficient."
+        )
+
+    rows = _interior_facet_rows_by_rule(payload, label=info.label)
+    point_set = 0 if restriction == "+" else 1
+    points = rules.points if restriction == "+" else rules.secondary_points
+    if points is None:
+        raise ValueError(
+            f"Restricted QuadratureFunction {info.label!r} requested the "
+            "minus side, but this runtime quadrature payload has no "
+            "secondary_points."
+        )
+
+    cell_column = 0 if restriction == "+" else 2
+    local_facet_column = 1 if restriction == "+" else 3
+    parent_map = np.ascontiguousarray(rows[:, cell_column], dtype=np.int32)
+    local_facets = np.ascontiguousarray(rows[:, local_facet_column], dtype=np.int32)
+
+    side_rules = QuadratureRules(
+        tdim=rules.tdim,
+        points=points,
+        weights=rules.weights,
+        offsets=rules.offsets,
+        parent_map=parent_map,
+        rule_id=rules.rule_id,
+        kind=rules.kind,
+        gdim=rules.gdim,
+        physical_points=rules.physical_points,
+    )
+    metadata = {
+        "side": restriction,
+        "point_set": point_set,
+        "base_rules": rules,
+        "base_payload": payload,
+        "entity_indices": rows,
+        "parent_map": parent_map,
+        "local_facets": local_facets,
+    }
+    return side_rules, metadata
+
+
 def build_quadrature_function_value_set(
     infos: list[Any],
-    rules: QuadratureRules,
+    rules: QuadratureRules | RuntimeQuadraturePayload,
     *,
     fallback_evaluator: Any | None = None,
+    active_slots: list[int] | tuple[int, ...] | None = None,
 ) -> QuadratureFunctionValueSet | None:
     """Resolve callable or explicit values for generated quadrature functions."""
+    if active_slots is not None:
+        active_slot_set = {int(slot) for slot in active_slots}
+        if not active_slot_set:
+            return None
+        infos = [info for info in infos if int(info.slot) in active_slot_set]
+        if not infos:
+            return None
+        max_slot = max(active_slot_set)
+        packed: list[QuadratureFunctionValue | None] = [
+            QuadratureFunctionValue(
+                values=np.empty((0,), dtype=np.float64), value_size=1
+            )
+            for _ in range(max_slot + 1)
+        ]
+    else:
+        packed = []
+
     if not infos:
         return None
+
+    payload = rules if isinstance(rules, RuntimeQuadraturePayload) else None
+    base_rules = payload.rules if payload is not None else rules
 
     from .quadrature_function import (
         quadrature_function_cache,
@@ -772,59 +896,71 @@ def build_quadrature_function_value_set(
         quadrature_function_values,
     )
 
-    packed: list[QuadratureFunctionValue] = []
     for info in infos:
+        active_rules, metadata = _quadrature_rules_for_info(
+            info,
+            base_rules,
+            payload,
+        )
         explicit_values = quadrature_function_values(info.terminal)
-        rule_values = explicit_values.get(str(rules.rule_id))
+        rule_values = explicit_values.get(str(active_rules.rule_id))
         if rule_values is not None:
             values = _normalise_quadrature_function_values(
                 rule_values,
                 value_size=info.value_size,
-                total_points=rules.total_points,
+                total_points=active_rules.total_points,
                 borrowed=True,
             )
         else:
             source = quadrature_function_source(info.terminal)
             if source is not None and hasattr(source, "evaluate"):
-                context = QuadratureEvaluationContext(rules=rules, info=info)
+                context = QuadratureEvaluationContext(
+                    rules=active_rules,
+                    info=info,
+                    metadata=metadata,
+                )
                 source_key_fn = getattr(source, "cache_key", None)
                 source_key = (
                     source_key_fn(context)
                     if source_key_fn is not None
                     else id(source)
                 )
-                cache_key = (str(rules.rule_id), source_key)
+                cache_key = (str(active_rules.rule_id), info.slot, source_key)
                 cache = quadrature_function_cache(info.terminal)
                 raw_values = cache.get(cache_key)
                 if raw_values is None:
                     raw_values = source.evaluate(context)
                     cache[cache_key] = raw_values
             elif source is not None:
-                if rules.physical_points is None:
+                if active_rules.physical_points is None:
                     raise ValueError(
                         f"QuadratureFunction {info.label!r} uses a callable source, "
                         "but the quadrature rules do not carry physical_points."
                     )
-                raw_values = source(rules.physical_points)
+                raw_values = source(active_rules.physical_points)
             elif fallback_evaluator is not None:
-                raw_values = fallback_evaluator(info, rules)
+                raw_values = fallback_evaluator(info, active_rules)
             else:
                 raise ValueError(
                     f"QuadratureFunction {info.label!r} has no values for "
-                    f"quadrature rule {rules.rule_id!r}."
+                    f"quadrature rule {active_rules.rule_id!r}."
                 )
             values = _normalise_quadrature_function_values(
                 raw_values,
                 value_size=info.value_size,
-                total_points=rules.total_points,
+                total_points=active_rules.total_points,
                 borrowed=False,
             )
 
-        packed.append(
-            QuadratureFunctionValue(values=values, value_size=info.value_size)
-        )
+        packed_value = QuadratureFunctionValue(values=values, value_size=info.value_size)
+        if active_slots is None:
+            packed.append(packed_value)
+        else:
+            packed[int(info.slot)] = packed_value
 
-    return QuadratureFunctionValueSet(functions=packed)
+    return QuadratureFunctionValueSet(
+        functions=[item for item in packed if item is not None]
+    )
 
 
 def as_runtime_quadrature_rules(
