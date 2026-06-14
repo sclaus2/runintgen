@@ -24,29 +24,46 @@ Basix tabulation callbacks supplied by the runtime context.
 
 ## Installation
 
-Use the FEniCSx 0.11 release stack so the Python code-generation imports and
-Basix C++ ABI stay consistent:
+Use the FEniCSx 0.11 conda-forge stack so the Python code-generation imports
+and Basix C++ ABI stay consistent. A tested minimal source-build environment is:
 
 ```bash
-# Install build tools
-python -m pip install --upgrade pip setuptools wheel scikit-build-core nanobind numpy cffi
+mamba create -n runintgen-dev -c conda-forge \
+  python=3.12 \
+  fenics-basix=0.11.0 fenics-ffcx=0.11.0 fenics-ufl=2026.1.0 \
+  scikit-build-core nanobind cffi cmake ninja pkg-config compilers numpy
+mamba activate runintgen-dev
 
-# Install the FEniCSx 0.11 release packages
-python -m pip install --upgrade --force-reinstall \
-  "fenics-basix>=0.11.0,<0.12.0" \
-  "fenics-ufl>=2026.1.0,<2026.2.0" \
-  "fenics-ffcx>=0.11.0,<0.12.0"
+export CONDA_PREFIX="${CONDA_PREFIX:?activate the conda environment first}"
+export CMAKE_PREFIX_PATH="$CONDA_PREFIX"
+export PYTHONNOUSERSITE=1
+export CC="$CONDA_PREFIX/bin/clang"
+export CXX="$CONDA_PREFIX/bin/clang++"
+```
 
-# Install runintgen against that stack
-cd PATH_TO/runintgen
+On macOS with conda-forge clang and DOLFINx/FEniCSx headers, also use:
+
+```bash
+export CMAKE_ARGS="-DCMAKE_OSX_DEPLOYMENT_TARGET=13.4"
+export CXXFLAGS="-D_LIBCPP_ENABLE_EXPERIMENTAL -D_LIBCPP_HAS_NO_EXPERIMENTAL_TZDB -D_LIBCPP_HAS_NO_EXPERIMENTAL_SYNCSTREAM -D_LIBCPP_HAS_NO_INCOMPLETE_PSTL"
+```
+
+Install runintgen from the repository root:
+
+```bash
 python -m pip install --no-build-isolation --no-deps --force-reinstall .
+python - <<'PY'
+import runintgen
+import runintgen.basix_runtime
+print("runintgen import ok")
+PY
 ```
 
 The default install builds the Basix-only runtime extension used to construct
 ``custom_data`` without depending on DOLFINx. It requires a C++20 compiler and a
-Basix installation discoverable by CMake. In conda environments, the build
-prefers the compiler from the Python environment so it matches the Basix
-library ABI.
+Basix installation discoverable by CMake. Keep `CMAKE_PREFIX_PATH`, `CC`, and
+`CXX` pointed at the active conda environment so the extension links against the
+same Basix library ABI used by Python.
 
 ## Requirements
 
@@ -56,7 +73,8 @@ library ABI.
   UFL >= 2026.1.0 and < 2026.2.0, and FFCx >= 0.11.0 and < 0.12.0.
 - UFCx headers and a C/C++ compiler when compiling generated kernels.
 - DOLFINx is optional and only needed when constructing DOLFINx forms.
-- `cffi` is optional and mainly useful for Python-side ABI tests/prototypes.
+- `cffi` is optional and required by `runintgen.jit`; install it with the
+  `jit` extra.
 
 ## Quick Start
 
@@ -444,6 +462,9 @@ UFCx kernel called with void* custom_data
 MIT License - Copyright (c) 2025 ONERA
 
 See [LICENSE](LICENSE) for details.
+
+Dependency and provenance notes are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Acknowledgments
 

@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2025 ONERA
+# SPDX-License-Identifier: MIT
+#
+# This file defines runintgen-owned UFCx-compatible runtime templates. See
+# THIRD_PARTY_NOTICES.md for FFCx/UFCx provenance notes.
+
 """C templates for runtime kernels."""
 
 from __future__ import annotations

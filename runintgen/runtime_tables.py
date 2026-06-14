@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2025 ONERA
+# SPDX-License-Identifier: MIT
+#
+# This file uses FFCx table metadata when available. See
+# THIRD_PARTY_NOTICES.md for dependency and provenance notes.
+
 """Runtime table mapping for code generation.
 
 This module provides utilities to map between the analysis results

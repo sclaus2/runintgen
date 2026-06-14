@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2025 ONERA
+# SPDX-License-Identifier: MIT
+#
+# This file subclasses and composes FFCx code-generation APIs. See
+# THIRD_PARTY_NOTICES.md for dependency and provenance notes.
+
 """Runtime integral generation using FFCx IR.
 
 This module adapts FFCx's ``IntegralGenerator`` instead of hand-writing form

@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2025 ONERA
+# SPDX-License-Identifier: MIT
+#
+# This file integrates with FFCx C code-generation APIs. See
+# THIRD_PARTY_NOTICES.md for dependency and provenance notes.
+
 """C code generation glue for runtime integrals."""
 
 from __future__ import annotations

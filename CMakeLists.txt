@@ -1,26 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(_runintgen_compiler_prefix "")
-if(DEFINED Python_EXECUTABLE)
-  get_filename_component(_runintgen_python_bin "${Python_EXECUTABLE}" DIRECTORY)
-  get_filename_component(_runintgen_compiler_prefix
-    "${_runintgen_python_bin}" DIRECTORY)
-elseif(DEFINED ENV{CONDA_PREFIX})
-  set(_runintgen_compiler_prefix "$ENV{CONDA_PREFIX}")
-elseif(DEFINED ENV{VIRTUAL_ENV})
-  set(_runintgen_compiler_prefix "$ENV{VIRTUAL_ENV}")
-endif()
-
-if(_runintgen_compiler_prefix)
-  if(EXISTS "${_runintgen_compiler_prefix}/bin/clang++")
-    if(NOT DEFINED CMAKE_CXX_COMPILER)
-      set(CMAKE_CXX_COMPILER "${_runintgen_compiler_prefix}/bin/clang++"
-        CACHE FILEPATH "C++ compiler" FORCE)
-    endif()
-  endif()
-endif()
-unset(_runintgen_compiler_prefix)
-
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
 if(NOT SKBUILD)
@@ -32,11 +11,18 @@ endif()
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
 execute_process(
-  COMMAND "${Python_EXECUTABLE}" -c "import sys; print(sys.prefix)"
-  OUTPUT_VARIABLE RUNINTGEN_PYTHON_PREFIX
+  COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.cmake_dir())"
+  OUTPUT_VARIABLE RUNINTGEN_NANOBIND_CMAKE_DIR
+  RESULT_VARIABLE RUNINTGEN_NANOBIND_RESULT
+  ERROR_VARIABLE RUNINTGEN_NANOBIND_ERROR
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-list(APPEND CMAKE_PREFIX_PATH "${RUNINTGEN_PYTHON_PREFIX}")
+if(NOT RUNINTGEN_NANOBIND_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "Could not query nanobind CMake directory with ${Python_EXECUTABLE}.\n"
+    "${RUNINTGEN_NANOBIND_ERROR}")
+endif()
+list(APPEND CMAKE_PREFIX_PATH "${RUNINTGEN_NANOBIND_CMAKE_DIR}")
 
 find_package(nanobind CONFIG REQUIRED)
 find_package(Basix CONFIG REQUIRED)

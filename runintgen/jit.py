@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2025 ONERA
+# SPDX-License-Identifier: MIT
+#
+# This file integrates with FFCx JIT and UFCx declaration APIs. See
+# THIRD_PARTY_NOTICES.md for dependency and provenance notes.
+
 """CFFI JIT compiler for combined runintgen/FFCx forms."""
 
 from __future__ import annotations

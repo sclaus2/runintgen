@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2025 ONERA
+# SPDX-License-Identifier: MIT
+#
+# This file integrates with FFCx analysis and IR APIs. See
+# THIRD_PARTY_NOTICES.md for dependency and provenance notes.
+
 """Analysis module for runintgen.
 
 This module handles the detection and analysis of runtime integrals
