@@ -2,8 +2,8 @@
 requires = [
     "scikit-build-core>=0.10",
     "nanobind>=2.0",
-    "fenics-basix>=0.11.0,<0.12.0",
     "numpy",
+    "cffi",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -13,7 +13,7 @@ version = "0.1.0"
 description = "Runtime integration kernel generator for FEniCSx/FFCx"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [
     {name = "Runintgen Developers"}
 ]
@@ -25,15 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-jit = [
-    "cffi",
-]
 dev = [
     "setuptools",
     "wheel",
-    "scikit-build-core>=0.10",
-    "nanobind>=2.0",
-    "cffi",
     "pytest",
     "pytest-cov",
     "ruff",
@@ -60,7 +54,7 @@ sdist.exclude = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

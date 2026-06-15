@@ -67,7 +67,7 @@ same Basix library ABI used by Python.
 
 ## Requirements
 
-- Python >= 3.10.
+- Python >= 3.12.
 - NumPy.
 - FEniCSx Python packages: Basix >= 0.11.0 and < 0.12.0,
   UFL >= 2026.1.0 and < 2026.2.0, and FFCx >= 0.11.0 and < 0.12.0.
