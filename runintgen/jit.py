@@ -19,7 +19,7 @@ import sysconfig
 import tempfile
 import time
 from contextlib import redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +47,7 @@ from .codegeneration.C.integrals import (
 )
 from .cpp_headers import runtime_abi_header_text
 from .form_metadata import FormRuntimeMetadata, build_form_runtime_metadata
-from .measures import is_runtime_integral, runtime_integral_mode
+from .measures import get_quadrature_provider, is_runtime_integral, runtime_integral_mode
 from .quadrature_function import (
     collect_quadrature_function_infos,
     integral_quadrature_functions,
@@ -58,6 +58,8 @@ from .runtime_data import CFFI_DEF
 
 logger = logging.getLogger("runintgen")
 root_logger = logging.getLogger()
+
+_sidecar_cache: dict[str, JITModuleInfo] = {}
 
 _SUPPORTED_SCALAR_DTYPES = {
     np.dtype(np.float32),
@@ -164,6 +166,79 @@ def _normalised_subdomain_ids(subdomain_id: Any) -> tuple[Any, ...]:
     else:
         ids = (subdomain_id,)
     return tuple("otherwise" if sid == "everywhere" else sid for sid in ids)
+
+
+def _provider_lookup_key(integral_type: str, subdomain_id: Any) -> tuple[str, Any]:
+    """Return a stable key for matching current-form runtime providers."""
+    try:
+        sid = -1 if subdomain_id in ("otherwise", "everywhere") else int(subdomain_id)
+    except (TypeError, ValueError):
+        sid = subdomain_id
+    return integral_type, sid
+
+
+def _runtime_provider_map(form: ufl.Form) -> dict[tuple[str, Any], Any]:
+    """Return current runtime quadrature providers by integral type/id."""
+    providers: dict[tuple[str, Any], Any] = {}
+    for integral in form.integrals():
+        if runtime_integral_mode(integral).value == "standard":
+            continue
+        for sid in _normalised_subdomain_ids(integral.subdomain_id()):
+            providers[_provider_lookup_key(integral.integral_type(), sid)] = (
+                get_quadrature_provider(integral)
+            )
+    return providers
+
+
+def _sole_provider(providers: dict[Any, Any]) -> Any | None:
+    """Return the sole non-null provider when there is exactly one."""
+    values = [provider for provider in providers.values() if provider is not None]
+    if not values:
+        return None
+    return values[0] if len({id(provider) for provider in values}) == 1 else None
+
+
+def _rebind_sidecar(template: JITModuleInfo, forms: list[ufl.Form]) -> JITModuleInfo:
+    """Reuse compiled sidecar metadata with current runtime quadrature providers."""
+    rebound_forms: list[JITFormInfo] = []
+
+    for form_info, form in zip(template.forms, forms, strict=True):
+        current_providers = _runtime_provider_map(form)
+        module_providers: list[Any] = []
+        rebound_groups = []
+        for group in form_info.analysis.groups:
+            providers = {}
+            for sid in group.subdomain_ids:
+                key = _provider_lookup_key(group.integral_type, sid)
+                providers[sid] = current_providers.get(
+                    key,
+                    group.quadrature_providers.get(sid, group.quadrature_provider),
+                )
+            module_providers.extend(
+                provider for provider in providers.values() if provider is not None
+            )
+            rebound_groups.append(
+                replace(
+                    group,
+                    quadrature_provider=_sole_provider(providers),
+                    quadrature_providers=providers,
+                )
+            )
+
+        analysis = replace(form_info.analysis, groups=rebound_groups)
+        module = replace(
+            form_info.module,
+            quadrature_provider=(
+                module_providers[0]
+                if len({id(provider) for provider in module_providers}) == 1
+                else None
+            ),
+        )
+        rebound_forms.append(
+            replace(form_info, ufl_form=form, analysis=analysis, module=module)
+        )
+
+    return replace(template, forms=rebound_forms)
 
 
 def _runtime_form_signature(forms: list[ufl.Form]) -> str:
@@ -543,7 +618,11 @@ def compile_forms(
         cache_dir = Path(cache_dir)
         obj, mod = get_cached_module(module_name, form_names, cache_dir, timeout)
         if obj is not None:
-            _, _, sidecar = _generate_code(forms, module_name, p)
+            sidecar = _sidecar_cache.get(module_name)
+            if sidecar is None:
+                _, _, sidecar = _generate_code(forms, module_name, p)
+                _sidecar_cache[module_name] = sidecar
+            sidecar = _rebind_sidecar(sidecar, forms)
             _attach_sidecar(mod, sidecar, cache_dir)
             return obj, mod, (None, None)
     else:
@@ -570,6 +649,7 @@ def compile_forms(
         raise
 
     obj, module = _load_objects(cache_dir, module_name, form_names)
+    _sidecar_cache[module_name] = sidecar
     _attach_sidecar(module, sidecar, cache_dir)
     return obj, module, (decl, impl)
 
