@@ -61,17 +61,28 @@ class ArgumentRole(Enum):
 
 @dataclass
 class ElementInfo:
-    """Basix-related information for one element in a runtime integral."""
+    """Basix-related information for one element in a runtime integral.
+
+    ``terminals`` lists the ``(role, index)`` of each terminal tabulated with
+    this element, in first-use order. A split mixed argument is a single
+    terminal that appears under every concrete sub-element it uses.
+    """
 
     element: Any
     element_id: str
     max_derivative_order: int = 0
     derivative_tuples: set[DerivTuple] = field(default_factory=set)
+    terminals: list[tuple[ArgumentRole, int]] = field(default_factory=list)
 
     def register_derivative(self, deriv: DerivTuple) -> None:
         """Register that this derivative tuple is needed."""
         self.derivative_tuples.add(deriv)
         self.max_derivative_order = max(self.max_derivative_order, sum(deriv))
+
+    def register_terminal(self, role: ArgumentRole, index: int) -> None:
+        """Register that the terminal ``(role, index)`` uses this element."""
+        if (role, index) not in self.terminals:
+            self.terminals.append((role, index))
 
 
 @dataclass
@@ -553,6 +564,7 @@ def _process_modified_terminal(
 
     arg_info.register_derivative(deriv)
     elem_info.register_derivative(deriv)
+    elem_info.register_terminal(role, index)
 
 
 # -----------------------------------------------------------------------------

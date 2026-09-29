@@ -1,8 +1,9 @@
 """Tests for form_metadata module (Plan v2)."""
 
 import basix
+import pytest
 import ufl
-from basix.ufl import element
+from basix.ufl import element, mixed_element
 
 from runintgen import compile_runtime_integrals
 from runintgen.form_metadata import (
@@ -31,6 +32,30 @@ def create_laplacian_form():
     dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_RuntimeRule())
     a = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
     return a
+
+
+def create_mixed_degree_mass_form(cell: str, rank: int):
+    """Create a derivative-free form on a [P2]^d x P1 space.
+
+    No Jacobian is needed, so the scalar P1 sub-element is only reachable
+    through the split mixed test/trial functions.
+    """
+    gdim = ufl.Cell(cell).topological_dimension
+    mesh = ufl.Mesh(element("Lagrange", cell, 1, shape=(gdim,)))
+    W = ufl.FunctionSpace(
+        mesh,
+        mixed_element(
+            [element("Lagrange", cell, 2, shape=(gdim,)), element("Lagrange", cell, 1)]
+        ),
+    )
+    v, q = ufl.TestFunctions(W)
+    dx_rt = ufl.Measure(
+        "dx", domain=mesh, subdomain_id=1, subdomain_data=_RuntimeRule()
+    )
+    if rank == 1:
+        return (v[0] + q) * dx_rt
+    u, p = ufl.TrialFunctions(W)
+    return (ufl.inner(u, v) + p * q) * dx_rt
 
 
 def create_p2_laplacian_form():
@@ -308,6 +333,27 @@ class TestBuildFormRuntimeMetadata:
                 table["name"]: table["slot"] for table in table_info
             }
             assert set(table_slots.values()) == {0}
+
+    @pytest.mark.parametrize("rank", [1, 2])
+    @pytest.mark.parametrize("cell", ["quadrilateral", "hexahedron"])
+    def test_mixed_degree_sub_elements_without_derivatives(self, cell, rank):
+        """Test every mixed sub-element is registered without a Jacobian."""
+        module = compile_runtime_integrals(create_mixed_degree_mass_form(cell, rank))
+        metadata = module.form_metadata
+
+        keys = [info.element_key for info in metadata.unique_elements]
+        assert sorted(key.degree for key in keys) == [1, 2]
+        assert all(info.role is not Role.GEOMETRY for info in metadata.unique_elements)
+
+        (layout,) = metadata.integral_layouts.values()
+        assert sorted(usage.form_elem_index for usage in layout.element_usages) == [
+            0,
+            1,
+        ]
+        assert all(usage.max_derivative == 0 for usage in layout.element_usages)
+
+        (kernel,) = module.kernels
+        assert {table["element_index"] for table in kernel.table_info} == {0, 1}
 
 
 class TestExportMetadataForCpp:

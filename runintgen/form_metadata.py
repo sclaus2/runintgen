@@ -631,14 +631,17 @@ def build_form_runtime_metadata(
 
     # Step 1: Collect all unique elements across all runtime integrals
     # and record one representative usage for each
-    # We use ElementKey for proper identification
+    # We use ElementKey for proper identification. Iterate the concrete
+    # elements rather than the arguments: a split mixed argument is a single
+    # (role, index) entry but tabulates one element per sub-element.
     element_first_usage: dict[ElementKey, tuple[Any, Role, int, int, int]] = {}
 
     for (itype, ir_index), integral_info in analysis.integral_infos.items():
-        for (role, idx), arg_info in integral_info.arguments.items():
-            element = arg_info.element
+        for elem_info in integral_info.elements.values():
+            element = elem_info.element
             elem_key = element_key_from_basix(element)
             if elem_key not in element_first_usage:
+                role, idx = elem_info.terminals[0]
                 # Get ndofs and ncomps from element
                 ndofs, ncomps = _get_element_dims(element)
                 element_first_usage[elem_key] = (
@@ -672,22 +675,19 @@ def build_form_runtime_metadata(
         )
 
         # Collect elements used in this integral with their max derivatives
-        # ElementKey -> max_derivative (for this integral only)
+        # ElementKey -> max_derivative (for this integral only). Each modified
+        # terminal registers its derivative on its concrete element, so the
+        # argument-level maxima, which span all mixed sub-elements, add nothing.
+        # Distinct elements can share a key (e.g. a blocked coordinate element
+        # and its scalar sub-element), so take the maximum.
         integral_elem_maxderiv: dict[ElementKey, int] = {}
 
         for elem_id, elem_info in integral_info.elements.items():
             elem_key = element_key_from_basix(elem_info.element)
-            integral_elem_maxderiv[elem_key] = elem_info.max_derivative_order
-
-        # Also collect from arguments (may have different derivatives)
-        for (role, idx), arg_info in integral_info.arguments.items():
-            elem_key = element_key_from_basix(arg_info.element)
-            if elem_key in integral_elem_maxderiv:
-                integral_elem_maxderiv[elem_key] = max(
-                    integral_elem_maxderiv[elem_key], arg_info.max_derivative_order
-                )
-            else:
-                integral_elem_maxderiv[elem_key] = arg_info.max_derivative_order
+            integral_elem_maxderiv[elem_key] = max(
+                integral_elem_maxderiv.get(elem_key, 0),
+                elem_info.max_derivative_order,
+            )
 
         # Create element usages (assign table slots in order)
         key_to_table_slot: dict[ElementKey, int] = {}
