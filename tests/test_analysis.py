@@ -341,6 +341,64 @@ class TestBuildRuntimeAnalysis:
         assert group.quadrature_providers[2] is provider_2
 
 
+class TestPlaceholderQuadratureDegree:
+    """Tests for the IR quadrature degree of runtime-only integrals."""
+
+    def test_nonpolynomial_runtime_integrand_gets_element_degree(self, options):
+        """Test UFL's degree estimate does not size the placeholder rule."""
+        mesh = ufl.Mesh(basix_element("Lagrange", "hexahedron", 1, shape=(3,)))
+        V = ufl.FunctionSpace(mesh, basix_element("Lagrange", "hexahedron", 2))
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        g = ufl.grad(ufl.Coefficient(V))
+        n = g / ufl.sqrt(ufl.dot(g, g))
+        dx = ufl.Measure(
+            "dx", domain=mesh, subdomain_id=1, subdomain_data=MockQuadratureProvider()
+        )
+        a = ufl.inner(ufl.grad(n) * ufl.grad(u), ufl.grad(n) * ufl.grad(v)) * dx
+
+        analysis = build_runtime_analysis(a, options)
+
+        metadata = analysis.form_data.integral_data[0].integrals[0].metadata()
+        assert metadata["estimated_polynomial_degree"] > 20
+        assert metadata["quadrature_degree"] == 4
+        for ir in (analysis.ir, analysis.standard_ir):
+            for integral_ir in ir.integrals:
+                for _, rule in integral_ir.expression.integrand:
+                    assert len(rule.weights) == 3**3
+
+    def test_standard_and_mixed_integrals_keep_ufl_estimate(self, mesh, V, options):
+        """Test integrals with a standard body keep UFL's degree estimate."""
+
+        class Quadrature:
+            points = [(1.0 / 3.0, 1.0 / 3.0)]
+            weights = [0.5]
+
+        u = ufl.TrialFunction(V)
+        v = ufl.TestFunction(V)
+        integrand = ufl.Coefficient(V) ** 4 * ufl.inner(u, v)
+        dx_standard = ufl.Measure("dx", domain=mesh, subdomain_id=0)
+        dx_mixed = ufl.Measure(
+            "dx",
+            domain=mesh,
+            subdomain_id=1,
+            subdomain_data=[(1, [0, 2, 4]), (1, Quadrature())],
+        )
+        dx_runtime = ufl.Measure(
+            "dx", domain=mesh, subdomain_id=2, subdomain_data=MockQuadratureProvider()
+        )
+        a = integrand * dx_standard + 2.0 * integrand * dx_mixed
+        a += 3.0 * integrand * dx_runtime
+
+        analysis = build_runtime_analysis(a, options)
+
+        degrees = {
+            tuple(data.subdomain_id): data.integrals[0].metadata()["quadrature_degree"]
+            for data in analysis.form_data.integral_data
+        }
+        assert degrees == {(0,): 6, (1,): 6, (2,): 2}
+
+
 class TestElementInfo:
     """Tests for ElementInfo dataclass."""
 

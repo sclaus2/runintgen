@@ -37,6 +37,7 @@ from .measures import (
     is_runtime_integral,
     runtime_integral_mode,
 )
+from .quadrature_function import is_quadrature_function
 
 # Type aliases
 DerivTuple = tuple[int, ...]  # e.g. (1, 0) in 2D
@@ -203,6 +204,71 @@ def _get_element_id(element: Any) -> str:
     return str(hash(element))
 
 
+def _runtime_only_keys(form: ufl.Form) -> set[tuple[str, Any]]:
+    """Return ``(integral_type, subdomain_id)`` pairs with only runtime integrals.
+
+    Mixed integrals are excluded: their standard body integrates full cells with
+    the IR quadrature rule, so its degree is an accuracy choice.
+    """
+    modes: dict[tuple[str, Any], set[RuntimeIntegralMode]] = {}
+    for integral in form.integrals():
+        mode = runtime_integral_mode(integral)
+        for sid in _normalised_subdomain_ids(integral.subdomain_id()):
+            modes.setdefault((integral.integral_type(), sid), set()).add(mode)
+    return {
+        key for key, found in modes.items() if found == {RuntimeIntegralMode.RUNTIME}
+    }
+
+
+def _placeholder_quadrature_degree(integral: ufl.classes.Integral) -> int:
+    """Return the IR quadrature degree for a runtime-only integral.
+
+    Runtime kernels read points, weights and FE tables from ``custom_data``; the
+    IR rule only drives FFCx's FE table classification (zeros, ones, piecewise,
+    uniform), which is compiled into the kernel. A positive-weight rule exact
+    for degree ``2 p``, with ``p`` the largest embedded superdegree of the
+    integral's elements, makes this classification exact: a tabulated
+    polynomial that vanishes or is constant at all points does so identically,
+    since its square is integrated exactly. UFL's degree estimate grows with
+    non-polynomial factors such as normalised gradients and would only inflate
+    the tables FFCx tabulates.
+    """
+    integrand = integral.integrand()
+    functions = [
+        *ufl.algorithms.extract_arguments(integrand),
+        *ufl.algorithms.extract_coefficients(integrand),
+    ]
+    elements = [f.ufl_element() for f in functions if not is_quadrature_function(f)]
+    elements.append(integral.ufl_domain().ufl_coordinate_element())
+    degrees = [element.embedded_superdegree for element in elements]
+    return 2 * max((d for d in degrees if d is not None), default=0)
+
+
+def _set_default_quadrature_metadata(
+    form_data: Any,
+    runtime_only_keys: set[tuple[str, Any]],
+) -> None:
+    """Set the quadrature rule and degree FFCx expects on processed integrals."""
+    for integral_data in form_data.integral_data:
+        runtime_only = all(
+            (integral_data.integral_type, sid) in runtime_only_keys
+            for sid in _normalised_subdomain_ids(integral_data.subdomain_id)
+        )
+        for i, integral in enumerate(integral_data.integrals):
+            metadata = dict(integral.metadata() or {})
+            if "quadrature_rule" not in metadata:
+                metadata["quadrature_rule"] = "default"
+            if "quadrature_degree" not in metadata or metadata["quadrature_degree"] < 0:
+                if runtime_only:
+                    qd = _placeholder_quadrature_degree(integral)
+                else:
+                    qd = metadata.get("estimated_polynomial_degree", 0)
+                    if isinstance(qd, (tuple, list)):
+                        qd = max(qd) if qd else 0
+                metadata["quadrature_degree"] = int(qd)
+            integral_data.integrals[i] = integral.reconstruct(metadata=metadata)
+
+
 def _compute_unscaled_ffcx_form_data(
     form: ufl.Form,
     scalar_type: np.dtype,
@@ -219,19 +285,7 @@ def _compute_unscaled_ffcx_form_data(
         do_append_everywhere_integrals=False,
         complex_mode=complex_mode,
     )
-
-    for integral_data in form_data.integral_data:
-        for i, integral in enumerate(integral_data.integrals):
-            metadata = dict(integral.metadata() or {})
-            if "quadrature_rule" not in metadata:
-                metadata["quadrature_rule"] = "default"
-            if "quadrature_degree" not in metadata or metadata["quadrature_degree"] < 0:
-                qd = metadata.get("estimated_polynomial_degree", 0)
-                if isinstance(qd, (tuple, list)):
-                    qd = max(qd) if qd else 0
-                metadata["quadrature_degree"] = int(qd)
-            integral_data.integrals[i] = integral.reconstruct(metadata=metadata)
-
+    _set_default_quadrature_metadata(form_data, _runtime_only_keys(form))
     return form_data
 
 
@@ -251,19 +305,7 @@ def _compute_standard_ffcx_form_data(
         do_append_everywhere_integrals=False,
         complex_mode=complex_mode,
     )
-
-    for integral_data in form_data.integral_data:
-        for i, integral in enumerate(integral_data.integrals):
-            metadata = dict(integral.metadata() or {})
-            if "quadrature_rule" not in metadata:
-                metadata["quadrature_rule"] = "default"
-            if "quadrature_degree" not in metadata or metadata["quadrature_degree"] < 0:
-                qd = metadata.get("estimated_polynomial_degree", 0)
-                if isinstance(qd, (tuple, list)):
-                    qd = max(qd) if qd else 0
-                metadata["quadrature_degree"] = int(qd)
-            integral_data.integrals[i] = integral.reconstruct(metadata=metadata)
-
+    _set_default_quadrature_metadata(form_data, _runtime_only_keys(form))
     return form_data
 
 
