@@ -47,10 +47,11 @@ from .codegeneration.C.integrals import (
 )
 from .cpp_headers import runtime_abi_header_text
 from .form_metadata import FormRuntimeMetadata, build_form_runtime_metadata
-from .measures import get_quadrature_provider, is_runtime_integral, runtime_integral_mode
+from .measures import get_quadrature_provider, runtime_integral_mode
 from .quadrature_function import (
     collect_quadrature_function_infos,
-    integral_quadrature_functions,
+    quadrature_function_layout,
+    rebind_quadrature_function_infos,
     validate_quadrature_function_form,
 )
 from .runtime_api import RunintModule, RuntimeKernelInfo
@@ -199,7 +200,12 @@ def _sole_provider(providers: dict[Any, Any]) -> Any | None:
 
 
 def _rebind_sidecar(template: JITModuleInfo, forms: list[ufl.Form]) -> JITModuleInfo:
-    """Reuse compiled sidecar metadata with current runtime quadrature providers."""
+    """Reuse compiled sidecar metadata for forms with the template's signature.
+
+    The sidecar of the first compiled form holds that form's quadrature
+    providers and QuadratureFunction terminals. Both are replaced by the objects
+    of ``forms``, so values are evaluated from the current form's functions.
+    """
     rebound_forms: list[JITFormInfo] = []
 
     for form_info, form in zip(template.forms, forms, strict=True):
@@ -233,6 +239,9 @@ def _rebind_sidecar(template: JITModuleInfo, forms: list[ufl.Form]) -> JITModule
                 if len({id(provider) for provider in module_providers}) == 1
                 else None
             ),
+            quadrature_functions=rebind_quadrature_function_infos(
+                form_info.module.quadrature_functions, form_info.ufl_form, form
+            ),
         )
         rebound_forms.append(
             replace(form_info, ufl_form=form, analysis=analysis, module=module)
@@ -242,9 +251,14 @@ def _rebind_sidecar(template: JITModuleInfo, forms: list[ufl.Form]) -> JITModule
 
 
 def _runtime_form_signature(forms: list[ufl.Form]) -> str:
-    """Return a signature for runtime metadata that FFCx may not hash."""
+    """Return a signature for runtime metadata that FFCx may not hash.
+
+    Besides runtime subdomains, this hashes which coefficients are
+    QuadratureFunctions: UFL signs them like ordinary coefficients on the same
+    element, but their kernels load values from ``custom_data`` instead of ``w``.
+    """
     digest = hashlib.sha1()
-    digest.update(b"runintgen-runtime-form-signature-v1")
+    digest.update(b"runintgen-runtime-form-signature-v2")
     for form_index, form in enumerate(forms):
         digest.update(f"form:{form_index};".encode("utf-8"))
         for integral in form.integrals():
@@ -259,6 +273,7 @@ def _runtime_form_signature(forms: list[ufl.Form]) -> str:
                     )
                 ).encode("utf-8")
             )
+        digest.update(repr(quadrature_function_layout(form)).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -451,25 +466,6 @@ def _compile_form_source(
     )
 
 
-def _validate_quadrature_function_integrals(form: ufl.Form) -> None:
-    """Reject quadrature-function standard integrals until that path exists."""
-    for integral in form.integrals():
-        if is_runtime_integral(integral):
-            continue
-        functions = integral_quadrature_functions(integral)
-        if not functions:
-            continue
-        labels = []
-        for function in functions:
-            spec = getattr(function, "_runintgen_quadrature_function")
-            labels.append(spec.name or "<unnamed>")
-        raise NotImplementedError(
-            "QuadratureFunction in standard integrals is not implemented yet. "
-            "Use a runtime measure with QuadratureRules for now. Affected "
-            f"quadrature functions: {', '.join(labels)}."
-        )
-
-
 def _generate_code(
     forms: list[ufl.Form],
     module_name: str,
@@ -593,7 +589,6 @@ def compile_forms(
 
     for form in forms:
         validate_quadrature_function_form(form)
-        _validate_quadrature_function_integrals(form)
 
     cffi_extra_compile_args = list(cffi_extra_compile_args or [])
     p = ffcx.options.get_options(options or {})

@@ -714,12 +714,25 @@ class QuadratureFunctionValueSet:
 
 @dataclass(frozen=True)
 class QuadratureEvaluationContext:
-    """Context passed to context-aware QuadratureFunction evaluators."""
+    """Context passed to context-aware QuadratureFunction evaluators.
+
+    ``rules`` is the side-specific rule view: on an interior facet its points
+    and ``parent_map`` belong to the cell of the requested side. ``metadata``
+    carries the facet rows and local facets of that side.
+    """
 
     rules: QuadratureRules
     info: Any
     mesh: Any | None = None
     metadata: dict[str, Any] | None = None
+
+    @property
+    def restriction(self) -> str | None:
+        """Side ``"+"`` or ``"-"`` of an interior-facet request, else ``None``."""
+        restriction = getattr(self.info, "restriction", None)
+        if restriction is None and self.metadata is not None:
+            restriction = self.metadata.get("side")
+        return restriction
 
 
 def _normalise_quadrature_function_values(
@@ -859,6 +872,93 @@ def _quadrature_rules_for_info(
     return side_rules, metadata
 
 
+def evaluate_quadrature_function(
+    function: Any,
+    context: QuadratureEvaluationContext,
+    *,
+    fallback_evaluator: Any | None = None,
+) -> npt.NDArray[np.float64]:
+    """Return the point-major values of ``function`` on ``context.rules``.
+
+    Sources are tried in order: values attached with ``set_values`` for the
+    rule set and side, a context-aware evaluator, a callable of physical
+    points, and ``fallback_evaluator(context.info, context.rules)``. Evaluator
+    results are cached on the function per rule set, side, and evaluator
+    ``cache_key``. Evaluators that combine other quadrature functions, such as
+    a conormal computed from a normal field, call this for their inputs.
+
+    Args:
+        function: A QuadratureFunction.
+        context: Rule view and side of the request.
+        fallback_evaluator: Backend callback used when ``function`` has no
+            explicit values and no source.
+
+    Returns:
+        Values with shape ``(total_nq,)`` for scalars and
+        ``(total_nq, value_size)`` otherwise.
+    """
+    from .quadrature_function import (
+        quadrature_function_cache,
+        quadrature_function_explicit_values,
+        quadrature_function_source,
+        quadrature_function_spec,
+    )
+
+    spec = quadrature_function_spec(function)
+    rules = context.rules
+    restriction = context.restriction
+    label = getattr(context.info, "label", None)
+    if getattr(context.info, "terminal", None) is not function:
+        label = spec.name or "<unnamed>"
+
+    explicit = quadrature_function_explicit_values(function, rules.rule_id, restriction)
+    if explicit is not None:
+        return _normalise_quadrature_function_values(
+            explicit,
+            value_size=spec.value_size,
+            total_points=rules.total_points,
+            borrowed=True,
+        )
+
+    source = quadrature_function_source(function)
+    if source is not None and hasattr(source, "evaluate"):
+        key_fn = getattr(source, "cache_key", None)
+        source_key = key_fn(context) if key_fn is not None else id(source)
+        cache_key = (str(rules.rule_id), restriction, source_key)
+        cache = quadrature_function_cache(function)
+        values = cache.get(cache_key)
+        if values is None:
+            values = _normalise_quadrature_function_values(
+                source.evaluate(context),
+                value_size=spec.value_size,
+                total_points=rules.total_points,
+                borrowed=False,
+            )
+            cache[cache_key] = values
+        return values
+
+    if source is not None:
+        if rules.physical_points is None:
+            raise ValueError(
+                f"QuadratureFunction {label!r} uses a callable source, "
+                "but the quadrature rules do not carry physical_points."
+            )
+        raw_values = source(rules.physical_points)
+    elif fallback_evaluator is not None:
+        raw_values = fallback_evaluator(context.info, rules)
+    else:
+        raise ValueError(
+            f"QuadratureFunction {label!r} has no values for quadrature rule "
+            f"{rules.rule_id!r}."
+        )
+    return _normalise_quadrature_function_values(
+        raw_values,
+        value_size=spec.value_size,
+        total_points=rules.total_points,
+        borrowed=False,
+    )
+
+
 def build_quadrature_function_value_set(
     infos: list[Any],
     rules: QuadratureRules | RuntimeQuadraturePayload,
@@ -866,7 +966,11 @@ def build_quadrature_function_value_set(
     fallback_evaluator: Any | None = None,
     active_slots: list[int] | tuple[int, ...] | None = None,
 ) -> QuadratureFunctionValueSet | None:
-    """Resolve callable or explicit values for generated quadrature functions."""
+    """Resolve the values of generated quadrature-function slots.
+
+    Each slot is evaluated on the rule view of its restriction; see
+    :func:`evaluate_quadrature_function` for the order of value sources.
+    """
     if active_slots is not None:
         active_slot_set = {int(slot) for slot in active_slots}
         if not active_slot_set:
@@ -890,68 +994,22 @@ def build_quadrature_function_value_set(
     payload = rules if isinstance(rules, RuntimeQuadraturePayload) else None
     base_rules = payload.rules if payload is not None else rules
 
-    from .quadrature_function import (
-        quadrature_function_cache,
-        quadrature_function_source,
-        quadrature_function_values,
-    )
-
     for info in infos:
         active_rules, metadata = _quadrature_rules_for_info(
             info,
             base_rules,
             payload,
         )
-        explicit_values = quadrature_function_values(info.terminal)
-        rule_values = explicit_values.get(str(active_rules.rule_id))
-        if rule_values is not None:
-            values = _normalise_quadrature_function_values(
-                rule_values,
-                value_size=info.value_size,
-                total_points=active_rules.total_points,
-                borrowed=True,
-            )
-        else:
-            source = quadrature_function_source(info.terminal)
-            if source is not None and hasattr(source, "evaluate"):
-                context = QuadratureEvaluationContext(
-                    rules=active_rules,
-                    info=info,
-                    metadata=metadata,
-                )
-                source_key_fn = getattr(source, "cache_key", None)
-                source_key = (
-                    source_key_fn(context)
-                    if source_key_fn is not None
-                    else id(source)
-                )
-                cache_key = (str(active_rules.rule_id), info.slot, source_key)
-                cache = quadrature_function_cache(info.terminal)
-                raw_values = cache.get(cache_key)
-                if raw_values is None:
-                    raw_values = source.evaluate(context)
-                    cache[cache_key] = raw_values
-            elif source is not None:
-                if active_rules.physical_points is None:
-                    raise ValueError(
-                        f"QuadratureFunction {info.label!r} uses a callable source, "
-                        "but the quadrature rules do not carry physical_points."
-                    )
-                raw_values = source(active_rules.physical_points)
-            elif fallback_evaluator is not None:
-                raw_values = fallback_evaluator(info, active_rules)
-            else:
-                raise ValueError(
-                    f"QuadratureFunction {info.label!r} has no values for "
-                    f"quadrature rule {active_rules.rule_id!r}."
-                )
-            values = _normalise_quadrature_function_values(
-                raw_values,
-                value_size=info.value_size,
-                total_points=active_rules.total_points,
-                borrowed=False,
-            )
-
+        context = QuadratureEvaluationContext(
+            rules=active_rules,
+            info=info,
+            metadata=metadata,
+        )
+        values = evaluate_quadrature_function(
+            info.terminal,
+            context,
+            fallback_evaluator=fallback_evaluator,
+        )
         packed_value = QuadratureFunctionValue(values=values, value_size=info.value_size)
         if active_slots is None:
             packed.append(packed_value)

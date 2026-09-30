@@ -61,6 +61,7 @@ from .measures import (
 from .quadrature_function import (
     QuadratureFunction,
     QuadratureFunctionInfo,
+    QuadratureFunctionMixin,
     QuadratureFunctionSpec,
     expression_quadrature_functions,
     form_quadrature_functions,
@@ -86,6 +87,7 @@ from .runtime_data import (
     as_runtime_quadrature_payload,
     as_runtime_quadrature_rules,
     build_quadrature_function_value_set,
+    evaluate_quadrature_function,
     facet_runtime_quadrature_payload,
     interior_facet_runtime_quadrature_payload,
     to_intptr,
@@ -152,6 +154,7 @@ __all__ = [
     # Quadrature functions
     "QuadratureFunction",
     "QuadratureFunctionInfo",
+    "QuadratureFunctionMixin",
     "QuadratureFunctionSpec",
     "expression_quadrature_functions",
     "form_quadrature_functions",
@@ -179,6 +182,7 @@ __all__ = [
     "as_runtime_quadrature_payload",
     "as_runtime_quadrature_rules",
     "build_quadrature_function_value_set",
+    "evaluate_quadrature_function",
     "facet_runtime_quadrature_payload",
     "interior_facet_runtime_quadrature_payload",
     "to_intptr",

@@ -256,3 +256,111 @@ def test_standard_quadrature_function_is_rejected_until_supported():
 
     with pytest.raises(NotImplementedError, match="standard integrals"):
         compile_forms([form])
+
+
+def _interior_facet_rules() -> QuadratureRules:
+    return QuadratureRules(
+        tdim=2,
+        points=np.array([[0.2, 0.3], [0.6, 0.2]], dtype=np.float64),
+        secondary_points=np.array([[0.8, 0.3], [0.4, 0.2]], dtype=np.float64),
+        weights=np.array([0.25, 0.25], dtype=np.float64),
+        offsets=np.array([0, 2], dtype=np.int32),
+        parent_map=np.array([10], dtype=np.int32),
+    )
+
+
+def test_cached_module_rebinds_quadrature_function_terminals(tmp_path):
+    """A cache hit must evaluate the current form's QuadratureFunctions.
+
+    Both forms have one UFL signature. Before rebinding, the second form reused
+    the first form's terminals, so dot(mu('+'), mu('-')) was evaluated with the
+    values of n.
+    """
+    mesh, _ = _space()
+    dS_rt = ufl.Measure("dS", domain=mesh, subdomain_data=_interior_facet_rules())
+    n = QuadratureFunction(mesh, name="normal", shape=(2,))
+    mu = QuadratureFunction(mesh, name="conormal", shape=(2,))
+
+    _, module_n, _ = compile_forms(
+        [ufl.dot(n("+"), n("-")) * dS_rt], cache_dir=tmp_path
+    )
+    sidecar_n = module_n._runintgen_jit
+    _, module_mu, code_mu = compile_forms(
+        [ufl.dot(mu("+"), mu("-")) * dS_rt], cache_dir=tmp_path
+    )
+    sidecar_mu = module_mu._runintgen_jit
+
+    assert sidecar_mu.module_name == sidecar_n.module_name
+    assert code_mu == (None, None)
+    infos_n = sidecar_n.forms[0].module.quadrature_functions
+    infos_mu = sidecar_mu.forms[0].module.quadrature_functions
+    assert all(info.terminal is n for info in infos_n)
+    assert all(info.terminal is mu for info in infos_mu)
+    assert [info.label for info in infos_mu] == ["conormal(+)", "conormal(-)"]
+    assert [info.slot for info in infos_mu] == [info.slot for info in infos_n]
+
+
+def test_cached_module_rebinds_quadrature_functions_by_coefficient_position(
+    tmp_path,
+):
+    """Rebinding follows the signature numbering, not names or first use."""
+    mesh, V = _space()
+    v = ufl.TestFunction(V)
+    dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_runtime_rules())
+    a1 = QuadratureFunction(mesh, name="a")
+    b1 = QuadratureFunction(mesh, name="b")
+    a2 = QuadratureFunction(mesh, name="b")
+    b2 = QuadratureFunction(mesh, name="a")
+
+    compile_forms([b1**2 * a1 * v * dx_rt], cache_dir=tmp_path)
+    _, module, code = compile_forms([b2**2 * a2 * v * dx_rt], cache_dir=tmp_path)
+
+    infos = module._runintgen_jit.forms[0].module.quadrature_functions
+    assert code == (None, None)
+    assert [info.terminal for info in infos] == [a2, b2]
+    assert infos[0].terminal is a2 and infos[1].terminal is b2
+    assert [info.label for info in infos] == ["b", "a"]
+
+
+def test_quadrature_function_and_coefficient_do_not_share_cached_module(tmp_path):
+    """A QuadratureFunction and an ordinary coefficient on one element differ.
+
+    UFL signs both alike, but only the QuadratureFunction kernel loads values
+    from custom_data; sharing a module silently read the other source.
+    """
+    mesh, V = _space()
+    v = ufl.TestFunction(V)
+    dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_runtime_rules())
+    q = QuadratureFunction(mesh, name="q")
+    f = ufl.Coefficient(q.ufl_function_space())
+    assert (f * v * dx_rt).signature() == (q * v * dx_rt).signature()
+
+    _, module_f, _ = compile_forms([f * v * dx_rt], cache_dir=tmp_path)
+    name_f = module_f._runintgen_jit.module_name
+    _, module_q, code_q = compile_forms([q * v * dx_rt], cache_dir=tmp_path)
+
+    assert module_q._runintgen_jit.module_name != name_f
+    assert code_q != (None, None)
+    assert "q_function_0" in code_q[1]
+    infos = module_q._runintgen_jit.forms[0].module.quadrature_functions
+    assert [info.terminal for info in infos] == [q]
+
+
+def test_mixed_integral_rejects_quadrature_function():
+    """Standard entities of a mixed integral cannot load quadrature values.
+
+    Their FFCx body read the QuadratureFunction from ``w``, where its slot is
+    disabled, instead of raising.
+    """
+    mesh, V = _space()
+    v = ufl.TestFunction(V)
+    dx_mixed = ufl.Measure(
+        "dx",
+        domain=mesh,
+        subdomain_id=0,
+        subdomain_data=[np.array([1, 2], dtype=np.int32), _runtime_rules()],
+    )
+    q = QuadratureFunction(mesh, name="q")
+
+    with pytest.raises(NotImplementedError, match="mixed standard/runtime"):
+        compile_forms([q * v * dx_mixed])
