@@ -14,11 +14,13 @@ import importlib.util
 import io
 import logging
 import os
+import shutil
 import sys
 import sysconfig
 import tempfile
 import time
-from contextlib import redirect_stdout
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -36,7 +38,6 @@ from ffcx.codegeneration.jit import (
     UFC_FORM_DECL,
     UFC_HEADER_DECL,
     UFC_INTEGRAL_DECL,
-    get_cached_module,
 )
 from ffcx.codegeneration.utils import dtype_to_scalar_dtype
 
@@ -59,6 +60,33 @@ from .runtime_data import CFFI_DEF
 
 logger = logging.getLogger("runintgen")
 root_logger = logging.getLogger()
+
+if sys.platform.startswith("win32"):
+    import msvcrt
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    def _unlock(fd: int) -> None:
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
 
 _sidecar_cache: dict[str, JITModuleInfo] = {}
 
@@ -282,6 +310,41 @@ def _jit_libraries(extra_libraries: list[str] | None) -> list[str]:
     if extra_libraries is None:
         return list(_ffcx_libraries)
     return list(_ffcx_libraries) + list(extra_libraries)
+
+
+@contextmanager
+def _module_lock(lock_path: Path, timeout: float) -> Iterator[None]:
+    """Serialise the compilation of one JIT module across processes.
+
+    A waiting process blocks until the holder has published the module and
+    then loads it. The OS drops the lock when its holder exits, so a killed
+    compile leaves nothing stale behind. When the lock is not acquired within
+    ``timeout`` seconds the caller compiles anyway: publication is atomic, so
+    concurrent builds only cost duplicate work.
+    """
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    locked = False
+    try:
+        deadline = time.monotonic() + timeout
+        try:
+            if not (locked := _try_lock(fd)):
+                logger.info("Waiting for another process to release %s.", lock_path)
+            while not locked and time.monotonic() < deadline:
+                time.sleep(0.1)
+                locked = _try_lock(fd)
+            if not locked:
+                logger.warning(
+                    "Timed out after %ss waiting for %s; compiling unlocked.",
+                    timeout,
+                    lock_path,
+                )
+        except OSError as exc:
+            logger.warning("Cannot lock %s (%s); compiling unlocked.", lock_path, exc)
+        yield
+    finally:
+        if locked:
+            _unlock(fd)
+        os.close(fd)
 
 
 def _load_objects(
@@ -521,7 +584,12 @@ def _compile_objects(
     cffi_debug: bool,
     cffi_libraries: list[str] | None,
 ) -> None:
-    """Compile generated C source with CFFI."""
+    """Compile generated C source with CFFI and publish it to ``cache_dir``.
+
+    The build runs in a private directory. The C file, extension module and
+    ``.c.cached`` ready marker are then moved into ``cache_dir`` with
+    ``os.replace``, marker last, so other processes never see a partial module.
+    """
     if sys.platform.startswith("win32"):
         cffi_base_compile_args = ["-std:c17"]
     else:
@@ -541,24 +609,41 @@ def _compile_objects(
     cache_dir.mkdir(exist_ok=True, parents=True)
     c_filename = cache_dir.joinpath(module_name + ".c")
     ready_name = c_filename.with_suffix(".c.cached")
+    build_dir = Path(tempfile.mkdtemp(prefix=module_name + "-build-", dir=cache_dir))
+    build_c_filename = build_dir.joinpath(c_filename.name)
 
-    t0 = time.time()
-    out = io.StringIO()
-    old_handlers = root_logger.handlers.copy()
-    root_logger.handlers = [logging.StreamHandler(out)]
     try:
-        with redirect_stdout(out):
-            ffibuilder.compile(tmpdir=cache_dir, verbose=True, debug=cffi_debug)
+        t0 = time.time()
+        out = io.StringIO()
+        old_handlers = root_logger.handlers.copy()
+        root_logger.handlers = [logging.StreamHandler(out)]
+        try:
+            with redirect_stdout(out):
+                ext_filename = Path(
+                    ffibuilder.compile(
+                        tmpdir=str(build_dir), verbose=True, debug=cffi_debug
+                    )
+                )
+        finally:
+            root_logger.handlers = old_handlers
+
+        build_log = out.getvalue()
+        if cffi_verbose:
+            print(build_log)
+
+        logger.info("runintgen JIT C compiler finished in %.4f", time.time() - t0)
+        build_dir.joinpath(ready_name.name).write_text(build_log)
+        os.replace(build_c_filename, c_filename)
+        os.replace(ext_filename, cache_dir.joinpath(ext_filename.name))
+        os.replace(build_dir.joinpath(ready_name.name), ready_name)
+    except Exception:
+        try:
+            os.replace(build_c_filename, c_filename.with_suffix(".c.failed"))
+        except OSError:
+            pass
+        raise
     finally:
-        root_logger.handlers = old_handlers
-
-    build_log = out.getvalue()
-    if cffi_verbose:
-        print(build_log)
-
-    logger.info("runintgen JIT C compiler finished in %.4f", time.time() - t0)
-    with open(ready_name, "x") as ready_file:
-        ready_file.write(build_log)
+        shutil.rmtree(build_dir, ignore_errors=True)
 
 
 def _attach_sidecar(module: Any, sidecar: JITModuleInfo, cache_dir: Path) -> None:
@@ -583,7 +668,12 @@ def compile_forms(
     cffi_libraries: list[str] | None = None,
     visualise: bool = False,
 ) -> tuple[list[Any], Any, tuple[str | None, str | None]]:
-    """Compile UFL forms into runintgen/FFCx UFCx form objects."""
+    """Compile UFL forms into runintgen/FFCx UFCx form objects.
+
+    Processes compiling the same forms into one ``cache_dir`` share a single
+    build: the others wait up to ``timeout`` seconds for it and then build
+    themselves instead of failing.
+    """
     if visualise:
         raise NotImplementedError("runintgen JIT visualisation is not implemented.")
 
@@ -609,10 +699,15 @@ def compile_forms(
         ffcx.naming.form_name(form, i, module_name) for i, form in enumerate(forms)
     ]
 
-    if cache_dir is not None:
-        cache_dir = Path(cache_dir)
-        obj, mod = get_cached_module(module_name, form_names, cache_dir, timeout)
-        if obj is not None:
+    if cache_dir is None:
+        cache_dir = tempfile.mkdtemp(prefix="runintgen_jit_")
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(exist_ok=True, parents=True)
+
+    with _module_lock(cache_dir.joinpath(module_name + ".lock"), timeout):
+        if cache_dir.joinpath(module_name + ".c.cached").exists():
+            logger.info("Loading cached JIT module %s.", module_name)
+            obj, mod = _load_objects(cache_dir, module_name, form_names)
             sidecar = _sidecar_cache.get(module_name)
             if sidecar is None:
                 _, _, sidecar = _generate_code(forms, module_name, p)
@@ -620,10 +715,7 @@ def compile_forms(
             sidecar = _rebind_sidecar(sidecar, forms)
             _attach_sidecar(mod, sidecar, cache_dir)
             return obj, mod, (None, None)
-    else:
-        cache_dir = Path(tempfile.mkdtemp(prefix="runintgen_jit_"))
 
-    try:
         decl, impl, sidecar = _generate_code(forms, module_name, p)
         _compile_objects(
             decl,
@@ -635,13 +727,6 @@ def compile_forms(
             cffi_debug=cffi_debug,
             cffi_libraries=cffi_libraries,
         )
-    except Exception:
-        try:
-            c_filename = cache_dir.joinpath(module_name + ".c")
-            os.replace(c_filename, c_filename.with_suffix(".c.failed"))
-        except Exception:
-            pass
-        raise
 
     obj, module = _load_objects(cache_dir, module_name, form_names)
     _sidecar_cache[module_name] = sidecar

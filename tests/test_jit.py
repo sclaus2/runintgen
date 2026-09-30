@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 import ufl
 from basix.ufl import element
 
+import runintgen
 from runintgen import QuadratureFunction
 from runintgen.jit import compile_forms
 from runintgen.runtime_data import QuadratureRules
@@ -364,3 +371,111 @@ def test_mixed_integral_rejects_quadrature_function():
 
     with pytest.raises(NotImplementedError, match="mixed standard/runtime"):
         compile_forms([q * v * dx_mixed])
+
+
+_CONCURRENT_COMPILE_SCRIPT = """
+import json, os, sys, time
+from pathlib import Path
+
+import numpy as np
+import ufl
+from basix.ufl import element
+
+from runintgen.jit import compile_forms
+from runintgen.runtime_data import QuadratureRules
+
+cache_dir, barrier, nprocs, timeout = sys.argv[1:]
+mesh = ufl.Mesh(element("Lagrange", "triangle", 1, shape=(2,)))
+V = ufl.FunctionSpace(mesh, element("Lagrange", "triangle", 1))
+rules = QuadratureRules(
+    tdim=2,
+    points=np.array([[1.0 / 3.0, 1.0 / 3.0]]),
+    weights=np.array([0.5]),
+    offsets=np.array([0, 1], dtype=np.int32),
+    parent_map=np.array([0], dtype=np.int32),
+)
+dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=rules)
+u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+form = ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+
+# Start compiling together once every process has finished importing.
+Path(barrier, str(os.getpid())).touch()
+while len(os.listdir(barrier)) < int(nprocs):
+    time.sleep(0.01)
+try:
+    forms, _, code = compile_forms([form], cache_dir=cache_dir, timeout=int(timeout))
+    result = {"rank": forms[0].rank, "compiled": code != (None, None)}
+except Exception as exc:
+    result = {"error": f"{type(exc).__name__}: {exc}"}
+print(json.dumps(result), flush=True)
+os._exit(0)  # skip interpreter (and possible MPI) teardown
+"""
+
+
+def _compile_concurrently(tmp_path: Path, nprocs: int, timeout: int):
+    """Compile one runtime form in ``nprocs`` processes at the same time."""
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
+    cache_dir = tmp_path / "cache"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(runintgen.__file__).parents[1]), env.get("PYTHONPATH", "")]
+    )
+    args = [str(cache_dir), str(barrier), str(nprocs), str(timeout)]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CONCURRENT_COMPILE_SCRIPT, *args],
+            stdout=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        for _ in range(nprocs)
+    ]
+    outputs = [proc.communicate(timeout=600)[0] for proc in procs]
+    return [json.loads(out.splitlines()[-1]) for out in outputs], cache_dir
+
+
+def test_concurrent_compiles_share_one_build(tmp_path):
+    """Processes compiling the same form at once wait for a single build."""
+    results, cache_dir = _compile_concurrently(tmp_path, nprocs=3, timeout=600)
+
+    assert all(result.get("rank") == 2 for result in results), results
+    assert sum(result["compiled"] for result in results) == 1
+    assert all(path.is_file() for path in cache_dir.iterdir())
+
+
+def test_concurrent_compiles_that_stop_waiting_all_succeed(tmp_path):
+    """Processes that stop waiting build too and publish atomically.
+
+    With the FFCx claim-file protocol, a compile outlasting ``timeout`` raised
+    TimeoutError in every waiting process.
+    """
+    results, cache_dir = _compile_concurrently(tmp_path, nprocs=3, timeout=0)
+
+    assert all(result.get("rank") == 2 for result in results), results
+    assert any(result["compiled"] for result in results)
+    assert all(path.is_file() for path in cache_dir.iterdir())
+
+
+def test_killed_compile_leftovers_do_not_block_compile(tmp_path):
+    """Files left by a killed compile neither stall nor break later compiles."""
+    mesh, V = _space()
+    u = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_runtime_rules())
+    form = ufl.inner(u, v) * dx_rt
+    _, module, _ = compile_forms([form], cache_dir=tmp_path / "first")
+    module_name = module._runintgen_jit.module_name
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    cache_dir.joinpath(module_name + ".c").touch()
+    cache_dir.joinpath(module_name + ".lock").touch()
+    cache_dir.joinpath(module_name + "-build-killed").mkdir()
+
+    forms, _, code = compile_forms([form], cache_dir=cache_dir, timeout=1)
+    assert forms[0].rank == 2
+    assert code != (None, None)
+
+    _, _, cached_code = compile_forms([form], cache_dir=cache_dir, timeout=1)
+    assert cached_code == (None, None)
