@@ -14,11 +14,8 @@ from typing import Any
 
 import numpy as np
 from ffcx.codegeneration.backend import FFCXBackend
+from ffcx.codegeneration.C import integral_template as ufcx_integrals
 from ffcx.codegeneration.C.formatter import Formatter
-from ffcx.codegeneration.C.integral import generator as standard_integral_generator
-from ffcx.codegeneration.integral_generator import (
-    IntegralGenerator as StandardIntegralGenerator,
-)
 from ffcx.codegeneration.utils import dtype_to_c_type, dtype_to_scalar_dtype
 from ffcx.options import get_options
 
@@ -28,6 +25,7 @@ from ...measures import RuntimeIntegralMode
 from ...quadrature_function import collect_quadrature_function_infos
 from ...runtime_api import RuntimeKernelInfo
 from ..runtime_integrals import RuntimeIntegralGenerator
+from ..standard_integrals import OptimizedIntegralGenerator
 from .integrals_template import (
     factory_mixed_tabulate_tensor,
     factory_runtime_kernel,
@@ -239,9 +237,9 @@ def _standard_kernel_info(
     kernel_id: int,
 ) -> RuntimeKernelInfo:
     """Generate one standard FFCx kernel and return runintgen metadata."""
-    c_decl, c_def = standard_integral_generator(integral_ir, domain, options)
     scalar_type = _scalar_type_name(options)
     geometry_type = _geometry_type_name(options, scalar_type)
+    c_decl, c_def = _standard_integral_code(integral_ir, domain, options)
     c_decl = _patch_coordinate_dofs_signature(
         c_decl, scalar_type=scalar_type, geometry_type=geometry_type
     )
@@ -476,10 +474,57 @@ def _standard_body(
 ) -> str:
     """Generate a standard FFCx tabulate_tensor body for one integral."""
     backend = FFCXBackend(integral_ir, options)
-    generator = StandardIntegralGenerator(integral_ir, backend)
+    generator = OptimizedIntegralGenerator(integral_ir, backend)
     parts = generator.generate(domain)
     formatter = Formatter(options["scalar_type"])
     return formatter(parts)
+
+
+def _standard_integral_code(
+    integral_ir: Any,
+    domain: Any,
+    options: dict[str, Any],
+) -> tuple[str, str]:
+    """Return the UFCx declaration and definition of a standard integral.
+
+    Same as ``ffcx.codegeneration.C.integral.generator``, except that the body
+    comes from :func:`_standard_body`.
+    """
+    factory_name = f"{integral_ir.expression.name}_{domain.name}"
+    declaration = ufcx_integrals.declaration.format(factory_name=factory_name)
+
+    if len(integral_ir.enabled_coefficients) > 0:
+        values = ", ".join("1" if i else "0" for i in integral_ir.enabled_coefficients)
+        size = len(integral_ir.enabled_coefficients)
+        enabled_coefficients_init = (
+            f"bool enabled_coefficients_{factory_name}[{size}] = {{{values}}};"
+        )
+        enabled_coefficients = f"enabled_coefficients_{factory_name}"
+    else:
+        enabled_coefficients_init = ""
+        enabled_coefficients = "NULL"
+
+    scalar_type = _scalar_type_name(options)
+    tabulate_tensor = _tabulate_tensor_initializers(
+        scalar_type, _default_geometry_type_name(scalar_type), factory_name
+    )
+    implementation = ufcx_integrals.factory.format(
+        factory_name=factory_name,
+        enabled_coefficients=enabled_coefficients,
+        enabled_coefficients_init=enabled_coefficients_init,
+        tabulate_tensor=_standard_body(integral_ir, domain, options),
+        needs_facet_permutations=(
+            "true" if integral_ir.expression.needs_facet_permutations else "false"
+        ),
+        scalar_type=dtype_to_c_type(options["scalar_type"]),
+        geom_type=dtype_to_c_type(dtype_to_scalar_dtype(options["scalar_type"])),
+        coordinate_element_hash=(
+            f"UINT64_C({integral_ir.expression.coordinate_element_hash})"
+        ),
+        domain=int(domain),
+        **tabulate_tensor,
+    )
+    return declaration, implementation
 
 
 def _tabulate_tensor_functions(

@@ -23,7 +23,6 @@ import ffcx.codegeneration.lnodes as L
 from ffcx.codegeneration.access import FFCXBackendAccess
 from ffcx.codegeneration.C.formatter import Formatter
 from ffcx.codegeneration.definitions import FFCXBackendDefinitions
-from ffcx.codegeneration.integral_generator import IntegralGenerator
 from ffcx.codegeneration.symbols import FFCXBackendSymbols
 from ffcx.ir.elementtables import (
     UniqueTableReferenceT,
@@ -37,6 +36,7 @@ from ..quadrature_function import (
     QuadratureFunctionInfo,
     is_quadrature_function,
 )
+from .standard_integrals import OptimizedIntegralGenerator
 
 
 @dataclass(frozen=True)
@@ -398,7 +398,7 @@ class RuntimeFFCXBackend:
         )
 
 
-class RuntimeFFCXIntegralGenerator(IntegralGenerator):
+class RuntimeFFCXIntegralGenerator(OptimizedIntegralGenerator):
     """FFCx integral generator with runtime quadrature/table sources."""
 
     def generate_quadrature_tables(
@@ -437,52 +437,17 @@ class RuntimeFFCXIntegralGenerator(IntegralGenerator):
             ],
         )
 
-    def generate_quadrature_loop(
-        self, quadrature_rule: QuadratureRule, domain: basix.CellType
-    ) -> list[L.LNode]:
-        """Generate a quadrature loop whose extent is ``rt_nq``."""
+    def quadrature_index(self, quadrature_rule: QuadratureRule) -> L.MultiIndex:
+        """Return a quadrature loop index whose extent is ``rt_nq``."""
         if quadrature_rule.has_tensor_factors:
             raise NotImplementedError(
                 "Runtime integrals do not support tensor-factor quadrature yet."
             )
-
-        definitions, intermediates_0 = self.generate_varying_partition(
-            quadrature_rule, domain
-        )
-        tensor_comp, intermediates_fw = self.generate_dofblock_partition(
-            quadrature_rule, domain
-        )
-        assert all(isinstance(tc, L.Section) for tc in tensor_comp)
-
-        inputs: list[L.Symbol] = []
-        for definition in definitions:
-            assert isinstance(definition, L.Section)
-            inputs += definition.output
-
-        output: list[L.Symbol] = []
-        declarations: list[L.VariableDecl] = []
-        for fw in intermediates_fw:
-            assert isinstance(fw, L.VariableDecl)
-            output += [fw.symbol]
-            declarations += [L.VariableDecl(fw.symbol, 0)]
-            intermediates_0 += [L.Assign(fw.symbol, fw.value)]
-
-        intermediates = [
-            L.Section("Intermediates", intermediates_0, declarations, inputs, output)
-        ]
-
         iq_symbol = self.backend.symbols.quadrature_loop_index
-        iq = L.MultiIndex(
+        return L.MultiIndex(
             [L.Symbol(iq_symbol.name, dtype=L.DataType.INT)],
             [L.Symbol("rt_nq", dtype=L.DataType.INT)],
         )
-
-        # FFCx's loop optimizer assumes static FE table semantics when deciding
-        # which products can be hoisted across dof loops. Runtime table accesses
-        # depend on dynamic quadrature/table pointers, so keep the unoptimized
-        # section structure until a runtime-aware optimizer exists.
-        code = definitions + intermediates + tensor_comp
-        return [L.create_nested_for_loops([iq], code)]
 
 
 @dataclass
