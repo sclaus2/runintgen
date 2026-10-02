@@ -756,6 +756,7 @@ def generate_C_runtime_kernels(
                     enabled_coefficients_init=enabled_coefficients_init,
                     enabled_coefficients=enabled_coefficients,
                     table_requests=_table_requests(element_requests, func_name),
+                    runtime_helpers="\n".join(generated.helpers),
                     tabulate_tensor_functions=_tabulate_tensor_functions(
                         mode=mode,
                         factory_name=func_name,

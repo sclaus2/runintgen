@@ -170,7 +170,7 @@ def _runtime_signature() -> str:
     """Return a signature for runintgen codegen inputs."""
     digest = hashlib.sha1()
     digest.update(runtime_abi_header_text().encode("utf-8"))
-    digest.update(b"runintgen-combined-jit-v2")
+    digest.update(b"runintgen-combined-jit-v3")
     return digest.hexdigest()
 
 

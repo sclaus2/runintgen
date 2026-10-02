@@ -15,15 +15,21 @@ kernel through a small Basix C wrapper function pointer.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import basix
 import ffcx.codegeneration.lnodes as L
+import numpy as np
+import ufl
 from ffcx.codegeneration.access import FFCXBackendAccess
 from ffcx.codegeneration.C.formatter import Formatter
-from ffcx.codegeneration.definitions import FFCXBackendDefinitions
+from ffcx.codegeneration.definitions import (
+    FFCXBackendDefinitions,
+    create_quadrature_index,
+)
 from ffcx.codegeneration.symbols import FFCXBackendSymbols
+from ffcx.codegeneration.utils import dtype_to_c_type, dtype_to_scalar_dtype
 from ffcx.ir.elementtables import (
     UniqueTableReferenceT,
     get_modified_terminal_element,
@@ -36,6 +42,7 @@ from ..quadrature_function import (
     QuadratureFunctionInfo,
     is_quadrature_function,
 )
+from .contraction import Verbatim, chunked_contraction
 from .standard_integrals import OptimizedIntegralGenerator
 
 
@@ -183,7 +190,44 @@ def _uses_runtime_table(tabledata: UniqueTableReferenceT, integral_type: str) ->
     return True
 
 
-def _force_runtime_tables_varying(integral_ir: IntegralIR) -> None:
+def _varies_at_runtime(
+    node_data: dict[str, Any], integral_type: str, affine_geometry: bool
+) -> bool:
+    """Return whether a terminal node takes different values at runtime points."""
+    mt = node_data.get("mt")
+    if mt is None:
+        return False
+    if is_quadrature_function(getattr(mt, "terminal", None)):
+        return True
+    tabledata = node_data.get("tr")
+    if tabledata is None:
+        return False
+    if affine_geometry and isinstance(mt.terminal, ufl.classes.Jacobian):
+        return False
+    return _uses_runtime_table(tabledata, integral_type) or tabledata.ttype in (
+        "varying",
+        "quadrature",
+        "uniform",
+    )
+
+
+def _is_affine_simplex_integral(integral_ir: IntegralIR) -> bool:
+    """Return whether the integral's mesh has degree-1 simplex cells."""
+    for integrand_data in integral_ir.expression.integrand.values():
+        factorization = integrand_data.get("factorization")
+        if factorization is None:
+            continue
+        for node_data in factorization.nodes.values():
+            mt = node_data.get("mt")
+            if mt is not None and isinstance(mt.terminal, ufl.classes.Jacobian):
+                domain = ufl.domain.extract_unique_domain(mt.terminal)
+                return bool(domain.is_piecewise_linear_simplex_domain())
+    return False
+
+
+def _force_runtime_tables_varying(
+    integral_ir: IntegralIR, affine_geometry: bool = False
+) -> None:
     """Move runtime-backed terminal dependencies into quadrature scope.
 
     FFCx classifies tables using the placeholder quadrature rule present during
@@ -192,6 +236,11 @@ def _force_runtime_tables_varying(integral_ir: IntegralIR) -> None:
     derivatives of a higher-order coordinate element. Match ffcx-runtime's
     conservative model by treating all runtime-backed table terminals and their
     dependent factorization nodes as varying.
+
+    On affine cells the Jacobian is the same at every point. With
+    ``affine_geometry`` it stays cellwise constant: it is computed once, before
+    the quadrature loop, and so are all nodes that depend only on it and on
+    other constants.
     """
     integral_type = integral_ir.expression.integral_type
 
@@ -200,37 +249,32 @@ def _force_runtime_tables_varying(integral_ir: IntegralIR) -> None:
         if factorization is None:
             continue
 
-        pending: list[int] = []
-        seen: set[int] = set()
-        for node_id, node_data in factorization.nodes.items():
-            tabledata = node_data.get("tr")
-            mt = node_data.get("mt")
-            if mt is not None and is_quadrature_function(
-                getattr(mt, "terminal", None)
-            ):
+        nodes = factorization.nodes
+        if affine_geometry:
+            for node_data in nodes.values():
                 if node_data.get("status") != "inactive":
-                    pending.append(node_id)
-                    seen.add(node_id)
-                continue
-            if tabledata is None:
-                continue
-            if not _uses_runtime_table(tabledata, integral_type):
-                continue
-            if node_data.get("status") == "inactive":
-                continue
-            pending.append(node_id)
-            seen.add(node_id)
-
+                    node_data["status"] = "active"
+        pending = [
+            node_id
+            for node_id, node_data in nodes.items()
+            if node_data.get("status") != "inactive"
+            and _varies_at_runtime(node_data, integral_type, affine_geometry)
+        ]
+        seen = set(pending)
         while pending:
             node_id = pending.pop()
-            factorization.nodes[node_id]["status"] = "varying"
+            nodes[node_id]["status"] = "varying"
             for dependent in factorization.in_edges.get(node_id, []):
                 if dependent in seen:
                     continue
-                if factorization.nodes[dependent].get("status") == "inactive":
+                if nodes[dependent].get("status") == "inactive":
                     continue
                 seen.add(dependent)
                 pending.append(dependent)
+        if affine_geometry:
+            for node_data in nodes.values():
+                if node_data.get("status") == "active":
+                    node_data["status"] = "piecewise"
 
 
 class RuntimeBackendSymbols(FFCXBackendSymbols):
@@ -333,6 +377,10 @@ class RuntimeBackendAccess(FFCXBackendAccess):
         self.symbols.element_tables[tabledata.name] = table_symbol
 
         iq = quadrature_index.global_index
+        if all(isinstance(n, int) and n == 0 for n in quadrature_index.sizes):
+            # Cellwise constant definitions, emitted before the quadrature loop
+            # (e.g. the Jacobian of an affine cell), read the first point.
+            iq = L.LiteralInt(0)
         ic = dof_index.global_index
         derivative = L.LiteralInt(table_ref.derivative_index)
         component = L.LiteralInt(0)
@@ -401,6 +449,11 @@ class RuntimeFFCXBackend:
 class RuntimeFFCXIntegralGenerator(OptimizedIntegralGenerator):
     """FFCx integral generator with runtime quadrature/table sources."""
 
+    def __init__(self, ir: IntegralIR, backend: Any) -> None:
+        """Initialise."""
+        super().__init__(ir, backend)
+        self.helpers: list[str] = []
+
     def generate_quadrature_tables(
         self, domain: basix.CellType, _expression: Any | None = None
     ) -> list[L.LNode]:
@@ -449,6 +502,91 @@ class RuntimeFFCXIntegralGenerator(OptimizedIntegralGenerator):
             [L.Symbol("rt_nq", dtype=L.DataType.INT)],
         )
 
+    def generate_quadrature_loop(
+        self, quadrature_rule: QuadratureRule, domain: basix.CellType
+    ) -> list[L.LNode]:
+        """Generate the quadrature loop, as chunked contraction where possible.
+
+        The option ``runintgen_chunked_contraction=False`` keeps FFCx's loop,
+        which updates the element tensor at every point.
+        """
+        iq = self.quadrature_index(quadrature_rule)
+        definitions, intermediates = self.generate_varying_partition(
+            quadrature_rule, domain
+        )
+        tensor_comp, weight_declarations = self.generate_dofblock_partition(
+            quadrature_rule, domain
+        )
+        options = self.backend.access.options
+        if not options.get("runintgen_chunked_contraction", True):
+            return self.quadrature_loop_code(
+                iq, definitions, intermediates, tensor_comp, weight_declarations
+            )
+        point = L.Symbol(iq.symbols[0].name, dtype=L.DataType.INT)
+        # As built by FFCx's dofblock partition
+        weight = self.backend.symbols.weights_table(quadrature_rule)[
+            create_quadrature_index(
+                quadrature_rule, self.backend.symbols.quadrature_loop_index
+            ).global_index
+        ]
+        scalar = np.dtype(options["scalar_type"])
+        real = np.dtype(dtype_to_scalar_dtype(scalar))
+        chunked = chunked_contraction(
+            tensor_sections=tensor_comp,
+            definitions=definitions,
+            intermediates=intermediates,
+            weight_declarations=weight_declarations,
+            weight_factors=self._weight_factors(
+                quadrature_rule, domain, weight_declarations, weight
+            ),
+            weight=weight,
+            point=point,
+            num_points=L.Symbol("rt_nq", dtype=L.DataType.INT),
+            c_types={
+                L.DataType.REAL: dtype_to_c_type(real),
+                L.DataType.SCALAR: dtype_to_c_type(scalar),
+            },
+            sizes={L.DataType.REAL: real.itemsize, L.DataType.SCALAR: scalar.itemsize},
+        )
+        if chunked is not None:
+            code, helpers = chunked
+            for helper in helpers:
+                if helper not in self.helpers:
+                    self.helpers.append(helper)
+            return code
+        return self.quadrature_loop_code(
+            iq, definitions, intermediates, tensor_comp, weight_declarations
+        )
+
+    def _weight_factors(
+        self,
+        quadrature_rule: QuadratureRule,
+        domain: basix.CellType,
+        declarations: list[L.VariableDecl],
+        weight: L.LExpr,
+    ) -> dict[str, tuple[L.LExpr, bool]]:
+        """Return fw name -> (f, f cellwise constant) for fw = f * weight."""
+        F = self.ir.expression.integrand[(domain, quadrature_rule)]["factorization"]
+        constant = {
+            symbol.name: F.nodes[key[2]]["status"] == "piecewise"
+            for key, symbol in self.temp_symbols.items()
+            if key[0] == "fw" and key[1] is quadrature_rule
+        }
+        factors = {}
+        for declaration in declarations:
+            value = declaration.value
+            args = list(value.args) if isinstance(value, L.Product) else [value]
+            # LNodes define == but not !=
+            rest = [a for a in args if not a == weight]
+            if len(rest) == len(args):
+                continue
+            f = rest[0] if len(rest) == 1 else (L.Product(rest) if rest else 1.0)
+            factors[declaration.symbol.name] = (
+                L.as_lexpr(f),
+                constant.get(declaration.symbol.name, False),
+            )
+        return factors
+
 
 @dataclass
 class RuntimeGeneratedKernel:
@@ -457,6 +595,18 @@ class RuntimeGeneratedKernel:
     body: str
     runtime_tables: list[RuntimeTableReferenceInfo]
     quadrature_function_slots: list[int]
+    # File-scope C helpers the body calls (each guarded against redefinition)
+    helpers: list[str] = field(default_factory=list)
+
+
+class RuntimeFormatter(Formatter):
+    """C formatter that also writes :class:`Verbatim` statements."""
+
+    def __call__(self, obj: L.LNode) -> str:
+        """Format an L node."""
+        if isinstance(obj, Verbatim):
+            return obj.text + "\n"
+        return super().__call__(obj)
 
 
 class RuntimeIntegralGenerator:
@@ -543,15 +693,23 @@ class RuntimeIntegralGenerator:
         integral_ir: IntegralIR,
         domain: basix.CellType,
     ) -> RuntimeGeneratedKernel:
-        """Generate a runtime kernel body for one FFCx integral/domain pair."""
-        _force_runtime_tables_varying(integral_ir)
+        """Generate a runtime kernel body for one FFCx integral/domain pair.
+
+        The option ``runintgen_affine_geometry`` states that all cells are
+        affine, e.g. parallelepipeds of a Cartesian hexahedral mesh. It
+        defaults to whether the mesh has degree-1 simplex cells.
+        """
+        affine_geometry = self.options.get("runintgen_affine_geometry")
+        if affine_geometry is None:
+            affine_geometry = _is_affine_simplex_integral(integral_ir)
+        _force_runtime_tables_varying(integral_ir, bool(affine_geometry))
         table_registry = RuntimeTableRegistry(self._table_metadata(integral_ir))
         backend = RuntimeFFCXBackend(
             integral_ir, self.options, table_registry, self._q_by_terminal_restriction
         )
         generator = RuntimeFFCXIntegralGenerator(integral_ir, backend)
         parts = generator.generate(domain)
-        body = Formatter(self.options["scalar_type"])(parts)
+        body = RuntimeFormatter(self.options["scalar_type"])(parts)
 
         used_slots = []
         for integrand_data in integral_ir.expression.integrand.values():
@@ -572,4 +730,5 @@ class RuntimeIntegralGenerator:
             body=body,
             runtime_tables=table_registry.references,
             quadrature_function_slots=sorted(set(used_slots)),
+            helpers=generator.helpers,
         )

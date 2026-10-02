@@ -19,6 +19,10 @@ class _RuntimeRule:
     weights = ()
 
 
+# Loop over the points of one chunk of the runtime rule
+_POINT_LOOP = "for (int iq = rt_q0; iq < rt_q0 + rt_nqc; ++iq)"
+
+
 def _runtime_measure(
     integral_type: str,
     mesh: ufl.Mesh,
@@ -75,7 +79,7 @@ class TestCodeGeneration:
         assert "entities->is_cut[local_index]" not in kernel.c_definition
         assert f"tabulate_tensor_{kernel.name}_runtime" not in kernel.c_definition
         assert f"tabulate_tensor_{kernel.name}_standard" not in kernel.c_definition
-        assert "for (int iq = 0; iq < rt_nq; ++iq)" in kernel.c_definition
+        assert _POINT_LOOP in kernel.c_definition
         assert "rt_weights" in kernel.c_definition
         assert kernel.c_definition.count(".tabulate(") == 1
         assert "rt_element_0" in kernel.c_definition
@@ -591,7 +595,7 @@ class TestCodeGeneration:
         dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=runtime_rule)
         module = compile_runtime_integrals(ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt)
         kernel = module.kernels[0]
-        loop_pos = kernel.c_definition.find("for (int iq = 0; iq < rt_nq; ++iq)")
+        loop_pos = kernel.c_definition.find(_POINT_LOOP)
         jacobian_pos = kernel.c_definition.find("// Section: Jacobian")
 
         assert loop_pos >= 0

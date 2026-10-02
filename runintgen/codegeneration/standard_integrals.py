@@ -37,6 +37,19 @@ class OptimizedIntegralGenerator(IntegralGenerator):
         tensor_comp, intermediates_fw = self.generate_dofblock_partition(
             quadrature_rule, domain
         )
+        return self.quadrature_loop_code(
+            iq, definitions, intermediates_0, tensor_comp, intermediates_fw
+        )
+
+    def quadrature_loop_code(
+        self,
+        iq: L.MultiIndex,
+        definitions: list[L.LNode],
+        intermediates_0: list[L.LNode],
+        tensor_comp: list[L.LNode],
+        intermediates_fw: list[L.VariableDecl],
+    ) -> list[L.LNode]:
+        """Return the quadrature loop over ``iq`` of the given sections."""
         assert all(isinstance(tc, L.Section) for tc in tensor_comp)
 
         inputs: list[L.Symbol] = []

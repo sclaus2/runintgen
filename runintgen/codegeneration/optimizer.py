@@ -56,6 +56,38 @@ def depends_on(expr: L.LExpr, index: L.Symbol) -> bool:
     )
 
 
+def expression_key(expr: L.LExpr, anonymous: L.Symbol | None = None) -> tuple:
+    """Return a hashable key of the structure of ``expr``.
+
+    Structurally equal expressions have equal keys (not all LNodes are
+    hashable). The symbol ``anonymous`` is replaced by a placeholder, so that
+    e.g. a table read with different dof indices gives the same key.
+    """
+
+    def key(e: L.LExpr) -> tuple:
+        return expression_key(e, anonymous)
+
+    if isinstance(expr, L.Symbol):
+        return ("?",) if expr == anonymous else ("symbol", expr.name)
+    if isinstance(expr, (L.LiteralFloat, L.LiteralInt)):
+        return (type(expr).__name__, expr.value)
+    if isinstance(expr, L.ArrayAccess):
+        return ("access", expr.array.name, tuple(key(i) for i in expr.indices))
+    if isinstance(expr, L.MathFunction):
+        return ("call", str(expr.function), tuple(key(a) for a in expr.args))
+    if isinstance(expr, L.NaryOp):
+        return (type(expr).__name__, tuple(key(a) for a in expr.args))
+    if isinstance(expr, L.BinOp):
+        return (type(expr).__name__, key(expr.lhs), key(expr.rhs))
+    if isinstance(expr, L.PrefixUnaryOp):
+        return (type(expr).__name__, key(expr.arg))
+    if isinstance(expr, L.Conditional):
+        return ("conditional", key(expr.condition), key(expr.true), key(expr.false))
+    if isinstance(expr, L.MultiIndex):
+        return ("multi-index", tuple(key(s) for s in expr.symbols), tuple(expr.sizes))
+    raise NotImplementedError(f"Cannot build a key of {type(expr).__name__}.")
+
+
 def _assignments(statement: L.LNode) -> list[L.LNode]:
     """Return the expressions of a statement or statement list."""
     if isinstance(statement, L.StatementList):

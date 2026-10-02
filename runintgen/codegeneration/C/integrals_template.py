@@ -19,6 +19,8 @@ factory_runtime_kernel = r"""
 
 {table_requests}
 
+{runtime_helpers}
+
 {tabulate_tensor_functions}
 
 ufcx_integral {factory_name} =
@@ -76,6 +78,8 @@ factory_runtime_tabulate_tensor = r"""
 {form_context}
 
   const int rt_nq = rule->nq;
+  if (rt_nq == 0)
+    return;
   const double* rt_weights = rule->weights;
 {runtime_points}
 {quadrature_function_preparation}
