@@ -585,6 +585,91 @@ class FormRuntimeMetadata:
         """Get the IntegralRuntimeLayout for a specific integral."""
         return self.integral_layouts.get((integral_type, ir_index))
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable dictionary.
+
+        Elements are stored as their Basix constructor specs, which is all the
+        runtime needs to rebuild them (see :func:`export_metadata_for_cpp`).
+        """
+        return {
+            "form_name": self.form_name,
+            "unique_elements": [
+                {
+                    "form_elem_index": fe.form_elem_index,
+                    "element_key": fe.element_key.to_dict(),
+                    "role": fe.role.name,
+                    "index": fe.index,
+                    "ndofs": fe.ndofs,
+                    "ncomps": fe.ncomps,
+                    "element_spec": (
+                        fe.element_spec
+                        or basix_element_spec_from_basix(
+                            fe.element, block_size=fe.ncomps
+                        )
+                    ).to_dict(),
+                }
+                for fe in self.unique_elements
+            ],
+            "integral_layouts": [
+                {
+                    "integral_type": layout.integral_type,
+                    "ir_index": layout.ir_index,
+                    "subdomain_id": layout.subdomain_id,
+                    "subdomain_ids": list(layout.subdomain_ids),
+                    "element_usages": [
+                        [eu.form_elem_index, eu.max_derivative, eu.table_slot]
+                        for eu in layout.element_usages
+                    ],
+                    "terminal_to_table_slot": [
+                        [role.name, index, slot]
+                        for (role, index), slot in layout.terminal_to_table_slot.items()
+                    ],
+                }
+                for layout in self.integral_layouts.values()
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FormRuntimeMetadata:
+        """Create metadata from :meth:`to_dict` output.
+
+        The ``element`` of each unique element is ``None``; its
+        ``element_spec`` identifies the Basix element.
+        """
+        metadata = cls(form_name=data["form_name"])
+        for item in data["unique_elements"]:
+            key = ElementKey.from_dict(item["element_key"])
+            metadata.unique_elements.append(
+                FormElementInfo(
+                    form_elem_index=int(item["form_elem_index"]),
+                    element_key=key,
+                    element=None,
+                    role=Role[item["role"]],
+                    index=int(item["index"]),
+                    ndofs=int(item["ndofs"]),
+                    ncomps=int(item["ncomps"]),
+                    element_spec=BasixElementSpec.from_dict(item["element_spec"]),
+                )
+            )
+            metadata.key_to_form_index[key] = int(item["form_elem_index"])
+        for item in data["integral_layouts"]:
+            layout = IntegralRuntimeLayout(
+                integral_type=item["integral_type"],
+                ir_index=int(item["ir_index"]),
+                subdomain_id=int(item["subdomain_id"]),
+                element_usages=[
+                    IntegralElementUsage(int(index), int(derivative), int(slot))
+                    for index, derivative, slot in item["element_usages"]
+                ],
+                terminal_to_table_slot={
+                    (Role[role], int(index)): int(slot)
+                    for role, index, slot in item["terminal_to_table_slot"]
+                },
+                subdomain_ids=tuple(int(i) for i in item["subdomain_ids"]),
+            )
+            metadata.integral_layouts[(layout.integral_type, layout.ir_index)] = layout
+        return metadata
+
 
 # -----------------------------------------------------------------------------
 # Builder Functions
@@ -787,7 +872,11 @@ def export_metadata_for_cpp(metadata: FormRuntimeMetadata) -> dict[str, Any]:
             {
                 "form_elem_index": fe.form_elem_index,
                 "element_key": fe.element_key.to_dict(),
-                "basix_hash": _basix_hash(fe.element),
+                "basix_hash": (
+                    element_spec.basix_hash
+                    if fe.element is None
+                    else _basix_hash(fe.element)
+                ),
                 "element_spec": element_spec.to_dict(),
                 "role": fe.role.name.lower(),
                 "index": fe.index,

@@ -58,6 +58,44 @@ class RuntimeKernelInfo:
         if not self.subdomain_ids:
             self.subdomain_ids = (self.subdomain_id,)
 
+    def to_dict(self, *, with_code: bool = True) -> dict[str, Any]:
+        """Return a JSON-serialisable dictionary, optionally without C code."""
+        return {
+            "name": self.name,
+            "integral_type": self.integral_type,
+            "subdomain_id": int(self.subdomain_id),
+            "ir_index": int(self.ir_index),
+            "c_declaration": self.c_declaration if with_code else "",
+            "c_definition": self.c_definition if with_code else "",
+            "tensor_shape": (
+                None
+                if self.tensor_shape is None
+                else [int(i) for i in self.tensor_shape]
+            ),
+            "table_info": self.table_info,
+            "table_slots": self.table_slots,
+            "quadrature_function_slots": self.quadrature_function_slots,
+            "domain": self.domain,
+            "kernel_id": int(self.kernel_id),
+            "scalar_type": self.scalar_type,
+            "geometry_type": self.geometry_type,
+            "base_name": self.base_name,
+            "mode": self.mode,
+            "subdomain_ids": [int(i) for i in self.subdomain_ids],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RuntimeKernelInfo:
+        """Create kernel info from :meth:`to_dict` output."""
+        tensor_shape = data.get("tensor_shape")
+        return cls(
+            **{
+                **data,
+                "tensor_shape": None if tensor_shape is None else tuple(tensor_shape),
+                "subdomain_ids": tuple(data.get("subdomain_ids", ())),
+            }
+        )
+
 
 @dataclass
 class RunintModule:

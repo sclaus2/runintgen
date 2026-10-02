@@ -479,3 +479,101 @@ def test_killed_compile_leftovers_do_not_block_compile(tmp_path):
 
     _, _, cached_code = compile_forms([form], cache_dir=cache_dir, timeout=1)
     assert cached_code == (None, None)
+
+
+def _as_if_new_process(monkeypatch):
+    """Forget in-memory sidecars and fail on code generation."""
+    import runintgen.jit
+
+    def regenerate(*args, **kwargs):
+        raise AssertionError("runintgen regenerated the code of a cached module")
+
+    monkeypatch.setattr(runintgen.jit, "_sidecar_cache", {})
+    monkeypatch.setattr(runintgen.jit, "_generate_code", regenerate)
+
+
+def test_new_process_loads_stored_sidecar(tmp_path, monkeypatch):
+    """Cache hits in a new process read the stored sidecar instead of the code.
+
+    Regenerating the code (FFCx IR and C) took longer than assembly for large
+    forms. The stored sidecar must match the generated one, with providers and
+    QuadratureFunctions of the form being compiled.
+    """
+    from runintgen.form_metadata import export_metadata_for_cpp
+
+    mesh, V = _space()
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+
+    def form(q, rules):
+        dx_rt = ufl.Measure("dx", domain=mesh, subdomain_id=3, subdomain_data=rules)
+        dS_rt = ufl.Measure(
+            "dS", domain=mesh, subdomain_id=2, subdomain_data=_interior_facet_rules()
+        )
+        return (
+            ufl.inner(u, v) * ufl.dx(domain=mesh)
+            + ufl.inner(ufl.grad(u), ufl.grad(v)) * dx_rt
+            + ufl.dot(q("+"), q("-")) * u("+") * v("-") * dS_rt
+        )
+
+    n = QuadratureFunction(mesh, name="normal", shape=(2,))
+    _, module, _ = compile_forms([form(n, _runtime_rules())], cache_dir=tmp_path)
+    stored = module._runintgen_jit
+    assert (tmp_path / f"{stored.module_name}.sidecar.json").is_file()
+
+    _as_if_new_process(monkeypatch)
+    mu = QuadratureFunction(mesh, name="conormal", shape=(2,))
+    rules = _runtime_rules()
+    _, module_new, code = compile_forms([form(mu, rules)], cache_dir=tmp_path)
+    loaded = module_new._runintgen_jit
+
+    assert code == (None, None)
+    assert loaded.module_name == stored.module_name
+    assert [k.to_dict(with_code=False) for k in loaded.kernels] == [
+        k.to_dict(with_code=False) for k in stored.kernels
+    ]
+
+    def summary(info):
+        return [
+            (i.integral_type, i.integral_position, i.subdomain_id, i.kernel.name)
+            for i in info.integral_infos
+        ]
+
+    form_info, stored_info = loaded.forms[0], stored.forms[0]
+    assert summary(form_info) == summary(stored_info)
+    assert form_info.ufcx_form is not None
+    assert export_metadata_for_cpp(form_info.form_metadata) == (
+        export_metadata_for_cpp(stored_info.form_metadata)
+    )
+    infos = form_info.module.quadrature_functions
+    assert [info.terminal for info in infos] == [mu, mu]
+    assert [info.label for info in infos] == ["conormal(+)", "conormal(-)"]
+    assert [info.slot for info in infos] == [
+        info.slot for info in stored_info.module.quadrature_functions
+    ]
+    providers = {
+        (group.integral_type, sid): provider
+        for group in form_info.analysis.groups
+        for sid, provider in group.quadrature_providers.items()
+    }
+    assert providers[("cell", 3)] is rules
+
+
+def test_unreadable_sidecar_is_regenerated(tmp_path, monkeypatch):
+    """A damaged sidecar file costs a regeneration, not a failure."""
+    import runintgen.jit
+
+    mesh, V = _space()
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    dx_rt = ufl.Measure("dx", domain=mesh, subdomain_data=_runtime_rules())
+    form = ufl.inner(u, v) * dx_rt
+    _, module, _ = compile_forms([form], cache_dir=tmp_path)
+    path = tmp_path / f"{module._runintgen_jit.module_name}.sidecar.json"
+
+    for damaged in ("{not json", '{"format": "runintgen-jit-sidecar"}', "[]"):
+        path.write_text(damaged)
+        monkeypatch.setattr(runintgen.jit, "_sidecar_cache", {})
+        _, module, code = compile_forms([form], cache_dir=tmp_path)
+
+        assert code == (None, None)
+        assert module._runintgen_jit.kernels[0].mode == "runtime"
+        assert json.loads(path.read_text())["format"] == "runintgen-jit-sidecar"

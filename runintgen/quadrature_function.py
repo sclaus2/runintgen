@@ -440,38 +440,84 @@ def rebind_quadrature_function_infos(
         return list(infos)
 
     positions = {id(c): i for i, c in enumerate(template_form.coefficients())}
+    return [
+        _bind_to_coefficient(info, positions.get(id(info.terminal)), form)
+        for info in infos
+    ]
+
+
+def _bind_to_coefficient(
+    info: QuadratureFunctionInfo, position: int | None, form: ufl.Form
+) -> QuadratureFunctionInfo:
+    """Return ``info`` for the coefficient at ``position`` of ``form``."""
     coefficients = form.coefficients()
-    rebound = []
-    for info in infos:
-        position = positions.get(id(info.terminal))
-        if position is None or position >= len(coefficients):
-            raise RuntimeError(
-                f"Cached QuadratureFunction {info.label!r} is not a coefficient "
-                "of the form the cached module was compiled for."
-            )
-        terminal = coefficients[position]
-        if not is_quadrature_function(terminal):
-            raise RuntimeError(
-                f"Coefficient {position} of the form is not a QuadratureFunction, "
-                f"but the cached module loads it as {info.label!r}."
-            )
-        spec = quadrature_function_spec(terminal)
-        if spec.value_shape != info.value_shape:
-            raise RuntimeError(
-                f"QuadratureFunction at coefficient {position} has value shape "
-                f"{spec.value_shape}; the cached module expects {info.value_shape}."
-            )
-        rebound.append(
-            replace(
-                info,
-                terminal=terminal,
-                name=spec.name,
-                label=_quadrature_function_label(
-                    spec.name, info.slot, info.restriction
-                ),
-            )
+    if position is None or position >= len(coefficients):
+        raise RuntimeError(
+            f"Cached QuadratureFunction {info.label!r} is not a coefficient "
+            "of the form the cached module was compiled for."
         )
-    return rebound
+    terminal = coefficients[position]
+    if not is_quadrature_function(terminal):
+        raise RuntimeError(
+            f"Coefficient {position} of the form is not a QuadratureFunction, "
+            f"but the cached module loads it as {info.label!r}."
+        )
+    spec = quadrature_function_spec(terminal)
+    if spec.value_shape != info.value_shape:
+        raise RuntimeError(
+            f"QuadratureFunction at coefficient {position} has value shape "
+            f"{spec.value_shape}; the cached module expects {info.value_shape}."
+        )
+    return replace(
+        info,
+        terminal=terminal,
+        name=spec.name,
+        label=_quadrature_function_label(spec.name, info.slot, info.restriction),
+    )
+
+
+def quadrature_function_info_records(
+    infos: Sequence[QuadratureFunctionInfo], form: ufl.Form
+) -> list[dict[str, Any]]:
+    """Return JSON-serialisable records of the infos of a module for ``form``.
+
+    Terminals are recorded by their position in ``form.coefficients()``, which
+    is the same for every form with the module's signature.
+    """
+    positions = {id(c): i for i, c in enumerate(form.coefficients())}
+    return [
+        {
+            "position": positions[id(info.terminal)],
+            "restriction": info.restriction,
+            "coefficient_number": info.coefficient_number,
+            "slot": info.slot,
+            "value_shape": list(info.value_shape),
+            "value_size": info.value_size,
+        }
+        for info in infos
+    ]
+
+
+def quadrature_function_infos_from_records(
+    records: Sequence[dict[str, Any]], form: ufl.Form
+) -> list[QuadratureFunctionInfo]:
+    """Bind :func:`quadrature_function_info_records` to the terminals of ``form``."""
+    infos = []
+    for record in records:
+        slot = int(record["slot"])
+        restriction = record["restriction"]
+        unbound = QuadratureFunctionInfo(
+            terminal=None,
+            restriction=restriction,
+            coefficient_number=int(record["coefficient_number"]),
+            slot=slot,
+            name=None,
+            label=_quadrature_function_label(None, slot, restriction),
+            value_shape=tuple(int(i) for i in record["value_shape"]),
+            value_size=int(record["value_size"]),
+        )
+        infos.append(_bind_to_coefficient(unbound, int(record["position"]), form))
+    return infos
 
 
 __all__ = [
@@ -488,6 +534,8 @@ __all__ = [
     "is_quadrature_function",
     "quadrature_function_cache",
     "quadrature_function_explicit_values",
+    "quadrature_function_info_records",
+    "quadrature_function_infos_from_records",
     "quadrature_function_layout",
     "quadrature_function_space",
     "quadrature_function_source",

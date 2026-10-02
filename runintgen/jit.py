@@ -12,6 +12,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import logging
 import os
 import shutil
@@ -19,6 +20,7 @@ import sys
 import sysconfig
 import tempfile
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field, replace
@@ -41,16 +43,22 @@ from ffcx.codegeneration.jit import (
 )
 from ffcx.codegeneration.utils import dtype_to_scalar_dtype
 
-from .analysis import RuntimeAnalysisInfo, build_runtime_info
+from .analysis import RuntimeAnalysisInfo, RuntimeGroup, build_runtime_info
 from .codegeneration.C.integrals import (
     _domains_for_integral,
     generate_C_combined_kernels,
 )
 from .cpp_headers import runtime_abi_header_text
 from .form_metadata import FormRuntimeMetadata, build_form_runtime_metadata
-from .measures import get_quadrature_provider, runtime_integral_mode
+from .measures import (
+    RuntimeIntegralMode,
+    get_quadrature_provider,
+    runtime_integral_mode,
+)
 from .quadrature_function import (
     collect_quadrature_function_infos,
+    quadrature_function_info_records,
+    quadrature_function_infos_from_records,
     quadrature_function_layout,
     rebind_quadrature_function_infos,
     validate_quadrature_function_form,
@@ -276,6 +284,205 @@ def _rebind_sidecar(template: JITModuleInfo, forms: list[ufl.Form]) -> JITModule
         )
 
     return replace(template, forms=rebound_forms)
+
+
+# A compiled module is reused by every process that compiles a form with its
+# signature, but its sidecar used to be rebuilt by regenerating all code (FFCx
+# IR and C), which can take longer than the assembly itself. The sidecar is
+# therefore stored next to the module. Only form-independent data is stored;
+# quadrature providers and QuadratureFunction terminals come from the forms
+# being compiled, as in _rebind_sidecar.
+_SIDECAR_FORMAT = "runintgen-jit-sidecar"
+_SIDECAR_VERSION = 1
+
+
+def _sidecar_path(cache_dir: Path, module_name: str) -> Path:
+    """Return the file holding the sidecar of a cached module."""
+    return cache_dir.joinpath(module_name + ".sidecar.json")
+
+
+def _domain_index(domains: tuple[Any, ...], domain: Any) -> int:
+    """Return the position of ``domain`` in ``form.ufl_domains()``."""
+    for i, candidate in enumerate(domains):
+        if candidate is domain or candidate == domain:
+            return i
+    raise ValueError("Runtime group domain is not a domain of its form.")
+
+
+def _sidecar_to_dict(sidecar: JITModuleInfo) -> dict[str, Any]:
+    """Return the form-independent part of a sidecar as JSON data.
+
+    C code and FFCx IR are left out: they are not needed once the module is
+    compiled.
+    """
+    forms = []
+    for form_info in sidecar.forms:
+        kernels = form_info.module.kernels
+        kernel_index = {id(kernel): i for i, kernel in enumerate(kernels)}
+        domains = form_info.ufl_form.ufl_domains()
+        metadata = form_info.form_metadata
+        forms.append(
+            {
+                "form_name": form_info.form_name,
+                "meta": form_info.module.meta,
+                "groups": [
+                    {
+                        "domain": _domain_index(domains, group.domain),
+                        "integral_type": group.integral_type,
+                        "subdomain_ids": list(group.subdomain_ids),
+                        "mode": group.mode.value,
+                    }
+                    for group in form_info.analysis.groups
+                ],
+                "form_metadata": None if metadata is None else metadata.to_dict(),
+                "kernels": [kernel.to_dict(with_code=False) for kernel in kernels],
+                "quadrature_functions": quadrature_function_info_records(
+                    form_info.module.quadrature_functions, form_info.ufl_form
+                ),
+                "integral_infos": [
+                    {
+                        "form_index": info.form_index,
+                        "integral_type": info.integral_type,
+                        "integral_position": info.integral_position,
+                        "subdomain_id": info.subdomain_id,
+                        "kernel": kernel_index[id(info.kernel)],
+                        "needs_custom_data": info.needs_custom_data,
+                    }
+                    for info in form_info.integral_infos
+                ],
+            }
+        )
+    return {
+        "format": _SIDECAR_FORMAT,
+        "version": _SIDECAR_VERSION,
+        "module_name": sidecar.module_name,
+        "forms": forms,
+    }
+
+
+def _sidecar_from_dict(
+    data: dict[str, Any],
+    forms: list[ufl.Form],
+    form_names: list[str],
+    options: dict[str, Any],
+) -> JITModuleInfo:
+    """Rebuild a sidecar stored by :func:`_sidecar_to_dict` for ``forms``.
+
+    The analysis of the result holds the runtime groups only (no FFCx IR).
+    """
+    if data.get("format") != _SIDECAR_FORMAT or data.get("version") != (
+        _SIDECAR_VERSION
+    ):
+        raise ValueError("unsupported sidecar format")
+    if len(data["forms"]) != len(forms):
+        raise ValueError("sidecar was written for a different number of forms")
+
+    form_infos = []
+    for form, form_name, item in zip(forms, form_names, data["forms"], strict=True):
+        if item["form_name"] != form_name:
+            raise ValueError(f"sidecar form {item['form_name']!r} is not {form_name!r}")
+        kernels = [RuntimeKernelInfo.from_dict(kernel) for kernel in item["kernels"]]
+        domains = form.ufl_domains()
+        groups = [
+            RuntimeGroup(
+                domain=domains[group["domain"]],
+                integral_type=group["integral_type"],
+                subdomain_ids=tuple(group["subdomain_ids"]),
+                mode=RuntimeIntegralMode(group["mode"]),
+            )
+            for group in item["groups"]
+        ]
+        meta = dict(item["meta"])
+        metadata = (
+            None
+            if item["form_metadata"] is None
+            else FormRuntimeMetadata.from_dict(item["form_metadata"])
+        )
+        module = RunintModule(
+            kernels=kernels,
+            meta=meta,
+            form_metadata=metadata,
+            quadrature_functions=quadrature_function_infos_from_records(
+                item["quadrature_functions"], form
+            ),
+        )
+        form_infos.append(
+            JITFormInfo(
+                ufl_form=form,
+                analysis=RuntimeAnalysisInfo(
+                    ir=None, groups=groups, integral_infos={}, meta=meta
+                ),
+                form_metadata=metadata,
+                module=module,
+                form_name=form_name,
+                integral_infos=[
+                    JITIntegralInfo(
+                        form_index=int(info["form_index"]),
+                        integral_type=info["integral_type"],
+                        integral_position=int(info["integral_position"]),
+                        subdomain_id=int(info["subdomain_id"]),
+                        kernel=kernels[int(info["kernel"])],
+                        needs_custom_data=bool(info["needs_custom_data"]),
+                    )
+                    for info in item["integral_infos"]
+                ],
+            )
+        )
+
+    return JITModuleInfo(
+        forms=form_infos,
+        kernels=[kernel for info in form_infos for kernel in info.module.kernels],
+        module_name=data["module_name"],
+        cache_dir=Path(),
+        options=dict(options),
+    )
+
+
+def _json_default(value: Any) -> Any:
+    """Convert NumPy scalars that table metadata may hold to Python scalars."""
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"{type(value).__name__} is not JSON serialisable")
+
+
+def _save_sidecar(sidecar: JITModuleInfo, cache_dir: Path) -> None:
+    """Store the sidecar of a module; a failure only costs regeneration later."""
+    path = _sidecar_path(cache_dir, sidecar.module_name)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(_sidecar_to_dict(sidecar), default=_json_default))
+        os.replace(tmp, path)
+    except (AttributeError, LookupError, OSError, TypeError, ValueError) as exc:
+        logger.warning("Could not store JIT sidecar %s: %s", path, exc)
+        tmp.unlink(missing_ok=True)
+
+
+def _load_sidecar(
+    cache_dir: Path,
+    module_name: str,
+    forms: list[ufl.Form],
+    form_names: list[str],
+    options: dict[str, Any],
+) -> JITModuleInfo | None:
+    """Return the stored sidecar of a module, or None if it is missing or stale."""
+    path = _sidecar_path(cache_dir, module_name)
+    try:
+        data = json.loads(path.read_text())
+        if data.get("module_name") != module_name:
+            raise ValueError(f"sidecar belongs to {data.get('module_name')!r}")
+        return _sidecar_from_dict(data, forms, form_names, options)
+    except FileNotFoundError:
+        return None
+    except (
+        AttributeError,
+        LookupError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        logger.warning("Ignoring JIT sidecar %s: %s", path, exc)
+        return None
 
 
 def _runtime_form_signature(forms: list[ufl.Form]) -> str:
@@ -672,7 +879,9 @@ def compile_forms(
 
     Processes compiling the same forms into one ``cache_dir`` share a single
     build: the others wait up to ``timeout`` seconds for it and then build
-    themselves instead of failing.
+    themselves instead of failing. The module's metadata is stored next to it
+    (``<module>.sidecar.json``), so cache hits in new processes do not
+    regenerate the code.
     """
     if visualise:
         raise NotImplementedError("runintgen JIT visualisation is not implemented.")
@@ -710,13 +919,18 @@ def compile_forms(
             obj, mod = _load_objects(cache_dir, module_name, form_names)
             sidecar = _sidecar_cache.get(module_name)
             if sidecar is None:
+                sidecar = _load_sidecar(cache_dir, module_name, forms, form_names, p)
+            if sidecar is None:
                 _, _, sidecar = _generate_code(forms, module_name, p)
-                _sidecar_cache[module_name] = sidecar
+                _save_sidecar(sidecar, cache_dir)
+            _sidecar_cache[module_name] = sidecar
             sidecar = _rebind_sidecar(sidecar, forms)
             _attach_sidecar(mod, sidecar, cache_dir)
             return obj, mod, (None, None)
 
         decl, impl, sidecar = _generate_code(forms, module_name, p)
+        # Before the module is published, so whoever loads it finds the sidecar.
+        _save_sidecar(sidecar, cache_dir)
         _compile_objects(
             decl,
             impl,
